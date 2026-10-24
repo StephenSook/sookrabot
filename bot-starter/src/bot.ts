@@ -39,7 +39,15 @@ import {
   sevenCompleterMask,
   shouldFlush,
 } from "./strategy.js";
-import { PoolTracker, lookaheadDelta, lookaheadLambda, poolWeights } from "./pool.js";
+import {
+  PoolTracker,
+  hashSeed,
+  lookaheadDelta,
+  lookaheadLambda,
+  mulberry32,
+  multiLookDelta,
+  poolWeights,
+} from "./pool.js";
 import { scaledEmpirical } from "./empirical.js";
 
 /** Starting rack size when match_state does not carry one (game.ts STARTING_RACK_SIZE). */
@@ -189,6 +197,8 @@ interface MatchModel {
   recvLags: number[];
   /** Unseen-pool bookkeeping (pool.ts); fed only while LOOKAHEAD_WEIGHT is on. */
   pool: PoolTracker;
+  /** Multi-letter lookahead values (MLOOK_M), by auction, rack and alpha. */
+  mlook: Map<string, number>;
 }
 
 function newModel(): MatchModel {
@@ -217,6 +227,7 @@ function newModel(): MatchModel {
     margins: [],
     recvLags: [],
     pool: new PoolTracker(),
+    mlook: new Map(),
   };
 }
 
@@ -841,6 +852,8 @@ export class SookraBot {
     alpha: number,
   ): number | null {
     model.pool.noteAuction(String(open.id), li);
+    const multi = this.multiLookahead(model, counts, val, open, li, bagTotal, alpha);
+    if (multi !== null) return multi;
     const lambda = lookaheadLambda(this.policy.LOOKAHEAD_WEIGHT, bagTotal, this.policy.LOOKAHEAD_HORIZON);
     if (lambda <= 0) return null;
     const withX = new Int32Array(counts);
@@ -854,6 +867,56 @@ export class SookraBot {
     }
     const w = poolWeights(this.policy.LOOKAHEAD_POOL > 0 ? model.pool.unseen() : null);
     return lookaheadDelta(val, vx, li, w, lambda);
+  }
+
+  /**
+   * Multi-letter lookahead value of the letter on auction (MLOOK_M, pool.ts
+   * multiLookDelta), or null when it is off, m < 2, or it failed (the one-step
+   * lookahead then applies). Computed once per auction, rack and alpha, from
+   * a sample seed of the same three, so a replay draws the same samples.
+   */
+  private multiLookahead(
+    model: MatchModel,
+    counts: Counts,
+    val: Valuation,
+    open: AuctionRow,
+    li: number,
+    bagTotal: number,
+    alpha: number,
+  ): number | null {
+    const p = this.policy;
+    if (!(p.MLOOK_M > 0)) return null;
+    const m = Math.min(p.MLOOK_M, Math.floor(bagTotal * p.MLOOK_RATE));
+    if (!(m >= 2)) return null;
+    const key = `${open.id}|${countsKey(counts)}|${alpha}`;
+    const hit = model.mlook.get(key);
+    if (hit !== undefined) return hit;
+    let tilt: Float64Array | undefined;
+    if (p.MLOOK_TILT > 0) {
+      let mean = 0;
+      for (let e = 0; e < 26; e++) mean += val.delta[e];
+      mean /= 26;
+      tilt = new Float64Array(26);
+      for (let e = 0; e < 26; e++) tilt[e] = mean > 0 ? (Math.max(0, val.delta[e]) / mean) ** p.MLOOK_TILT : 1;
+    }
+    let d: number;
+    try {
+      d = multiLookDelta(
+        this.index, counts, li, model.pool.unseen(), m, p.MLOOK_SAMPLES,
+        alpha * p.MLOOK_ALPHA_SCALE, mulberry32(hashSeed(key)), tilt,
+      );
+    } catch (err) {
+      this.warn("multi-letter lookahead", err);
+      return null;
+    }
+    if (!Number.isFinite(d)) return null;
+    model.mlook.set(key, d);
+    while (model.mlook.size > 64) {
+      const oldest = model.mlook.keys().next().value;
+      if (oldest === undefined) break;
+      model.mlook.delete(oldest);
+    }
+    return d;
   }
 
   private playWords(

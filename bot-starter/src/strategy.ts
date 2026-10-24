@@ -301,6 +301,26 @@ export const LOOKAHEAD_MIN_REAL_RIVALS = 2;
  */
 export const EMP_DEAD_SCALE = 0;
 
+// Round 3 knobs, off by default.
+
+/**
+ * MLOOK_M: the refined bid values the letter on auction by the multi-letter
+ * lookahead (pool.ts multiLookDelta), its mean marginal value on the rack plus
+ * m = min(MLOOK_M, floor(bagTotal x MLOOK_RATE)) more letters drawn from the
+ * unseen pool, over MLOOK_SAMPLES draws, at leave weight alpha x
+ * MLOOK_ALPHA_SCALE: a sampled estimate of the odds that the pool completes a
+ * word (7+ letters included) with this letter within the letters still to be
+ * won. MLOOK_TILT draws letter e with weight pool_e x (delta_R(e) / mean
+ * delta_R)^MLOOK_TILT (0: as the pool), since we win the letters we bid high
+ * on. Same gate as the one-step lookahead (LOOKAHEAD_WEIGHT,
+ * LOOKAHEAD_MIN_REAL_RIVALS); where m < 2 the one-step lookahead applies. 0: off.
+ */
+export const MLOOK_M = 0;
+export const MLOOK_RATE = 0.2;
+export const MLOOK_SAMPLES = 16;
+export const MLOOK_ALPHA_SCALE = 1;
+export const MLOOK_TILT = 0;
+
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
  * (STARTING_BALANCE, BAG_TILES, SIM_BID_JITTER) and the network-stall bounds of
@@ -350,6 +370,11 @@ export interface Policy {
   readonly LOOKAHEAD_POOL: number;
   readonly LOOKAHEAD_MIN_REAL_RIVALS: number;
   readonly EMP_DEAD_SCALE: number;
+  readonly MLOOK_M: number;
+  readonly MLOOK_RATE: number;
+  readonly MLOOK_SAMPLES: number;
+  readonly MLOOK_ALPHA_SCALE: number;
+  readonly MLOOK_TILT: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -397,6 +422,11 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   LOOKAHEAD_POOL,
   LOOKAHEAD_MIN_REAL_RIVALS,
   EMP_DEAD_SCALE,
+  MLOOK_M,
+  MLOOK_RATE,
+  MLOOK_SAMPLES,
+  MLOOK_ALPHA_SCALE,
+  MLOOK_TILT,
 });
 
 // ---- Types ----

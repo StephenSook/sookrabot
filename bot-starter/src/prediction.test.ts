@@ -3,7 +3,16 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import { test } from "node:test";
 import { WordIndex, countsOf, valuate, wordReward } from "./engine.js";
-import { BAG_COUNTS, PoolTracker, lookaheadDelta, lookaheadLambda, poolWeights } from "./pool.js";
+import {
+  BAG_COUNTS,
+  PoolTracker,
+  hashSeed,
+  lookaheadDelta,
+  lookaheadLambda,
+  mulberry32,
+  multiLookDelta,
+  poolWeights,
+} from "./pool.js";
 import { DEFAULT_POLICY } from "./strategy.js";
 
 const WORDLIST = fs
@@ -103,4 +112,25 @@ test("lookahead: on and gated by default, ramps to 0 at the end", () => {
   const vu = valuate(INDEX, withU, 0.35);
   const w = poolWeights(null);
   assert.ok(lookaheadDelta(base, vu, 20, w, 1) >= 0);
+});
+
+test("multi-letter lookahead: off by default, seeded, at or above the leave floor, and m 0 values the rack alone", () => {
+  assert.equal(DEFAULT_POLICY.MLOOK_M, 0);
+  const rack = countsOf("EINST");
+  const pool = new Int32Array(BAG_COUNTS);
+  for (let i = 0; i < 26; i++) pool[i] -= rack[i];
+  const li = 0; // A
+  const a = multiLookDelta(INDEX, rack, li, pool, 6, 12, 0.35, mulberry32(hashSeed("k")));
+  const b = multiLookDelta(INDEX, rack, li, pool, 6, 12, 0.35, mulberry32(hashSeed("k")));
+  assert.equal(a, b);
+  assert.ok(a >= 0.35 * 6.38 - 1e-9);
+  const plain = valuate(INDEX, rack, 0.35).delta[li];
+  assert.ok(Math.abs(multiLookDelta(INDEX, rack, li, pool, 0, 12, 0.35, mulberry32(1)) - plain) < 1e-9);
+  // A tilt of 0 on every letter but one draws only that letter (pool permitting).
+  const tilt = new Float64Array(26);
+  tilt[17] = 1; // R
+  const onlyR = new Int32Array(rack);
+  onlyR[17] += 2;
+  const viaTilt = multiLookDelta(INDEX, rack, li, pool, 2, 3, 0.35, mulberry32(9), tilt);
+  assert.ok(Math.abs(viaTilt - valuate(INDEX, onlyR, 0.35).delta[li]) < 1e-9);
 });
