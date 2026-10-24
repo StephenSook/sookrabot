@@ -369,6 +369,8 @@ interface Seat {
   sevens: number;
   /** With MatchOpts.regimes: SeatResult.regimes, accumulated. */
   regimes?: number[];
+  /** Points scored by when the word was played: 0-22, 23-45, 46-60, 61-66, 67+ auctions closed (validate5). */
+  phasePts: number[];
 }
 
 /**
@@ -415,8 +417,11 @@ export function sevenCompleters(index: WordIndex, counts: Counts): number {
   return mask >>> 0;
 }
 
-/** Per rack key: [7+ completers mask, useful letters mask]. Pure functions of the rack, so shared by every seat and match. */
-const RACK_MASKS = new Map<string, [number, number]>();
+/**
+ * Per word index, per rack key: [7+ completers mask, useful letters mask]. Pure functions of the rack and
+ * the dictionary, so shared by every seat and match that uses the same index.
+ */
+const RACK_MASKS = new WeakMap<WordIndex, Map<string, [number, number]>>();
 
 /**
  * For a rack: the sevenCompleters mask, and bit i set when letter i is useful to it, rack + letter packing
@@ -425,7 +430,9 @@ const RACK_MASKS = new Map<string, [number, number]>();
  */
 export function rackMasks(index: WordIndex, counts: Counts): [number, number] {
   const key = countsKey(counts);
-  const hit = RACK_MASKS.get(key);
+  let cache = RACK_MASKS.get(index);
+  if (!cache) RACK_MASKS.set(index, (cache = new Map()));
+  const hit = cache.get(key);
   if (hit) return hit;
   const cands = index.scan(counts, true);
   let c7 = 0;
@@ -442,8 +449,8 @@ export function rackMasks(index: WordIndex, counts: Counts): [number, number] {
   let useful = 0;
   for (let i = 0; i < 26; i++) if (index.pack(cands, counts, i, 0).total > base) useful |= 1 << i;
   const out: [number, number] = [c7 >>> 0, useful >>> 0];
-  if (RACK_MASKS.size >= 400000) RACK_MASKS.clear();
-  RACK_MASKS.set(key, out);
+  if (cache.size >= 400000) cache.clear();
+  cache.set(key, out);
   return out;
 }
 
@@ -535,6 +542,7 @@ class Table {
     seat.score += r;
     seat.words++;
     if (word.length >= 7) seat.sevens++;
+    seat.phasePts[this.closed <= 22 ? 0 : this.closed <= 45 ? 1 : this.closed <= 60 ? 2 : this.closed <= 66 ? 3 : 4] += r;
     if (seat.firstWord === null) seat.firstWord = this.closed;
     return true;
   }
@@ -627,6 +635,8 @@ export interface SeatResult {
    * the auctions it could outbid (balance above the best competing bid M), those it won and the sum of M.
    */
   regimes?: number[];
+  /** Points by when they were scored: 0-22, 23-45, 46-60, 61-66, 67+ auctions closed. */
+  phasePts: number[];
 }
 
 /** How a match is played: the auction rule and the fitted rivals' bid scale. */
@@ -713,6 +723,7 @@ export async function playMatch(
     startRack: "",
     wonLetters: new Int32Array(26),
     sevens: 0,
+    phasePts: [0, 0, 0, 0, 0],
   }));
   const botRows = new Map<bigint, BotRow>();
   for (const s of seats) {
@@ -891,6 +902,7 @@ export async function playMatch(
       startRack: s.startRack,
       wonLetters: [...s.wonLetters].map((k, i) => String.fromCharCode(65 + i).repeat(k)).join(""),
       ...(s.regimes ? { regimes: [...s.regimes] } : {}),
+      phasePts: [...s.phasePts],
     })),
   };
 }
@@ -1009,6 +1021,10 @@ interface LiveV5 {
   won_by_class: number[];
   /** Auctions by letter regime (matches with a known starting rack): how many a match, the share won, mean M. */
   regimes: Record<"complete7" | "useful" | "dead", { perMatch: number; winRate: number; M: number }>;
+  /** Points by when they were scored: 0-22, 23-45, 46-60, 61-66, 67+ auctions closed. */
+  pts_by_phase: number[];
+  /** Balance before auction 34. */
+  mid_balance: number;
 }
 interface LiveV5File {
   rivals: Record<string, LiveV5>;
@@ -1817,7 +1833,7 @@ const RS = { score: 0, place: 1, win: 2, won: 3, paid: 4, balance: 5, words: 6, 
  * Plays the live tables of fixtures/rival-live-v5.json: match i seats the six rivals of table i mod 288,
  * modelOf(stem) giving each seat's model, match seed mix(seed, i, 5). Returns per stem the sums of
  * RS (then 5 letter-class counts, then 9 regime numbers: auctions, wins and sum of M for complete7, useful
- * and dead letters).
+ * and dead letters, then 5 phase point sums, then the balance before auction 34).
  */
 async function replayLiveTables(
   index: WordIndex, n: number, seed: number, modelOf: (stem: string) => RivalModel,
@@ -1830,13 +1846,15 @@ async function replayLiveTables(
     const seats = (await playMatch(index, specs, mix(seed, i, 5), VICKREY, { regimes: true })).seats;
     for (const r of seats) {
       const ahead = seats.filter((o) => o.score > r.score).length;
-      const a = acc.get(r.name) ?? Array<number>(27).fill(0);
+      const a = acc.get(r.name) ?? Array<number>(33).fill(0);
       [
         r.score, ahead + 1, ahead === 0 ? 1 : 0, r.won, r.paid, r.balance, r.words, r.sevens, RACK + r.won - r.endRack,
         r.endRack, packValue(index, r.wonLetters), packValue(index, r.startRack + r.wonLetters), 1,
       ].forEach((x, j) => (a[j] += x));
       for (const c of r.wonLetters) a[13 + Math.min(LETTER_VALUE[c], 5) - 1]++;
       (r.regimes ?? []).forEach((x, j) => (a[18 + j] += x));
+      r.phasePts.forEach((x, j) => (a[27 + j] += x));
+      a[32] += r.midBalance ?? 0;
       acc.set(r.name, a);
     }
   }
@@ -1860,6 +1878,8 @@ function replaySummary(a: number[]) {
     pack_won: r1(a[RS.packWon] / m), pack_all: r1(a[RS.packAll] / m), score_over_pack_all: r2(a[RS.score] / a[RS.packAll]),
     won_by_class: a.slice(13, 18).map((x) => r2(x / m)),
     regimes: { complete7: regime(0), useful: regime(1), dead: regime(2) },
+    pts_by_phase: a.slice(27, 32).map((x) => r1(x / m)),
+    mid_balance: r1(a[32] / m),
   };
 }
 
@@ -1906,7 +1926,8 @@ export async function validate5(
       live: {
         score: obs.score, place: obs.place, win: obs.win, won: obs.won, paid: obs.paid, final_balance: obs.final_balance,
         words: obs.n_words, sevens: obs.sevens, used: obs.used, end_rack: obs.end_rack, pack_won: obs.pack_won,
-        pack_all: obs.pack_all, won_by_class: obs.won_by_class, regimes: obs.regimes, matches: obs.matches,
+        pack_all: obs.pack_all, won_by_class: obs.won_by_class, regimes: obs.regimes, pts_by_phase: obs.pts_by_phase,
+        mid_balance: obs.mid_balance, matches: obs.matches,
       },
       simMinusLive: {
         score: r1(sim.score - obs.score), place: r2(sim.place - obs.place), won: r1(sim.won - obs.won),

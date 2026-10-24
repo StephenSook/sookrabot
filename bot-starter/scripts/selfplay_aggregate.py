@@ -304,11 +304,13 @@ def render_fit(rows, markdown):
     out = []
     fits = {}
     for r in rows:
-        fits.setdefault((r.get("base"), r.get("mods"), r.get("gamma"), r.get("matches")), []).append(r)
-    for (base, mods, gamma, matches), rs in sorted(fits.items(), key=lambda kv: str(kv[0])):
+        # round r plays seed + 1000 r: the fit's own seed keeps separate fits apart
+        seed0 = r.get("seed", 0) - 1000 * r.get("round", 0)
+        fits.setdefault((r.get("base"), r.get("mods"), r.get("gamma"), r.get("matches"), seed0), []).append(r)
+    for (base, mods, gamma, matches, seed0), rs in sorted(fits.items(), key=lambda kv: str(kv[0])):
         rs.sort(key=lambda r: r["round"])
-        title = (f"calibrate5 {base} entries{' +' + mods if mods else ''}, gamma {gamma}, {matches} matches a round: "
-                 "per-rival bid scales fitted so the replayed live tables give each rival its live score")
+        title = (f"calibrate5 {base} entries{' +' + mods if mods else ''}, gamma {gamma}, seed {seed0}, {matches} matches "
+                 "a round: per-rival bid scales fitted so the replayed live tables give each rival its live score")
         head = ["round", "seed", "mean abs top", "max abs top", "mean abs all"]
         table = [[str(r["round"]), str(r["seed"]), fmt(r["meanAbsTop"], 1), fmt(r["maxAbsTop"], 1), fmt(r["meanAbsAll"], 1)]
                  for r in rs]
