@@ -911,6 +911,7 @@ export class SookraBot {
       return null;
     }
     if (!Number.isFinite(d)) return null;
+    d *= p.MLOOK_SCALE;
     model.mlook.set(key, d);
     while (model.mlook.size > 64) {
       const oldest = model.mlook.keys().next().value;

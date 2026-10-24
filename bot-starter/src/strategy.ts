@@ -325,13 +325,16 @@ export const EMP_DEAD_SCALE = 0;
  * delta_R)^MLOOK_TILT (0: as the pool), since we win the letters we bid high
  * on. Same gate as the one-step lookahead (LOOKAHEAD_WEIGHT,
  * LOOKAHEAD_MIN_REAL_RIVALS); where m < 2 the one-step lookahead applies; with
- * LOOKAHEAD_POOL 0 the draws come from the full bag instead. 0: off.
+ * LOOKAHEAD_POOL 0 the draws come from the full bag instead. MLOOK_SCALE
+ * multiplies the value it returns (it runs above the one-step values, so this
+ * matches spend only where it applies). 0: off.
  */
 export const MLOOK_M = 0;
 export const MLOOK_RATE = 0.2;
 export const MLOOK_SAMPLES = 16;
 export const MLOOK_ALPHA_SCALE = 1;
 export const MLOOK_TILT = 0;
+export const MLOOK_SCALE = 1;
 /**
  * SPEND_FLOOR: every value bid (paced, Vickrey, at tables of at least
  * SPEND_FLOOR_MIN_REAL_RIVALS real rivals) is raised by
@@ -396,6 +399,7 @@ export interface Policy {
   readonly MLOOK_SAMPLES: number;
   readonly MLOOK_ALPHA_SCALE: number;
   readonly MLOOK_TILT: number;
+  readonly MLOOK_SCALE: number;
   readonly SPEND_FLOOR: number;
   readonly SPEND_FLOOR_MIN_REAL_RIVALS: number;
 }
@@ -450,6 +454,7 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   MLOOK_SAMPLES,
   MLOOK_ALPHA_SCALE,
   MLOOK_TILT,
+  MLOOK_SCALE,
   SPEND_FLOOR,
   SPEND_FLOOR_MIN_REAL_RIVALS,
 });
