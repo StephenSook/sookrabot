@@ -31,6 +31,7 @@ import {
   sevenCompleters,
   shardRange,
   summarize,
+  v5Model,
   validate4,
   validate5,
 } from "./selfplay.js";
@@ -352,7 +353,37 @@ test("rival modifiers: each changes only what it names, never the fixture entry,
   for (const bad of ["nope", "minlen", "bidx", "shark=1", "minlen=0", "minlen=-1", "shark+", "SHARK"]) {
     assert.throws(() => parseRivalMods(bad), Error, bad);
   }
-  assert.deepEqual(parseRivalMods(V5_CALIBRATION.mods), parseRivalMods(V5_CALIBRATION.mods), "the calibration parses");
+  assert.deepEqual(parseRivalMods(V5_CALIBRATION.mods), ["nongainx=0.7"], "the calibration's global modifier parses");
+  // bidx scales every run including gainCells; nongainx every run but gainCells.
+  const g = fixture["postturing-v5g"];
+  const all = applyRivalMods(g, parseRivalMods("bidx=2"));
+  const non = applyRivalMods(g, parseRivalMods("nongainx=2"));
+  assert.deepEqual(all.gainCells!["g4|1"], g.gainCells["g4|1"].map(([x, s]: [number, number]) => [2 * x, s]));
+  assert.deepEqual(non.gainCells, g.gainCells);
+  assert.deepEqual(non.dead!["v1|1"], g.dead["v1|1"].map(([x, s]: [number, number]) => [2 * x, s]));
+});
+
+test("calibration v5k: -v5g dead and completing letters' bids times 0.7 and a scale per top rival, nothing else", () => {
+  const fixture = JSON.parse(fs.readFileSync(new URL("./fixtures/rival-models.json", import.meta.url), "utf8")).rivals;
+  assert.equal(V5_CALIBRATION.base, "v5g");
+  assert.equal(V5_CALIBRATION.rho, undefined, "each rival keeps its fitted rack awareness");
+  assert.deepEqual(Object.keys(V5_CALIBRATION.bidScale).sort(), [...V5_TOP].sort(), "a scale for each top rival only");
+  for (const [stem, s] of Object.entries(V5_CALIBRATION.bidScale)) assert.ok(s >= 0.6 && s <= 1.6, `${stem} ${s}`);
+  // A -v5k model is its -v5g entry with its dead, complete7 and cell runs' x times 0.7 x the rival's scale, applied
+  // once, and everything else (gainCells included) as fitted.
+  const near = (a: [number, number][], b: [number, number][], f: number) =>
+    a.length === b.length && a.every(([x, s], i) => Math.abs(x - f * b[i][0]) < 1e-9 && s === b[i][1]);
+  for (const [stem, f] of [["Nijello", 0.7 * V5_CALIBRATION.bidScale.Nijello], ["sardine", 0.7]] as const) {
+    const g = fixture[`${stem}-v5g`];
+    const k = v5Model(stem, "v5k");
+    assert.deepEqual(k.gainCells, g.gainCells, `${stem}: useful letters' bids as fitted`);
+    for (const key of Object.keys(g.dead)) assert.ok(near(k.dead![key], g.dead[key], f), `${stem} dead ${key}`);
+    if (g.complete7) assert.ok(near(k.complete7!, g.complete7, f), `${stem} complete7`);
+    for (const key of Object.keys(g.bid.cells)) assert.ok(near(k.bid.kind === "survival" ? k.bid.cells[key] : [], g.bid.cells[key], f), key);
+    assert.deepEqual({ ...k, bid: undefined, dead: undefined, complete7: undefined },
+      { ...g, bid: undefined, dead: undefined, complete7: undefined }, `${stem}: nothing else changes`);
+  }
+  assert.deepEqual(v5Model("Nijello", "v5g"), fixture["Nijello-v5g"], "v5g is the entry itself");
 });
 
 test("self-play: the v5 fields seat the calibrated rivals, and validate5 replays the live tables beside live", async () => {

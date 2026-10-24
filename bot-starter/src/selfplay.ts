@@ -111,13 +111,24 @@
 // clock block of the fits averages away. -v5u splits the bids three ways
 // (complete7, useful, dead), -v5p adds an opening clock block (auctions
 // 1-22), and -v5g draws a useful letter's bid by its gain (gainCells). The
-// calibrated rivals, -v5k (V5_CALIBRATION), are the -v5g fits with every bid
-// lowered (the fits' bid level drains the simulated rivals' money by the
-// midgame: they can outbid the best competing bid in fewer auctions than live
-// and hold their words until the end) and per-rival scales for the top
-// eleven (calibrate5, update secant). The v5 fields (ar6-top5-v5,
-// ar6-field-v5, ar6-mixed-v5, ar4/ar3-top-v5, ar4/ar3-topdraw-v5,
-// duel-*-v5) seat the -v5k rivals.
+// calibrated rivals, -v5k (V5_CALIBRATION), are the -v5g fits with their bids
+// on dead letters and on 7+ completing letters times 0.7 (at the fitted level
+// the simulated rivals run short of money by the midgame: they can outbid the
+// best competing bid in about 10 auctions a match fewer than live and hold
+// their words until the end) and those bids scaled further for each of the
+// top eleven (calibrate5, update secant). On fresh
+// deals (validate5 v5k, seed 31, 1728 matches) ten of the top eleven score
+// within 10 points of live (mean absolute error 5.7, against 14.6 for -v5c on
+// the same deals). Known gap: Chinese Dante-v5k scores about 23 under live
+// (69 against 92): it gets about two chances a match to buy a letter that
+// completes a 7+ word against 3.5 live and makes 1.4 such words against 1.75,
+// and neither its bid level nor any model above moved that, so a field with
+// Dante (ar6-top5-v5, ar4-top-v5, the topdraw fields, duel-dante-v5) is still
+// easier than live; the rest of the field is mixed (mid-table bots mostly 5
+// to 15 under live, a few weak bots over: SkyScrabble 71 against 55). The v5
+// fields (ar6-top5-v5, ar6-field-v5, ar6-mixed-v5, ar4/ar3-top-v5,
+// ar4/ar3-topdraw-v5, duel-*-v5) seat the -v5k rivals. Trust paired
+// differences over levels, as before.
 
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -1138,19 +1149,30 @@ export const RIVAL_MODS: Record<string, { about: string; apply: (m: RivalModel, 
     apply: (m) => ({ ...m, dead: undefined }),
   },
   bidx: {
-    about: "bidx=s: every survival bid (cells, complete7 and dead runs) times s before the balance scaling",
-    apply: (m, x) => {
-      if (m.bid.kind !== "survival") return m;
-      const scale = (runs: [number, number][]): [number, number][] => runs.map(([rx, s]): [number, number] => [rx * x, s]);
-      const cells = Object.fromEntries(Object.entries(m.bid.cells).map(([k, runs]) => [k, scale(runs)]));
-      return {
-        ...m, bid: { ...m.bid, cells }, ...(m.complete7 ? { complete7: scale(m.complete7) } : {}),
-        ...(m.dead ? { dead: Object.fromEntries(Object.entries(m.dead).map(([k, runs]) => [k, scale(runs)])) } : {}),
-      };
-    },
+    about: "bidx=s: every survival bid (cells, complete7, dead runs and gainCells) times s before the balance scaling",
+    apply: (m, x) => scaleRuns(scaleRuns(m, x, false), x, true),
+    arg: true,
+  },
+  nongainx: {
+    about:
+      "nongainx=s: every survival bid but the gainCells ones (cells, complete7 and dead runs) times s; on an entry " +
+      "without gainCells the same as bidx, on -v5g the dead letters' and completing letters' bids",
+    apply: (m, x) => scaleRuns(m, x, false),
     arg: true,
   },
 };
+
+/** A survival model with its runs' x times s: cells, complete7 and dead runs, or (gain true) only its gainCells. */
+function scaleRuns(m: RivalModel, s: number, gain: boolean): RivalModel {
+  if (m.bid.kind !== "survival") return m;
+  const scale = (runs: [number, number][]): [number, number][] => runs.map(([rx, p]): [number, number] => [rx * s, p]);
+  const all = (r: Record<string, [number, number][]>) => Object.fromEntries(Object.entries(r).map(([k, runs]) => [k, scale(runs)]));
+  if (gain) return m.gainCells ? { ...m, gainCells: all(m.gainCells) } : m;
+  return {
+    ...m, bid: { ...m.bid, cells: all(m.bid.cells) }, ...(m.complete7 ? { complete7: scale(m.complete7) } : {}),
+    ...(m.dead ? { dead: all(m.dead) } : {}),
+  };
+}
 
 /** "a+b=1.5+..." into its checked parts ("" or "-": none). */
 export function parseRivalMods(text: string): string[] {
@@ -1189,31 +1211,34 @@ const V5_ENTRIES: readonly V5Entries[] = ["v5", "v5c", "v5u", "v5p", "v5g", "v5k
 /**
  * The calibration of the v5 rivals: what turns a fixture entry (base) into its -v5k model (validate5 with
  * entries v5k, and the v5 fields). mods: RIVAL_MODS applied to every rival; rho: replaces each rival's
- * fitted rack awareness (absent: keep it); bidScale: per rival, every survival bid (cells, complete7 and
- * dead runs) times this (absent: 1), as fitted by calibrate5.
+ * fitted rack awareness (absent: keep it); bidScale: per rival, its non-gainCells bids (cells, complete7 and
+ * dead runs, as the nongainx modifier) times this (absent: 1), as fitted by calibrate5.
  */
 export const V5_CALIBRATION: { base: "v5c" | "v5u" | "v5p" | "v5g"; mods: string; rho?: number; bidScale: Record<string, number> } = {
   base: "v5g",
-  // Every rival's bids times 0.7: the best level of a grid of 0.6 to 1.1 (run 40093222909, seed 4: mean
-  // absolute score error over the top eleven 7.9 at 0.7, 10.0 at 0.9; 40092960695: 11.7 at 1.1).
-  mods: "bidx=0.7",
-  // The top eleven, on top of that: a least-squares line through each one's (scale, error) pairs over the six
-  // rounds of the secant fit (run 40093581785, 864 matches a round), solved for zero error, within [0.6, 1.6].
+  // Every rival's bids on dead letters and on letters that complete a 7+ word times 0.7 (its useful letters'
+  // gainCells bids as fitted): the best level of a grid of 0.6 to 1.1 (run 40093222909, seed 4: mean absolute
+  // score error over the top eleven 7.9 at 0.7, 10.0 at 0.9; 40092960695: 11.7 at 1.1). Those runs and the fit
+  // below named the modifier bidx, which then scaled exactly what nongainx scales now.
+  mods: "nongainx=0.7",
+  // The top eleven, on top of that: the same bids times a scale each (applied as nongainx), from a least-squares
+  // line through each one's (scale, error) pairs over the six rounds of the secant fit (run 40093581785, 864
+  // matches a round), solved for zero error, within [0.6, 1.6].
   bidScale: {
     postturing: 0.84, guesser: 1.53, Dante: 1.6, Doppio: 1.27, Nijello: 0.77, Vickey: 1.6, LetterSharkPro: 1.6,
     Ally: 1.32, atlas: 1.09, marcellinus: 1.27, Cashu: 1.6,
   },
 };
 
-/** A v5 rival's model: its -v5, -v5c or -v5u fixture entry, or for v5k its V5_CALIBRATION base entry calibrated. */
-function v5Model(stem: string, entries: V5Entries): RivalModel {
+/** A v5 rival's model: its -v5, -v5c, -v5u, -v5p or -v5g fixture entry, or for v5k its V5_CALIBRATION base entry calibrated. */
+export function v5Model(stem: string, entries: V5Entries): RivalModel {
   const name = `${stem}-${entries === "v5k" ? V5_CALIBRATION.base : entries}`;
   const base = RIVALS[name];
   if (!base) throw new Error(`no rival model ${name} in fixtures/rival-models.json`);
   if (entries !== "v5k") return base;
   let m = applyRivalMods(base, parseRivalMods(V5_CALIBRATION.mods));
   const s = V5_CALIBRATION.bidScale[stem] ?? 1;
-  if (s !== 1) m = RIVAL_MODS.bidx.apply(m, s);
+  if (s !== 1) m = RIVAL_MODS.nongainx.apply(m, s);
   return V5_CALIBRATION.rho === undefined ? m : { ...m, rho: V5_CALIBRATION.rho };
 }
 
@@ -1922,13 +1947,14 @@ const RS = { score: 0, place: 1, win: 2, won: 3, paid: 4, balance: 5, words: 6, 
  * and dead letters, then 5 phase point sums, then the balance before auction 34).
  */
 async function replayLiveTables(
-  index: WordIndex, n: number, seed: number, modelOf: (stem: string) => RivalModel,
+  index: WordIndex, n: number, seed: number, modelOf: (stem: string) => RivalModel, realSookra = false,
 ): Promise<Map<string, number[]>> {
   const { tables } = liveV5();
   const acc = new Map<string, number[]>();
   for (let i = 0; i < n; i++) {
     const stems = tables[i % tables.length].slice(1) as string[];
-    const specs = stems.map((stem): SeatSpec => ({ kind: "fitted", name: stem, model: modelOf(stem) }));
+    const specs = stems.map((stem): SeatSpec =>
+      realSookra && stem === "SookraBot" ? sookra(stem, HEAD) : { kind: "fitted", name: stem, model: modelOf(stem) });
     const seats = (await playMatch(index, specs, mix(seed, i, 5), VICKREY, { regimes: true })).seats;
     for (const r of seats) {
       const ahead = seats.filter((o) => o.score > r.score).length;
@@ -1979,7 +2005,8 @@ function replaySummary(a: number[]) {
  * best competing bid), beside its live numbers over its fitted range. `entries`: v5 (the existing format),
  * v5c (complete7 bids and the likelihood-chosen word policies), v5u (bids in three regimes) or v5k (the
  * calibrated rivals, V5_CALIBRATION). `rho` replaces every rival's rack awareness; `mods` are rival model
- * modifiers (RIVAL_MODS) applied to every seat.
+ * modifiers (RIVAL_MODS) applied to every seat, and "real" among them seats this branch's SookraBot (head)
+ * where SookraBot sat instead of its fit, to see how the bot itself fares at the live tables.
  */
 export async function validate5(
   n: number, seed: number, rho?: number, entries: V5Entries = "v5c", mods = "",
@@ -1988,7 +2015,9 @@ export async function validate5(
   if (!Number.isInteger(seed)) throw new Error(`seed must be a whole number, got ${seed}`);
   if (rho !== undefined && !(rho >= 0 && rho < 1)) throw new Error(`rho must be in [0, 1) or "-", got ${rho}`);
   if (!V5_ENTRIES.includes(entries)) throw new Error(`entries must be one of ${V5_ENTRIES.join(", ")}, got ${entries}`);
-  const modList = parseRivalMods(mods);
+  // "real" (not a rival modifier): SookraBot's seats are played by this branch's SookraBot (head) instead of its fit.
+  const realSookra = mods.split("+").includes("real");
+  const modList = parseRivalMods(mods.split("+").filter((m) => m !== "real").join("+"));
   const { rivals: live } = liveV5();
   const models = new Map<string, RivalModel>();
   const modelOf = (stem: string): RivalModel => {
@@ -2000,14 +2029,16 @@ export async function validate5(
     }
     return model;
   };
-  const acc = await replayLiveTables(loadIndex(), n, seed, modelOf);
-  const label = (rho === undefined ? "fitted" : `rho ${rho}`) + (modList.length ? ` ${modList.join("+")}` : "");
+  const acc = await replayLiveTables(loadIndex(), n, seed, modelOf, realSookra);
+  const label = (rho === undefined ? "fitted" : `rho ${rho}`) + (modList.length ? ` ${modList.join("+")}` : "") +
+    (realSookra ? " real SookraBot" : "");
   const out = [...acc].map(([stem, a]) => {
     const obs = live[stem];
     const sim = replaySummary(a);
     return {
-      kind: "validate5", rival: `${stem}-${entries}`, stem, entries, top: V5_TOP.includes(stem),
-      rho: rho ?? models.get(stem)!.rho ?? 0, rhoFitted: rho === undefined, mods: modList.join("+"), label,
+      kind: "validate5", rival: realSookra && stem === "SookraBot" ? "SookraBot (head)" : `${stem}-${entries}`, stem, entries,
+      top: V5_TOP.includes(stem), rho: rho ?? models.get(stem)?.rho ?? 0, rhoFitted: rho === undefined,
+      mods: modList.join("+") + (realSookra ? (modList.length ? "+real" : "real") : ""), label,
       matches: n, seed, seats: a[RS.seats], sim,
       live: {
         score: obs.score, place: obs.place, win: obs.win, won: obs.won, paid: obs.paid, final_balance: obs.final_balance,
@@ -2025,15 +2056,15 @@ export async function validate5(
   return out;
 }
 
-/** A model with every survival bid (cells, complete7 and dead runs) times s (1: unchanged). */
+/** A model with its non-gainCells bids (cells, complete7 and dead runs: nongainx) times s (1: unchanged). */
 function scaleBids(m: RivalModel, s: number): RivalModel {
-  return s === 1 ? m : RIVAL_MODS.bidx.apply(m, s);
+  return s === 1 ? m : RIVAL_MODS.nongainx.apply(m, s);
 }
 
 /**
  * Fits per-rival bid scales so the replayed live tables (validate5) give each rival its live score:
- * `rounds` rounds of n matches (round r plays seed + 1000 r), every rival's bids (cells, complete7, dead
- * runs and gainCells of its `base` entry, after `mods`) times its scale. update "ratio": after a round
+ * `rounds` rounds of n matches (round r plays seed + 1000 r), every rival's non-gainCells bids (cells,
+ * complete7 and dead runs of its `base` entry, after `mods`; nongainx) times its scale. update "ratio": after a round
  * each rival's scale is multiplied by (live score / simulated score)^gamma, clamped to [0.5, 2] (a rival
  * scoring under 20 live keeps 1); this assumes a higher bid level raises a rival's score, which the v5
  * replays contradict (run 40090375596 diverged). update "secant": only the top rivals (V5_TOP) move,
