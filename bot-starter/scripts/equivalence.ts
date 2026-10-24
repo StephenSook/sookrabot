@@ -215,7 +215,9 @@ function checkWords(n: number, seed: number, ref: Strategy, ix: Indexes, policy:
       alpha: pick(r, [undefined, 0.35, 0.35, 0, 0.2]),
       realRivals: pick(r, [undefined, 0, 1, 1, 2, 3, 5, 5, 7]),
     };
-    const bagTotal = r() < 0.25 ? undefined : int(r, 0, 87);
+    // Bag positions a match has, and ones it never has (an off knob must not read them either).
+    const u2 = r();
+    const bagTotal = u2 < 0.2 ? undefined : u2 < 0.26 ? pick(r, [999, 1000, NaN, Infinity, -1, 0.5, 98]) : int(r, 0, 87);
     const rc = ix.refEngine.countsOf(rack);
     const cc = curEngine.countsOf(rack);
     const a = ref.chooseWords(ix.refIdx, { ...input, counts: rc, cands: ix.refIdx.scan(rc, true) });
@@ -258,7 +260,8 @@ function checkFlushAndHelpers(n: number, seed: number, ref: Strategy, ix: Indexe
     note(flush, fa === fb, fa, () => `shouldFlush(${bagTotal}, ${ms}, ${lead}): ref ${fa}, now ${fb}`);
     const fl = r() < 0.3;
     const aa = ref.alphaFor(fl);
-    const ab = cur.alphaFor(fl, p, r() < 0.8 ? int(r, 0, 87) : undefined);
+    const u3 = r();
+    const ab = cur.alphaFor(fl, p, u3 < 0.7 ? int(r, 0, 87) : u3 < 0.85 ? pick(r, [NaN, 999, -1, 0.5, Infinity]) : undefined);
     note(flush, aa === ab, aa > 0, () => `alphaFor(${fl}): ref ${aa}, now ${ab}`);
     // The bid helpers at random points, called as valueBid calls them.
     const bal = randomBalance(r);
@@ -330,10 +333,17 @@ class Server {
   bidCalls = 0;
   wordCalls = 0;
   flushWordCalls = 0;
-  /** Set by the driver while the match is inside the fixed flush window (for the counts only). */
+  /** Bids refused "Auction window expired" (sent after the auction's close time, as after a stall). */
+  lateBids = 0;
+  /** Set by the driver while the bot plays its end-of-match flush (for the counts only). */
   flushing = false;
 
-  constructor(auctionType: "Vickrey" | "FirstPrice", durationMs: number) {
+  constructor(
+    auctionType: "Vickrey" | "FirstPrice",
+    durationMs: number,
+    /** The server's clock, ms (the driver's simulated time). */
+    private readonly clock: () => number,
+  ) {
     this.match = {
       id: MATCH, status: { tag: "Running" }, currentAuctionId: undefined, bagTotal: 0,
       auctionType: { tag: auctionType }, auctionDurationMs: BigInt(durationMs), startingRackSize: 5,
@@ -351,14 +361,21 @@ class Server {
     bot: { id: { find: (id: bigint) => this.bots.get(id) } },
   };
 
+  // As spacetimedb/src/index.ts submitBid and submitWord check them.
   reducers = {
     submitBid: (a: { auctionId: bigint; amount: bigint }): Promise<unknown> => {
       this.calls.push(`bid a${a.auctionId} ${a.amount}`);
       this.bidCalls++;
+      if (a.amount < 0n) return Promise.reject(new Error("Bid must be non-negative"));
       const row = this.auctions.get(a.auctionId);
-      if (!row || row.status.tag !== "Open") return Promise.reject(new Error("Auction closed"));
+      if (!row) return Promise.reject(new Error("Unknown auction"));
+      if (row.status.tag !== "Open") return Promise.reject(new Error("Auction closed"));
+      if (BigInt(this.clock()) * 1000n >= row.closesAt!.microsSinceUnixEpoch) {
+        this.lateBids++;
+        return Promise.reject(new Error("Auction window expired"));
+      }
       if (a.amount > this.me().balance) return Promise.reject(new Error("Insufficient balance"));
-      if (a.amount <= 0n) this.live.delete(a.auctionId);
+      if (a.amount === 0n) this.live.delete(a.auctionId);
       else this.live.set(a.auctionId, a.amount);
       return Promise.resolve();
     },
@@ -366,6 +383,7 @@ class Server {
       this.calls.push(`word ${a.word}`);
       this.wordCalls++;
       if (this.flushing) this.flushWordCalls++;
+      if (this.match.status.tag !== "Running") return Promise.reject(new Error("Match not running"));
       const need = curEngine.countsOf(a.word);
       for (let i = 0; i < 26; i++) {
         if ((this.rack.get(LETTERS[i]) ?? 0) < need[i]) return Promise.reject(new Error(`Not enough letters for ${a.word}`));
@@ -415,9 +433,18 @@ interface MatchResult {
   bids: number;
   words: number;
   flushWords: number;
+  lateBids: number;
 }
 
-/** One simulated match, the same for both bots: rivals, sims, bag, lags and tie-breaks come from `seed` alone. */
+/**
+ * One simulated match, the same for both bots: rivals, sims, bag, lags and tie-breaks come from `seed`
+ * alone. As in the module, an auction closes at its close time and the next one opens in the same
+ * transaction: the bots get the result and the next auction's open together (index.ts callbacks: result,
+ * then the open with its bid from the precomputed table, then the refresh a rack or balance update
+ * schedules), and only then run deferred work. A bot receives each open `lag` ms after it opened; a bid
+ * sent at or after the close time is refused "Auction window expired", as after a stall. The two servers'
+ * reducer calls are compared after every auction and after the match ends.
+ */
 async function lockstepMatch(
   seed: number, ix: Indexes, refBot: BotModule, policy: Policy | undefined, trace: boolean,
 ): Promise<MatchResult> {
@@ -435,7 +462,7 @@ async function lockstepMatch(
     new refBot.SookraBot(ix.refIdx, "SookraBot", trace ? traced : quiet, now) as unknown as BotLike,
     new curBot.SookraBot(ix.curIdx, "SookraBot", quiet, now, policy) as unknown as BotLike,
   ];
-  const servers = [new Server(auctionType, durationMs), new Server(auctionType, durationMs)];
+  const servers = [new Server(auctionType, durationMs, now), new Server(auctionType, durationMs, now)];
   // Rivals: real bots (random bidders, rich or frugal, that cash words now and then) and sims (the module's rule).
   const rivals = Array.from({ length: seats - 1 }, (_, i) => ({
     id: BigInt(20 + i), sim: r() < 0.3, strategy: pick(r, SIMS), style: r(),
@@ -464,31 +491,40 @@ async function lockstepMatch(
     b.online = true;
   }
   const auctions = bag.length - RULES.RACK * seats;
-  const lags: number[] = [];
-  for (let i = 0; i < auctions; i++) {
-    const letter = bag[next++];
+  const letters = bag.slice(next, next + auctions);
+  const recvLags: number[] = [];
+  let opensMs = clock;
+
+  /** Opens auction i on both servers at `opensMs`; the bots receive it `lag` ms later (the clock moves there). */
+  const openAuction = (i: number): AuctionRow[] => {
     const id = BigInt(1000 + i);
     const bagTotal = auctions - 1 - i;
     const lag = r() < stallRate ? int(r, 1500, 5000) : int(r, 0, 90);
-    const opensMs = clock - lag;
-    // The bot receives the auction at `clock`, so its receive lag is `lag`; it plays its flush once the fixed
-    // rule or the stall-aware lead says so (bot.ts refresh), which this mirrors for the counts.
-    lags.push(lag);
-    const flushing = cur.shouldFlush(bagTotal, durationMs) || cur.shouldFlush(bagTotal, durationMs, cur.flushLeadMs(lags));
-    for (const s of servers) {
+    clock = Math.max(clock, opensMs + lag);
+    // The bot's receive lag (bot.ts recvLags) and so the flush it plays: the fixed rule or the stall-aware lead.
+    recvLags.push(clock - opensMs);
+    const flushing =
+      cur.shouldFlush(bagTotal, durationMs) || cur.shouldFlush(bagTotal, durationMs, cur.flushLeadMs(recvLags));
+    return servers.map((s) => {
       s.match.bagTotal = bagTotal;
       s.match.currentAuctionId = id;
       s.flushing = flushing;
-      s.auctions.set(id, {
-        id, matchId: MATCH, letter, status: { tag: "Open" },
+      const row: AuctionRow = {
+        id, matchId: MATCH, letter: letters[i], status: { tag: "Open" },
         opensAt: { microsSinceUnixEpoch: BigInt(opensMs) * 1000n },
         closesAt: { microsSinceUnixEpoch: BigInt(opensMs + durationMs) * 1000n },
-      });
-    }
-    bots.forEach((b, j) => b.onAuctionOpen(servers[j], servers[j].auctions.get(id)!));
-    await settle(servers);
-    clock += Math.floor(durationMs / 2);
-    // Rival bids, tie-break priorities and rival cash: drawn the same way whatever the bots did.
+      };
+      s.auctions.set(id, row);
+      return row;
+    });
+  };
+
+  /** Closes auction i on both servers at its close time (rival bids drawn the same way whatever the bots did). */
+  const closeAuction = (i: number): AuctionResultRow[] => {
+    const id = BigInt(1000 + i);
+    const letter = letters[i];
+    opensMs += durationMs; // the close time, and the next auction's open
+    clock = Math.max(clock, opensMs);
     const face = curEngine.LETTER_VALUE[letter] ?? 1;
     const rivalBids = rivals.map((v) => {
       const u = r();
@@ -501,8 +537,7 @@ async function lockstepMatch(
     });
     const prio = Array.from({ length: seats }, () => r());
     const cash = rivals.map(() => (r() < 0.08 ? int(r, 8, 45) : 0));
-    const results: AuctionResultRow[] = [];
-    for (const s of servers) {
+    return servers.map((s) => {
       const mine = Number(s.live.get(id) ?? 0n);
       const balances = [Number(s.me().balance), ...rivals.map((v) => Number(s.seat(v.id).balance))];
       const amounts = [Math.min(mine, balances[0]), ...rivalBids.map((b, j) => Math.min(b, balances[j + 1]))];
@@ -527,35 +562,48 @@ async function lockstepMatch(
       s.auctions.set(id, { ...s.auctions.get(id)!, status: { tag: "Closed" } });
       s.match.currentAuctionId = undefined;
       s.live.delete(id);
-      results.push({
+      return {
         auctionId: id, matchId: MATCH, letter, paid: BigInt(paid),
         winnerBotId: w < 0 ? undefined : w === 0 ? ME : rivals[w - 1].id,
-      });
-    }
+      };
+    });
+  };
+
+  const counts = (): Omit<MatchResult, "auctions" | "differ"> => {
+    const [a] = servers;
+    return { bids: a.bidCalls, words: a.wordCalls, flushWords: a.flushWordCalls, lateBids: a.lateBids };
+  };
+  /** A description of the first call where the two servers differ, or null. */
+  const compare = (where: string): string | null => {
+    const [a, b] = servers;
+    if (a.calls.length === b.calls.length && a.calls.every((c, j) => c === b.calls[j])) return null;
+    let j = 0;
+    while (j < a.calls.length && a.calls[j] === b.calls[j]) j++;
+    return `match seed ${seed} (${seats} seats, ${auctionType}, ${durationMs} ms), ${where}: ` +
+      `ref ${JSON.stringify(a.calls.slice(j, j + 4))}, now ${JSON.stringify(b.calls.slice(j, j + 4))}`;
+  };
+
+  const first = openAuction(0);
+  bots.forEach((b, j) => b.onAuctionOpen(servers[j], first[j]));
+  await settle(servers);
+  let differ = compare(`auction 0 (bag ${auctions - 1}, ${letters[0]})`);
+  if (differ) return { auctions: 1, differ, ...counts() };
+  for (let i = 0; i < auctions; i++) {
+    const results = closeAuction(i);
+    const opened = i + 1 < auctions ? openAuction(i + 1) : null;
     bots.forEach((b, j) => {
       b.onAuctionResult(servers[j], results[j]);
+      if (opened) b.onAuctionOpen(servers[j], opened[j]);
       b.scheduleRefresh(servers[j], MATCH); // index.ts: rack and balance updates schedule a refresh
     });
     await settle(servers);
-    clock += Math.ceil(durationMs / 2);
-    const [a, b] = servers;
-    if (a.calls.length !== b.calls.length || a.calls.some((c, j) => c !== b.calls[j])) {
-      let j = 0;
-      while (j < a.calls.length && a.calls[j] === b.calls[j]) j++;
-      return {
-        auctions: i + 1,
-        differ:
-          `match seed ${seed}, auction ${i} (bag ${bagTotal}, ${letter}, ${seats} seats, ${auctionType}, ${durationMs} ms): ` +
-          `ref ${JSON.stringify(a.calls.slice(j, j + 4))}, now ${JSON.stringify(b.calls.slice(j, j + 4))}`,
-        bids: a.bidCalls, words: a.wordCalls, flushWords: a.flushWordCalls,
-      };
-    }
+    differ = compare(`after auction ${i} (${letters[i]})${opened ? `, auction ${i + 1} open (${letters[i + 1]})` : ""}`);
+    if (differ) return { auctions: i + 1, differ, ...counts() };
   }
   for (const s of servers) s.match.status = { tag: "Ended" };
   bots.forEach((b, j) => b.onMatchEnded(servers[j], MATCH));
   await settle(servers);
-  const [a] = servers;
-  return { auctions, differ: null, bids: a.bidCalls, words: a.wordCalls, flushWords: a.flushWordCalls };
+  return { auctions, differ: compare("match end"), ...counts() };
 }
 
 // ---- main ----
@@ -592,22 +640,25 @@ async function main() {
   let bidCalls = 0;
   let wordCalls = 0;
   let flushWordCalls = 0;
+  let lateBids = 0;
   for (let m = lo; m < hi; m++) {
     const res = await lockstepMatch(mix(o.seed, 7, m), ix, refBot, policy, o.trace);
     auctions += res.auctions;
     bidCalls += res.bids;
     wordCalls += res.words;
     flushWordCalls += res.flushWords;
+    lateBids += res.lateBids;
     note(bots, res.differ === null, res.words > 0, () => res.differ!);
   }
-  out.bots = { matches: hi - lo, auctions, bidCalls, wordCalls, flushWordCalls, ...bots };
+  out.bots = { matches: hi - lo, auctions, bidCalls, wordCalls, flushWordCalls, lateBids, ...bots };
   if (hi > lo) all.push(bots);
   const differ = all.reduce((s, t) => s + t.differ, 0);
-  // Not vacuous: every check ran and saw non-trivial results (bids above 0, words played, plays in the flush window).
+  // Not vacuous: every check ran and saw non-trivial results (bids above 0, words played, plays in the flush
+  // window, and from 20 matches on bids refused after a stall).
   const exercised =
     all.length > 0 &&
     all.every((t) => t.compared > 0 && t.nonTrivial > 0) &&
-    (hi === lo || (bidCalls > 0 && wordCalls > 0 && flushWordCalls > 0));
+    (hi === lo || (bidCalls > 0 && wordCalls > 0 && flushWordCalls > 0 && (hi - lo < 20 || lateBids > 0)));
   out.differ = differ;
   out.exercised = exercised;
   console.log(JSON.stringify(out, null, 1));
