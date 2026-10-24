@@ -13,12 +13,16 @@ import {
   type MatchStateRow,
   type ParticipantRow,
   MAX_WORD_FAILURES,
+  PENDING_CALL_DEADLINE_MAX_MS,
   PENDING_CALL_DEADLINE_MS,
   SookraBot,
   TRANSPORT_BACKOFF_MS,
+  WORD_LATENCY_WINDOW,
 } from "./bot.js";
 import { WordIndex, countsOf, letterIndex, wordReward } from "./engine.js";
+import { ConnectionLifecycle } from "./lifecycle.js";
 import { maxSimBid } from "./strategy.js";
+import { Supervisor, type Scheduler } from "./supervisor.js";
 
 const INDEX = WordIndex.fromWords(
   fs.readFileSync(new URL("../../spacetimedb/wordlist.txt", import.meta.url), "utf8").split("\n"),
@@ -97,22 +101,7 @@ class FakeServer implements ConnLike {
       this.wordAttempts++;
       this.attempted.push(a.word);
       if (this.wordTransportDown) return Promise.reject(new FakeDisconnected());
-      const land = () => {
-        if (this.refuseWords) throw new Error(this.refuseWords);
-        const need = countsOf(a.word);
-        const have = countsOf(this.rackString());
-        for (let i = 0; i < 26; i++) {
-          if (have[i] < need[i]) throw new Error(`Not enough letters for ${a.word}`);
-        }
-        for (const c of a.word) {
-          const h = this.rack.find((r) => r.letter === c && r.count > 0)!;
-          h.count--;
-        }
-        const me = this.participants.find((p) => p.botId === ME && p.matchId === a.matchId)!;
-        me.balance += BigInt(wordReward(a.word));
-        me.score += BigInt(wordReward(a.word));
-        this.words.push(a.word);
-      };
+      const land = () => this.runWord(a);
       if (this.held) {
         const held = this.held;
         return new Promise((resolve, reject) => {
@@ -135,6 +124,28 @@ class FakeServer implements ConnLike {
       }
     },
   };
+
+  /**
+   * The module running a word play: refused (throws) unless every letter is
+   * held, checked before any is taken (game.ts playWord), else the letters go
+   * and the reward is credited.
+   */
+  runWord(a: { matchId: bigint; word: string }) {
+    if (this.refuseWords) throw new Error(this.refuseWords);
+    const need = countsOf(a.word);
+    const have = countsOf(this.rackString());
+    for (let i = 0; i < 26; i++) {
+      if (have[i] < need[i]) throw new Error(`Not enough letters for ${a.word}`);
+    }
+    for (const c of a.word) {
+      const h = this.rack.find((r) => r.letter === c && r.count > 0)!;
+      h.count--;
+    }
+    const me = this.participants.find((p) => p.botId === ME && p.matchId === a.matchId)!;
+    me.balance += BigInt(wordReward(a.word));
+    me.score += BigInt(wordReward(a.word));
+    this.words.push(a.word);
+  }
 
   rackString(): string {
     return this.rack.map((h) => h.letter.repeat(h.count)).join("");
@@ -540,6 +551,255 @@ test("a stuck call failed by the replacement (as the SDK does) is not replayed u
   await settle();
   assert.deepEqual(s.attempted, ["QINTARS", "QINTARS"]);
   assert.deepEqual(s.words, ["QINTARS"]);
+});
+
+test("the word-call deadline adapts: twice the slowest recent call (a report counts what it waited), 5 s to 60 s", async () => {
+  const clock = { t: 11_000_000 };
+  const { s, bot } = setup("RETAINSQ", 30, "E", { clock });
+  const reports: { at: number; deadline: number }[] = [];
+  bot.onStuck = () => reports.push({ at: clock.t, deadline: bot.wordDeadlineMs() });
+  /** QINTARS goes out now and is answered `ms` later (no tick runs meanwhile). */
+  const answeredAfter = async (ms: number) => {
+    s.setRack("RETAINSQ");
+    s.held = [];
+    bot.refresh(s, MATCH);
+    await settle();
+    assert.equal(s.held.length, 1, "one call out");
+    clock.t += ms;
+    s.held[0]();
+    s.held = null;
+    await settle();
+  };
+  assert.equal(bot.wordDeadlineMs(), PENDING_CALL_DEADLINE_MS, "a fresh bot starts at the base");
+  await answeredAfter(6000);
+  assert.equal(bot.wordDeadlineMs(), 12_000, "an answer after 6 s: twice that");
+  for (let i = 1; i < WORD_LATENCY_WINDOW; i++) await answeredAfter(100);
+  assert.equal(bot.wordDeadlineMs(), 12_000, "the slow call is still among the last WORD_LATENCY_WINDOW");
+  await answeredAfter(100);
+  assert.equal(bot.wordDeadlineMs(), PENDING_CALL_DEADLINE_MS, "prompt answers bring it back to the base");
+  assert.equal(s.words.length, 1 + WORD_LATENCY_WINDOW);
+  assert.equal(reports.length, 0, "answered calls are never reported");
+  // A call never answered, on a connection nothing replaces here: it is reported again
+  // every deadline, and each report doubles what it had waited, up to the cap.
+  s.setRack("RETAINSQ");
+  s.held = [];
+  bot.refresh(s, MATCH);
+  await settle();
+  const sentAt = clock.t;
+  for (let ms = 250; ms <= 300_000; ms += 250) {
+    clock.t = sentAt + ms;
+    bot.tick(s);
+  }
+  await settle();
+  assert.deepEqual(
+    reports.slice(0, 4).map((r) => r.deadline),
+    [10_500, 32_000, PENDING_CALL_DEADLINE_MAX_MS, PENDING_CALL_DEADLINE_MAX_MS],
+    "reported at 5,250, 16,000, 48,250 and 108,500 ms",
+  );
+  let last = sentAt;
+  let allowed = PENDING_CALL_DEADLINE_MS;
+  for (const r of reports) {
+    const gap = r.at - last;
+    assert.ok(gap > allowed && gap <= allowed + 250, `reported ${gap} ms after the last, deadline ${allowed} ms`);
+    last = r.at;
+    allowed = r.deadline;
+  }
+  assert.equal(reports.length, 7);
+  assert.equal(s.attempted.length, 2 + WORD_LATENCY_WINDOW, "the unanswered call is never sent again: its reservation holds");
+});
+
+// ---- End to end: the bot, the supervisor and the lifecycle wired as index.ts wires them ----
+
+/** index.ts's tick interval. */
+const TICK_MS = 250;
+
+/** Fake timers for the supervisor, the lifecycle and slow answers; the bot reads `t` as its clock. */
+class FakeClock implements Scheduler {
+  private seq = 0;
+  private readonly timers = new Map<number, { at: number; fn: () => void }>();
+  constructor(public t = 0) {}
+  setTimeout(fn: () => void, ms: number): unknown {
+    this.timers.set(++this.seq, { at: this.t + ms, fn });
+    return this.seq;
+  }
+  clearTimeout(handle: unknown): void {
+    this.timers.delete(handle as number);
+  }
+  now(): number {
+    return this.t;
+  }
+  /** Fire every timer due within `ms`, earliest first (ties in the order they were set). */
+  advance(ms: number) {
+    const end = this.t + ms;
+    for (;;) {
+      let next: [number, { at: number; fn: () => void }] | undefined;
+      for (const e of this.timers) if (e[1].at <= end && (!next || e[1].at < next[1].at)) next = e;
+      if (!next) break;
+      this.timers.delete(next[0]);
+      this.t = next[1].at;
+      next[1].fn();
+    }
+    this.t = end;
+  }
+}
+
+/**
+ * One connection object to `s`, as build() returns it in index.ts. A word
+ * call reaches the server at once; the server runs it `latencyMs` later
+ * (never, for Infinity) and answers then, but only while this connection is
+ * open: disconnect() fails every call still waiting with
+ * UnknownCallResultError, as the SDK does, and the server runs it anyway.
+ * Bids are answered at once.
+ */
+class SlowLink implements ConnLike {
+  readonly db: ConnLike["db"];
+  readonly reducers: ConnLike["reducers"];
+  private readonly waiting = new Set<(err: unknown) => void>();
+  constructor(s: FakeServer, clock: FakeClock, latencyMs: number) {
+    this.db = s.db;
+    this.reducers = {
+      submitBid: async (a) => {
+        s.bids.push(a);
+      },
+      submitWord: (a) =>
+        new Promise((resolve, reject) => {
+          s.wordAttempts++;
+          s.attempted.push(a.word);
+          this.waiting.add(reject);
+          if (latencyMs === Infinity) return; // lost on the way: the server never runs it
+          clock.setTimeout(() => {
+            let refusal: unknown = null;
+            try {
+              s.runWord(a);
+            } catch (err) {
+              refusal = err;
+            }
+            if (!this.waiting.delete(reject)) return; // dropped first: the answer is lost
+            if (refusal === null) resolve(undefined);
+            else reject(refusal);
+          }, latencyMs);
+        }),
+    };
+  }
+  disconnect() {
+    const waiting = [...this.waiting];
+    this.waiting.clear();
+    for (const reject of waiting) reject(new FakeUnknownResult());
+  }
+}
+
+/**
+ * SookraBot, the Supervisor and the ConnectionLifecycle wired as index.ts
+ * wires them (the supervisor and lifecycle hooks, bot.onStuck, onApplied,
+ * bootstrapActivity, and the tick interval with its watchdog), over
+ * SlowLinks to one server holding RETAINSQ. Only the SDK and the clock are
+ * fakes: a connection's handshake and subscription complete as it is built,
+ * and while it is live an auction opens every second. `latencyMs(n)` is the
+ * answer time on the n-th connection built (0 first).
+ */
+async function wired(opts: { latencyMs: (n: number) => number; refuseWords?: string }) {
+  const clock = new FakeClock();
+  const { s, bot, warns } = setup("RETAINSQ", 30, "E", { clock });
+  s.refuseWords = opts.refuseWords ?? null;
+  bot.online = false; // until the first subscription is applied
+  const links: SlowLink[] = [];
+  let activeConn: ConnLike | null = null;
+  const supervisor = new Supervisor(
+    {
+      setOnline: (online) => {
+        bot.online = online;
+      },
+      resubscribe: () => {},
+      reconnect: (why) => lifecycle.replace(why),
+      log: () => {},
+    },
+    clock,
+  );
+  const lifecycle: ConnectionLifecycle<SlowLink> = new ConnectionLifecycle<SlowLink>(
+    supervisor,
+    {
+      build: (id) => {
+        const link = new SlowLink(s, clock, opts.latencyMs(links.length));
+        links.push(link);
+        clock.setTimeout(() => {
+          if (!lifecycle.accept(link, id)) return; // onConnect
+          if (id !== supervisor.conn) return; // onApplied
+          supervisor.onApplied(id);
+          activeConn = link; // bootstrapActivity
+          bot.tick(link);
+        }, 0);
+        return link;
+      },
+      deactivate: () => {
+        activeConn = null;
+      },
+      log: () => {},
+      warn: () => {},
+    },
+    clock,
+  );
+  bot.onStuck = (c, why) => {
+    if (c === activeConn) supervisor.reportStuck(supervisor.conn, why);
+  };
+  lifecycle.start();
+  clock.advance(0);
+  await settle(); // QINTARS goes out at t = 0
+  let auctionId = 200n;
+  /** Run to `until`, TICK_MS at a time; `each(t)` runs first at every step. */
+  const run = async (until: number, each: (t: number) => void = () => {}) => {
+    while (clock.t < until) {
+      clock.advance(TICK_MS);
+      await settle();
+      each(clock.t);
+      const c = activeConn;
+      if (!c) continue;
+      if (clock.t % 1000 === 0) {
+        supervisor.noteAuctionEvent();
+        bot.onAuctionOpen(c, s.nextAuction(auctionId++, "E", 29));
+      }
+      bot.tick(c);
+      supervisor.watchdog(supervisor.conn, bot.runningMatches(c).length > 0, 1000);
+      await settle();
+    }
+  };
+  return { s, bot, warns, links, run };
+}
+
+test("Codex repro, wired: word calls answered after 6 s replace a working connection once, not on every play", async () => {
+  const w = await wired({ latencyMs: () => 6000 });
+  await w.run(30_000, (t) => {
+    if (t === 8000 || t === 16_000) w.s.setRack("RETAINSQ"); // fresh playable racks, as in the repro
+  });
+  assert.deepEqual(w.s.words, ["QINTARS", "QINTARS", "QINTARS"], "every play ran on the server");
+  assert.equal(w.s.participants[0].score, 144n);
+  assert.equal(w.s.attempted.length, 3, "none was sent twice");
+  assert.equal(w.links.length, 2, "one replacement, for the first slow answer; none for the plays after it");
+  assert.equal(w.bot.wordDeadlineMs(), 12_000, "twice the 6 s the accepted plays took");
+});
+
+test("Codex repro, wired: a refusal answered after 6 s is counted, not lost to a replacement every time", async () => {
+  const w = await wired({ latencyMs: () => 6000, refuseWords: "'QINTARS' is not in the dictionary" });
+  await w.run(40_000);
+  assert.equal(w.links.length, 2, "one replacement, for the first slow answer");
+  assert.equal(w.s.attempted.length, 1 + MAX_WORD_FAILURES, "lost once with the replaced connection, then refused until the cap");
+  assert.equal(w.warns.filter((m) => m.includes("play 'QINTARS' refused")).length, MAX_WORD_FAILURES);
+  assert.deepEqual(w.s.words, []);
+  assert.equal(w.bot.wordDeadlineMs(), 12_000, "twice the 6 s the refusals took");
+});
+
+test("wired controls: a prompt server never loses its connection; a call never answered still gets one replaced", async () => {
+  const fast = await wired({ latencyMs: () => 50 });
+  await fast.run(30_000, (t) => {
+    if (t === 8000 || t === 16_000) fast.s.setRack("RETAINSQ");
+  });
+  assert.deepEqual(fast.s.words, ["QINTARS", "QINTARS", "QINTARS"]);
+  assert.equal(fast.links.length, 1, "no replacement");
+  // The first connection never answers a word call; the next answers at once.
+  const lost = await wired({ latencyMs: (n) => (n === 0 ? Infinity : 50) });
+  await lost.run(20_000);
+  assert.equal(lost.links.length, 2, "replaced after the first deadline");
+  assert.deepEqual(lost.s.attempted, ["QINTARS", "QINTARS"], "played again on the new connection, once");
+  assert.deepEqual(lost.s.words, ["QINTARS"]);
 });
 
 test("a play in flight counts toward the balance: no needless liquidity word while its reward is pending", async () => {

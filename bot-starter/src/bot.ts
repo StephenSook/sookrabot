@@ -112,13 +112,18 @@ export const MAX_BID_FAILURES = 3;
 /** After a transport failure (disconnect), wait this long before submitting words again. */
 export const TRANSPORT_BACKOFF_MS = 1000;
 /**
- * A word call still unanswered this long on the connection it went out on
- * means that connection is unhealthy although events still arrive: the bot
- * asks for a new one (onStuck). Its reservation is kept meanwhile (expiring
- * it on time alone could submit the same letters twice); the new
- * connection's rack settles it.
+ * A word call still unanswered past the word-call deadline on the connection
+ * it went out on means that connection is unhealthy although events still
+ * arrive: the bot asks for a new one (onStuck). Its reservation is kept
+ * meanwhile (expiring it on time alone could submit the same letters twice);
+ * the new connection's rack settles it. This is the deadline while the
+ * server answers promptly; it adapts to a slow one (SookraBot.wordDeadlineMs).
  */
 export const PENDING_CALL_DEADLINE_MS = 5000;
+/** The word-call deadline never grows past this. */
+export const PENDING_CALL_DEADLINE_MAX_MS = 60_000;
+/** Word calls (answered, or reported overdue) the word-call deadline looks back over. */
+export const WORD_LATENCY_WINDOW = 8;
 /** Log a valuation slower than this. */
 export const SLOW_VALUATION_MS = 50;
 /** Valuation tables kept per match (current rack, rack + letter on auction, flush variants). */
@@ -140,7 +145,7 @@ interface PendingWord {
   /** The connection the call went out on. */
   conn: ConnLike;
   at: number;
-  /** When it was sent or last reported overdue: it is reported again every PENDING_CALL_DEADLINE_MS. */
+  /** When it was sent or last reported overdue: it is reported again every word-call deadline. */
   checkedAt: number;
 }
 
@@ -244,9 +249,9 @@ export class SookraBot {
   /** Called with one record per auction result in our matches (for an offline log). */
   onRecord: ((rec: Record<string, unknown>) => void) | null = null;
   /**
-   * Called with the connection a word call has gone unanswered on for
-   * PENDING_CALL_DEADLINE_MS (and again each deadline while that lasts);
-   * index.ts has the supervisor replace that connection.
+   * Called with the connection a word call has gone unanswered on for the
+   * word-call deadline (wordDeadlineMs; again each deadline while that
+   * lasts); index.ts has the supervisor replace that connection.
    */
   onStuck: ((conn: ConnLike, reason: string) => void) | null = null;
   readonly models = new Map<string, MatchModel>();
@@ -256,6 +261,12 @@ export class SookraBot {
   private readonly lastWarn = new Map<string, number>();
   private readonly indexVerified = new Set<string>();
   private useIndex = true;
+  /**
+   * How long each of the last WORD_LATENCY_WINDOW word calls took to be
+   * answered (accepted or refused); a call reported overdue counts with how
+   * long it had waited by then. Kept across connections: it measures the server.
+   */
+  private readonly wordLatencies: number[] = [];
 
   constructor(
     private readonly index: WordIndex,
@@ -534,6 +545,29 @@ export class SookraBot {
   }
 
   /**
+   * How long a word call may go unanswered on its connection before the bot
+   * asks for a new one: twice the slowest of the last WORD_LATENCY_WINDOW
+   * calls, within PENDING_CALL_DEADLINE_MS..PENDING_CALL_DEADLINE_MAX_MS. A
+   * fixed deadline replaces a working connection on every play once the
+   * server takes longer than it to answer, and each replacement loses the
+   * late answer, a refusal included (the SDK fails the call as
+   * UnknownCallResultError, which never counts toward MAX_WORD_FAILURES). A
+   * report therefore at least doubles the deadline (up to the cap), and it is
+   * back at the base once each of the last WORD_LATENCY_WINDOW calls was
+   * answered within half of the base.
+   */
+  wordDeadlineMs(): number {
+    let slowest = 0;
+    for (const ms of this.wordLatencies) slowest = Math.max(slowest, ms);
+    return Math.min(PENDING_CALL_DEADLINE_MAX_MS, Math.max(PENDING_CALL_DEADLINE_MS, 2 * slowest));
+  }
+
+  private noteWordLatency(ms: number) {
+    this.wordLatencies.push(ms);
+    while (this.wordLatencies.length > WORD_LATENCY_WINDOW) this.wordLatencies.shift();
+  }
+
+  /**
    * Word calls still unanswered; `conn` is the connection the bot acts on
    * (tick runs only while it is online, so its subscription is applied).
    * A call sent on an earlier connection is settled by this one: the rack
@@ -543,6 +577,7 @@ export class SookraBot {
    */
   private checkPending(conn: ConnLike) {
     const t = this.now();
+    const deadline = this.wordDeadlineMs();
     let overdue: string | null = null;
     for (const [key, model] of this.models) {
       for (const [id, p] of model.pending) {
@@ -551,9 +586,11 @@ export class SookraBot {
           this.log(`m${key}: play '${p.word}' unanswered when its connection was replaced; the rack decides`);
           continue;
         }
-        if (t - p.checkedAt > PENDING_CALL_DEADLINE_MS) {
+        if (t - p.checkedAt > deadline) {
           p.checkedAt = t;
-          overdue ??= `m${key}: play '${p.word}' unanswered for ${t - p.at} ms`;
+          // Its answer, if one ever comes, takes at least this long: the next deadline is longer.
+          this.noteWordLatency(t - p.at);
+          overdue ??= `m${key}: play '${p.word}' unanswered for ${t - p.at} ms (deadline ${deadline} ms)`;
         }
       }
     }
@@ -757,17 +794,21 @@ export class SookraBot {
       this.warn(`play '${word}'`, err);
       return;
     }
-    p.catch((err: unknown) => {
-      model.submitted--;
-      if (isTransportError(err)) {
-        // Not the word's fault: back off and retry after reconnecting.
-        model.wordBackoffUntil = this.now() + TRANSPORT_BACKOFF_MS;
-        this.warn(`play '${word}' (transport)`, err);
-      } else {
-        model.wordFailures.set(word, (model.wordFailures.get(word) ?? 0) + 1);
-        this.out.warn(`[${this.name}] m${matchId}: play '${word}' refused: ${errMsg(err)}`);
-      }
-    }).finally(() => {
+    p.then(
+      () => this.noteWordLatency(this.now() - at),
+      (err: unknown) => {
+        model.submitted--;
+        if (isTransportError(err)) {
+          // Not the word's fault: back off and retry after reconnecting.
+          model.wordBackoffUntil = this.now() + TRANSPORT_BACKOFF_MS;
+          this.warn(`play '${word}' (transport)`, err);
+        } else {
+          this.noteWordLatency(this.now() - at);
+          model.wordFailures.set(word, (model.wordFailures.get(word) ?? 0) + 1);
+          this.out.warn(`[${this.name}] m${matchId}: play '${word}' refused: ${errMsg(err)}`);
+        }
+      },
+    ).finally(() => {
       model.pending.delete(id);
       this.scheduleRefresh(conn, matchId);
     });
