@@ -57,10 +57,16 @@ export const FP_NO_HISTORY_SHADE = 0.75;
 export const BROKE_RIVAL_MAX_BID = 2;
 /** Duel liquidity applies at tables with at most this many rivals (the 3-game final is 1v1). */
 export const DUEL_MAX_OPPONENTS = 1;
-/** Coins held back per remaining auction in a duel ... */
-export const DUEL_RESERVE_PER_AUCTION = 2;
-/** ... counting at most this many remaining auctions (so the reserve is at most 30). */
-export const DUEL_RESERVE_WINDOW = 15;
+/**
+ * Coins held back per remaining auction in a duel, counting at most
+ * DUEL_RESERVE_WINDOW auctions (so the reserve is at most 10). Sized by the
+ * duel sim (400 deal-paired 88-auction duels, seed 31, score difference vs
+ * rival): no reserve -9.3 vs a kappa-4.25 hoarder and +24.1 vs kappa 8;
+ * 1 x 10 gave -5.2 and +34.5 (within noise, SE about 10 to 14); 2 x 15
+ * gave -84.7 and -8.0, so a large reserve loses mid-game letters.
+ */
+export const DUEL_RESERVE_PER_AUCTION = 1;
+export const DUEL_RESERVE_WINDOW = 10;
 
 // ---- Types ----
 

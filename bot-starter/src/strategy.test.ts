@@ -254,17 +254,19 @@ test("duel rule: bids never exceed the richest rival's balance + 1", () => {
 
 test("duel rule: one rival means a cash reserve sized to the remaining auctions", () => {
   assert.equal(DUEL_MAX_OPPONENTS, 1);
-  assert.equal(duelReserve(1, 30), DUEL_RESERVE_PER_AUCTION * DUEL_RESERVE_WINDOW); // 30
-  assert.equal(duelReserve(1, 10), 20);
+  assert.equal(duelReserve(1, 30), DUEL_RESERVE_PER_AUCTION * DUEL_RESERVE_WINDOW); // 10
+  assert.equal(duelReserve(1, 30), 10);
+  assert.equal(duelReserve(1, 5), 5);
   assert.equal(duelReserve(1, 0), 0);
   assert.equal(duelReserve(2, 30), 0);
   const rich: Opponent[] = [{ isSim: false, balance: 100 }];
   const duel = (myBalance: number, bagTotal: number, delta = 6) =>
     decideBid({ letter: "S", delta, bagTotal, auctionType: "Vickrey", myBalance, opponents: rich }).amount;
-  assert.equal(duel(100, 30), 25); // reserve 30 does not bind: floor(4.25 * 6)
-  assert.equal(duel(40, 20), 10); // 40 - 30 reserve
-  assert.equal(duel(12, 5), 2); // inside the reserve: an even share, floor(12 / 6)
-  assert.equal(duel(3, 1), 1); // floor(3 / 2)
+  assert.equal(duel(100, 30), 25); // reserve does not bind: floor(4.25 * 6)
+  assert.equal(duel(20, 20), 10); // 20 - 10 reserve
+  assert.equal(duel(12, 5), 7); // kappa doubled (51), capped at 12 - 5
+  assert.equal(duel(5, 20), 0); // inside the reserve: an even share, floor(5 / 21)
+  assert.equal(duel(3, 1), 2); // max(3 - 1, floor(3 / 2))
   // Six-bot tables keep the measured kappa rule.
   const five: Opponent[] = Array.from({ length: 5 }, () => ({ isSim: false, balance: 100 }));
   assert.equal(
