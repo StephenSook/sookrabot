@@ -491,21 +491,25 @@ test("shouldFlush: always at the final auction, earlier for short auctions", () 
   assert.equal(shouldFlush(3, 0), false);
 });
 
-test("flushLeadMs: unchanged under normal lag, longer after a stall, capped", () => {
+test("flushLeadMs: unchanged under normal jitter, longer after a stall, skew-proof, capped", () => {
   assert.equal(flushLeadMs([]), FLUSH_LEAD_MS);
   assert.equal(flushLeadMs([67, 158, 72, -30]), FLUSH_LEAD_MS);
   assert.equal(flushLeadMs([1000]), FLUSH_LEAD_MS);
-  // The venue Wi-Fi stall measured Friday (1,136 ms) still flushes in the last 3 auctions.
-  assert.equal(shouldFlush(3, 1000, flushLeadMs([1136])), false);
-  assert.equal(shouldFlush(2, 1000, flushLeadMs([1136])), true);
-  // m276's 3,253 ms lag starts the flush 7 auctions out instead of 3.
-  assert.equal(flushLeadMs([80, 3253, 90]), 7506);
-  assert.equal(shouldFlush(6, 1000, flushLeadMs([3253])), true);
-  assert.equal(shouldFlush(7, 1000, flushLeadMs([3253])), false);
-  // Only the most recent 20 lags count, junk values are ignored, and the lead is capped.
+  // Friday's venue stall (about 1,100 ms over a ~60 ms baseline) still flushes in the last 3 auctions.
+  assert.equal(shouldFlush(3, 1000, flushLeadMs([60, 1136])), false);
+  assert.equal(shouldFlush(2, 1000, flushLeadMs([60, 1136])), true);
+  // An m276-size stall (3,253 ms over an 80 ms baseline) starts word plays 7 auctions out.
+  assert.equal(flushLeadMs([80, 3253, 90]), 7346);
+  assert.equal(shouldFlush(6, 1000, flushLeadMs([80, 3253])), true);
+  assert.equal(shouldFlush(7, 1000, flushLeadMs([80, 3253])), false);
+  // A constant clock skew cancels in either direction: 6 s ahead is not a stall...
+  assert.equal(flushLeadMs([6050, 6060, 6040]), FLUSH_LEAD_MS);
+  // ...and a real stall still counts when the Mac's clock runs 6 s behind.
+  assert.equal(flushLeadMs([-5950, -2747]), 7406);
+  // Only the most recent 20 lags count toward the stall, junk values are ignored, and the lead is capped.
   assert.equal(flushLeadMs([9000, ...Array.from({ length: 20 }, () => 50)]), FLUSH_LEAD_MS);
   assert.equal(flushLeadMs([Number.NaN, Number.POSITIVE_INFINITY, 100]), FLUSH_LEAD_MS);
-  assert.equal(flushLeadMs([60000]), MAX_FLUSH_LEAD_MS);
+  assert.equal(flushLeadMs([0, 60000]), MAX_FLUSH_LEAD_MS);
 });
 
 test("chooseWords: hoards short words, cashes 7+, flushes everything at the end", () => {

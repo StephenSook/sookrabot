@@ -347,19 +347,25 @@ export const MAX_FLUSH_LEAD_MS = 12000;
 export const FLUSH_LAG_WINDOW = 20;
 
 /**
- * Flush lead for the current match: FLUSH_LEAD_MS normally, longer after a stall.
+ * Word-flush lead for the current match: FLUSH_LEAD_MS normally, longer after a stall.
  * Held words must reach the server before the final auction closes, and m276 lost
- * its whole hoard to a 3,253 ms receive lag. If a recent auction reached us N ms
- * late, the end of the match can too, so allow twice the worst recent lag plus a
- * second. Lags under 1,000 ms leave the lead at FLUSH_LEAD_MS, so normal play
- * (and the self-play harness, which has no lag) is unchanged.
+ * its whole hoard to a 3,253 ms receive lag. A receive lag is our wall clock minus
+ * the server's open time, so it carries any clock skew; the stall is therefore
+ * measured against this match's best lag (the baseline), which cancels a constant
+ * skew in either direction. The lead allows twice the worst recent stall plus a
+ * second. Normal jitter leaves it at FLUSH_LEAD_MS, so normal play and the
+ * self-play harness (no lag) are unchanged. It only moves word plays earlier;
+ * valuation alpha keeps the fixed rule, so precomputed bid tables stay valid.
  */
-export function flushLeadMs(recentLagsMs: readonly number[]): number {
-  let worst = 0;
-  for (const lag of recentLagsMs.slice(-FLUSH_LAG_WINDOW)) {
-    if (Number.isFinite(lag) && lag > worst) worst = lag;
+export function flushLeadMs(lagsMs: readonly number[]): number {
+  let baseline = Infinity;
+  for (const lag of lagsMs) if (Number.isFinite(lag) && lag < baseline) baseline = lag;
+  if (baseline === Infinity) return FLUSH_LEAD_MS;
+  let stall = 0;
+  for (const lag of lagsMs.slice(-FLUSH_LAG_WINDOW)) {
+    if (Number.isFinite(lag) && lag - baseline > stall) stall = lag - baseline;
   }
-  return Math.min(MAX_FLUSH_LEAD_MS, Math.max(FLUSH_LEAD_MS, Math.ceil(2 * worst + 1000)));
+  return Math.min(MAX_FLUSH_LEAD_MS, Math.max(FLUSH_LEAD_MS, Math.ceil(2 * stall + 1000)));
 }
 
 /** True once the match ends within leadMs (always at the final auction). */

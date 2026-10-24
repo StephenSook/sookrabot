@@ -484,7 +484,7 @@ export class SookraBot {
       const opensMs = microsToMs(a.opensAt);
       if (opensMs !== undefined) model.recvLags.push(recvWall - opensMs);
       const bagTotal = Number(m.bagTotal);
-      const alpha = alphaFor(shouldFlush(bagTotal, Number(m.auctionDurationMs), flushLeadMs(model.recvLags)));
+      const alpha = alphaFor(shouldFlush(bagTotal, Number(m.auctionDurationMs)));
       const counts = this.effectiveCounts(model, this.rackCounts(conn, a.matchId));
       const { delta, source } = this.lookupDelta(a.matchId, counts, alpha, a.letter);
       this.placeBid(conn, model, m, a, Number(me.balance), delta, bagTotal, source, this.opponentsFrom(conn, rows));
@@ -513,7 +513,7 @@ export class SookraBot {
     const key = String(matchId);
     if (this.precomputeScheduled.has(key)) return;
     this.precomputeScheduled.add(key);
-    const nextAlpha = alphaFor(shouldFlush(bagTotal - 1, durationMs, flushLeadMs(this.models.get(key)?.recvLags ?? [])));
+    const nextAlpha = alphaFor(shouldFlush(bagTotal - 1, durationMs));
     const step = (withLetter: boolean) => () =>
       this.guard(`precompute m${key}`, () => {
         if (!this.online) return;
@@ -715,7 +715,10 @@ export class SookraBot {
     const open = row && row.status.tag === "Open" && row.matchId === matchId ? row : undefined;
     const bagTotal = Number(m.bagTotal);
     const durationMs = Number(m.auctionDurationMs);
-    const flush = open !== undefined && shouldFlush(bagTotal, durationMs, flushLeadMs(model.recvLags));
+    // Valuation keeps the fixed flush rule (so precomputed tables match); only word
+    // plays move earlier when this match has seen a network stall (flushLeadMs).
+    const flush = open !== undefined && shouldFlush(bagTotal, durationMs);
+    const flushWords = open !== undefined && (flush || shouldFlush(bagTotal, durationMs, flushLeadMs(model.recvLags)));
     const alpha = alphaFor(flush);
     const balance = Number(me.balance);
 
@@ -731,7 +734,7 @@ export class SookraBot {
     if (val) {
       let played = 0;
       try {
-        played = this.playWords(conn, matchId, model, counts, val, balance, flush);
+        played = this.playWords(conn, matchId, model, counts, val, balance, flushWords);
       } catch (err) {
         this.warn("word choice", err);
       }
