@@ -45,7 +45,7 @@ import { WordIndex } from "./engine.js";
 import { SookraBot, type ConnLike } from "./bot.js";
 import { Supervisor, realScheduler } from "./supervisor.js";
 import { ConnectionLifecycle } from "./lifecycle.js";
-import { GAME_WINDOW_MS, REFLOOR_IDLE_MS, TargetedSubscription, type Subscriber } from "./subscriptions.js";
+import { GAME_WINDOW_MS, PlanChain, REFLOOR_IDLE_MS, TargetedSubscription, type Subscriber } from "./subscriptions.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -158,12 +158,16 @@ function seatMatchIds(db: ConnLike["db"], botId: bigint): bigint[] {
 }
 
 /** The targeted subscriptions of each connection (absent with SUBSCRIBE_ALL). */
-const plans = new WeakMap<DbConnection, TargetedSubscription>();
+const chains = new WeakMap<DbConnection, PlanChain>();
+
+function currentPlan(conn: DbConnection | null): TargetedSubscription | null {
+  return conn ? (chains.get(conn)?.current ?? null) : null;
+}
 
 /** Move the current connection's window up to our newer matches and a later game-wide span. */
 function refloor(why: string) {
   const conn = lifecycle.current;
-  const plan = conn ? plans.get(conn) : undefined;
+  const plan = currentPlan(conn);
   if (!conn || !plan || bot.myBotId === null) return;
   try {
     if (plan.refloor(seatMatchIds(conn.db, bot.myBotId), Date.now())) {
@@ -220,10 +224,14 @@ function subscribe(conn: DbConnection, id: number) {
     return;
   }
   if (!myIdentity) return; // subscribe runs only after the handshake
-  // A resubscribe: the earlier attempt reports nothing more, and its rows stay
+  // A resubscribe: earlier attempts report nothing more, and their rows stay
   // until this one is ready (so rows in both are never removed and re-inserted).
-  const previous = plans.get(conn);
-  previous?.quiesce();
+  let found = chains.get(conn);
+  if (!found) {
+    found = new PlanChain();
+    chains.set(conn, found);
+  }
+  const chain = found;
   const subscriber: Subscriber = (queries, onApplied, onError) =>
     conn
       .subscriptionBuilder()
@@ -236,14 +244,14 @@ function subscribe(conn: DbConnection, id: number) {
     {
       onBaseApplied: () => onBaseApplied(conn, id, plan),
       onReady: () => {
-        previous?.stop();
+        chain.ready();
         onReady(conn, id);
       },
       onError: (err) => subscriptionError(id, err),
       log: (msg) => console.log(`[${BOT_NAME}] ${msg}`),
     },
   );
-  plans.set(conn, plan);
+  chain.replace(plan);
   plan.start();
 }
 
@@ -296,7 +304,7 @@ function onBaseApplied(conn: DbConnection, id: number, plan: TargetedSubscriptio
 /** Everything the bot reads is cached (first time, a resubscribe, or a reconnect replay). */
 function onReady(conn: DbConnection, id: number) {
   if (id !== supervisor.conn || bot.myBotId === null) return;
-  const plan = plans.get(conn);
+  const plan = currentPlan(conn);
   if (plan) {
     const f = plan.floors;
     console.log(
@@ -406,7 +414,7 @@ function bootstrapActivity(conn: DbConnection) {
         const ms = running.length > 0 ? Number(c.db.matchState.id.find(running[0])?.auctionDurationMs ?? 1000) : 1000;
         supervisor.watchdog(supervisor.conn, running.length > 0, ms);
         // Between matches, keep the game-wide part of the window from growing.
-        const floors = lifecycle.current ? plans.get(lifecycle.current)?.floors : undefined;
+        const floors = currentPlan(lifecycle.current)?.floors;
         if (running.length === 0 && floors && Date.now() - GAME_WINDOW_MS - floors.gameSinceMs >= REFLOOR_IDLE_MS) {
           refloor("idle");
         }

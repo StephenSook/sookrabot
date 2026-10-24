@@ -35,8 +35,14 @@
 export const WINDOW_MATCHES = 3;
 /** Game-wide results kept for the first-price price history. */
 export const GAME_WINDOW_MS = 15 * 60_000;
-/** Game-wide match rows reach this much further back, so a result of a match that started earlier finds its type. */
-export const MATCH_LOOKBACK_MS = 10 * 60_000;
+/**
+ * Game-wide match rows reach this much further back, so a cached result of a
+ * match that started earlier finds its type (onAuctionResult skips a result
+ * whose match row is missing). A match has at most 98 auctions (the bag,
+ * spacetimedb/src/letters.ts BAG_SIZE), so at the longest legal auction
+ * (10 s, set_matchmaker_config) it lasts under 17 minutes.
+ */
+export const MATCH_LOOKBACK_MS = 30 * 60_000;
 /** A window whose game floor moved less than this is not re-subscribed (unless our floor moved). */
 export const REFLOOR_MIN_STEP_MS = 60_000;
 /** While no match of ours is running, re-floor at least this often (index.ts tick). */
@@ -302,6 +308,37 @@ export class TargetedSubscription {
     if (!this.stopped && this.holds(entry)) return false;
     drop(entry.handle);
     return true;
+  }
+}
+
+/**
+ * The plans of one connection: the current one, and the earlier attempts of a
+ * resubscribe, kept quiesced (their rows stay cached) until the current one
+ * is ready, then all stopped. Attempts that fail in a row all wait here, so
+ * none is left subscribed when a later one succeeds.
+ */
+export class PlanChain {
+  current: TargetedSubscription | null = null;
+  private retired: TargetedSubscription[] = [];
+
+  /** A new attempt replaces the current plan, which is quiesced and kept. */
+  replace(next: TargetedSubscription) {
+    if (this.current) {
+      this.current.quiesce();
+      this.retired.push(this.current);
+    }
+    this.current = next;
+  }
+
+  /** The current plan is ready: stop every earlier attempt. */
+  ready() {
+    for (const p of this.retired) p.stop();
+    this.retired = [];
+  }
+
+  /** Earlier attempts not yet stopped. */
+  get retiredCount(): number {
+    return this.retired.length;
   }
 }
 

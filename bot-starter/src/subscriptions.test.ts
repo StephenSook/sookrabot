@@ -11,6 +11,7 @@ import {
   READ_TABLES,
   REFLOOR_MIN_STEP_MS,
   REFLOOR_RETRY_MS,
+  PlanChain,
   TargetedSubscription,
   WINDOW_MATCHES,
   baseQueries,
@@ -91,6 +92,19 @@ test("queries scope to our identity, or to the observed bot id", () => {
       `SELECT * FROM match_state WHERE created_at >= '${new Date(NOW - GAME_WINDOW_MS - MATCH_LOOKBACK_MS).toISOString()}'`,
     ),
   );
+});
+
+test("every cached game-wide result has its match row cached, even for the longest legal match", () => {
+  // A result is cached when it closed after the game floor. Its match was
+  // created at most one full match earlier: BAG_SIZE auctions at the longest
+  // legal auction length (spacetimedb/src: BAG_SIZE 98, 250..10000 ms).
+  const longestMatchMs = 98 * 10_000;
+  assert.ok(MATCH_LOOKBACK_MS >= longestMatchMs, `${MATCH_LOOKBACK_MS} < ${longestMatchMs}`);
+  // The server constants this relies on.
+  const letters = fs.readFileSync(new URL("../../spacetimedb/src/letters.ts", import.meta.url), "utf8");
+  assert.match(letters, /export const BAG_SIZE = 98;/);
+  const server = fs.readFileSync(new URL("../../spacetimedb/src/index.ts", import.meta.url), "utf8");
+  assert.match(server, /auctionDurationMs > 10_000n/);
 });
 
 test("window floor: our WINDOW_MATCHES-th most recent match, 0 with fewer", () => {
@@ -300,6 +314,49 @@ test("stop after quiesce drops the handles that were kept", () => {
   assert.deepEqual(handles.map((h) => h.unsubscribes), [0, 1, 0]);
   plan.stop();
   assert.deepEqual(handles.map((h) => h.unsubscribes), [1, 1, 1]);
+});
+
+test("resubscribe chain: attempts that fail in a row are all dropped once one succeeds", () => {
+  const handles: FakeHandle[] = [];
+  const chain = new PlanChain();
+  const errors: string[] = [];
+  const attempt = () => {
+    const plan: TargetedSubscription = new TargetedSubscription(
+      (queries, onApplied, onError) => {
+        const h = new FakeHandle(queries, onApplied, onError);
+        handles.push(h);
+        return h;
+      },
+      SCOPE,
+      {
+        onBaseApplied: () => plan.openWindow(9n, [1n, 2n, 3n], NOW),
+        onReady: () => chain.ready(),
+        onError: (err) => errors.push(String(err)),
+        log: () => {},
+      },
+    );
+    chain.replace(plan);
+    plan.start();
+    const [base, seed] = handles.slice(-2);
+    base.apply();
+    seed.apply();
+    return handles[handles.length - 1]; // the window
+  };
+  attempt().fail(new Error("A")); // A: base and seed applied, window refused
+  attempt().fail(new Error("B")); // B: the same
+  assert.deepEqual(errors, ["Error: A", "Error: B"]);
+  assert.equal(chain.retiredCount, 1, "A waits for a ready plan (B is current)");
+  const win = attempt(); // C
+  assert.equal(chain.retiredCount, 2);
+  assert.equal(handles.filter((h) => h.active).length, 6, "A's and B's base and seed are still cached");
+  win.apply();
+  assert.equal(chain.retiredCount, 0);
+  const active = handles.filter((h) => h.active);
+  assert.deepEqual(
+    active.map((h) => h.queries),
+    [baseQueries(SCOPE), windowQueries(9n, windowFloors([1n, 2n, 3n], NOW))],
+    "only C's base and window remain (its seed is dropped by the window)",
+  );
 });
 
 test("observer scope: seats and lobby memberships by bot id", () => {
