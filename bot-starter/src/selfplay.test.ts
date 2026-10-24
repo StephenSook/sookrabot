@@ -66,6 +66,9 @@ test("fields: rack awareness, the auction rule, rival shading and warm history a
     name: "ar6@0.9,fp,shade=0.8,warm", base: "ar6", rho: 0.9, env: { auction: "FirstPrice", shade: 0.8 }, warm: true,
   });
   for (const size of [2, 3, 4, 5, 6, 7, 8]) assert.equal(parseField(`ar${size}`).base, `ar${size}`);
+  assert.deepEqual(parseField("ar6-top@0.9,smart"), {
+    name: "ar6-top@0.9,smart", base: "ar6-top", rho: 0.9, env: { auction: "Vickrey", shade: 1 }, warm: false, smart: true,
+  });
   for (const bad of ["nope", "ar9", "ar6@1", "ar6@", "ar6@0.5@0.5", "ar6,xx", "ar6,shade=0", "ar6,shade=", "ar6,warm"]) {
     assert.throws(() => parseField(bad), Error, bad);
   }
