@@ -24,6 +24,12 @@
 // probability in its reward after each auction (up to 4 per gap) and flush
 // in the last 3 auctions. Clock blocks count auctions still to come, so a
 // 2-seat duel (88 auctions) keeps the endgame where a 68-auction match has it.
+// Entries named -v2 (and Yezi, tinytung, slow-n-dumb) were refitted by
+// rival_refit.py on a later snapshot (matches up to 161): code-v2 and bot-v2
+// from match 127 on, the newer bots on all their matches. Known gap: these
+// bids do not depend on the rival's own rack, and against them the harness
+// is optimistic for SookraBot (pad-code2: 153 vs code-v2 115; live m127 and
+// m129 to m132: 101 vs code 208), so trust paired differences more than levels.
 //
 // compare runs every variant of the focal SookraBot (seat 0) on the same
 // deals with common random numbers: per match, the bag order, each sim's
@@ -64,6 +70,7 @@ import {
   CASH_MIN_LEN,
   ENDGAME_AUCTIONS,
   ENDGAME_KAPPA_BOOST,
+  KAPPA,
   LEAVE_ALPHA,
   LIQUIDITY_FALLBACK_MIN_LEN,
   LIQUIDITY_FLOOR,
@@ -725,7 +732,9 @@ const boosted = (k: number) => (c: BidCtx) => (c.bagTotal < ENDGAME_AUCTIONS ? E
  *   head                   current policy, no hooks
  *   hooked                 hooks installed with the HEAD logic (must equal head exactly)
  *   kappa:K                kappa K (still doubled in the last ENDGAME_AUCTIONS auctions)
- *   pace:G[:LO[:HI]]       HEAD kappa x clamp(paceRatio^G, LO, HI) (defaults 0.5, 3)
+ *   pace:G[:LO[:HI[:K0[:B]]]]  budget pacing: K0 x clamp(paceRatio^G, LO, HI), x B in the last
+ *                          ENDGAME_AUCTIONS auctions (defaults 0.5, 3, KAPPA, ENDGAME_KAPPA_BOOST);
+ *                          paceRatio = (balance / auctions left incl. this one) / (100 / auctions per match)
  *   liq:C[:CAP[:MIN[:FB]]] liquidity floor max(15, min(CAP, C x auctions left incl. this one)),
  *                          liquidity word of MIN+ letters, else FB+ (FB 0: none); defaults 60, 5, 2
  *   liqp:Q[:CAP]           floor max(15, min(CAP, Q x mean price so far x expected share x auctions left)),
@@ -747,8 +756,8 @@ export function parseVariant(name: string): Variant {
     } else if (kind === "kappa") {
       v.kappa = boosted(a[0]);
     } else if (kind === "pace") {
-      const [g, lo = 0.5, hi = 3] = a;
-      v.kappa = (c) => kappaFor(c.bagTotal) * clamp(paceRatio(c) ** g, lo, hi);
+      const [g, lo = 0.5, hi = 3, k0 = KAPPA, boost = ENDGAME_KAPPA_BOOST] = a;
+      v.kappa = (c) => (c.bagTotal < ENDGAME_AUCTIONS ? boost : 1) * k0 * clamp(paceRatio(c) ** g, lo, hi);
     } else if (kind === "liq") {
       const [c, cap = 60, minLen = LIQUIDITY_MIN_LEN, fb = LIQUIDITY_FALLBACK_MIN_LEN] = a;
       const w = wordsCfg();
@@ -808,6 +817,22 @@ const FIELDS: Record<string, { about: string; seats: (focal: SeatSpec, rnd: Rng)
   "pad-ls-code": {
     about: "focal, LetterShark, code + 3 random sims",
     seats: (f, r) => [f, fitted("LetterShark"), fitted("code"), ...randomSims(r, 3)],
+  },
+  "pad-code": { about: "focal, code + 4 random sims (live m127, m129 to m132)", seats: (f, r) => [f, fitted("code"), ...randomSims(r, 4)] },
+  // Rivals refitted on matches up to 161 (code-v2 and bot-v2: from match 127; the new bots: all their matches).
+  "pad-code2": { about: "focal, code-v2 + 4 random sims (live m127, m129 to m132)", seats: (f, r) => [f, fitted("code-v2"), ...randomSims(r, 4)] },
+  "duel-code2": { about: "2-bot duel vs code-v2", seats: (f) => [f, fitted("code-v2")] },
+  "duel-yezi": { about: "2-bot duel vs YeziShanYang", seats: (f) => [f, fitted("Yezi")] },
+  live4: { about: "focal, code-v2, Yezi, bot-v2", seats: (f) => [f, fitted("code-v2"), fitted("Yezi"), fitted("bot-v2")] },
+  live6: {
+    about: "focal, code-v2, Yezi, tinytung, bot-v2, dev-voices-v2 (live m147 to m158)",
+    seats: (f) => [f, fitted("code-v2"), fitted("Yezi"), fitted("tinytung"), fitted("bot-v2"), fitted("dev-voices-v2")],
+  },
+  // Value-bidding rivals: the current SookraBot as the opponent.
+  "duel-head": { about: "2-bot duel vs a HEAD SookraBot", seats: (f) => [f, sookra("SookraHead", HEAD)] },
+  mix5: {
+    about: "focal, HEAD SookraBot, code-v2, Yezi, LetterShark",
+    seats: (f) => [f, sookra("SookraHead", HEAD), fitted("code-v2"), fitted("Yezi"), fitted("LetterShark")],
   },
 };
 
@@ -909,12 +934,21 @@ async function compare(field: string, n: number, seed: number, names: string[], 
   const variants = names.map(parseVariant);
   const index = loadIndex();
   const rows: FocalRow[][] = variants.map(() => []);
+  /** Per variant, per rival seat name: summed score, letters won, coins paid, end and mid balance, matches. */
+  const others: Map<string, number[]>[] = variants.map(() => new Map());
   const t0 = performance.now();
   for (let i = 0; i < n; i++) {
     const ms = mix(seed, i);
     for (let v = 0; v < variants.length; v++) {
       const specs = f.seats(sookra("SookraBot", variants[v]), mulberry32(mix(ms, STREAM.field)));
-      rows[v].push(focalRow(i, await playMatch(index, specs, ms)));
+      const res = await playMatch(index, specs, ms);
+      rows[v].push(focalRow(i, res));
+      for (const r of res.slice(1)) {
+        const name = r.kind === "sim" ? "sims" : r.name;
+        const acc = others[v].get(name) ?? [0, 0, 0, 0, 0, 0];
+        [r.score, r.won, r.paid, r.balance, r.midBalance ?? 0, 1].forEach((x, j) => (acc[j] += x));
+        others[v].set(name, acc);
+      }
     }
   }
   if (rowsPath) {
@@ -937,6 +971,12 @@ async function compare(field: string, n: number, seed: number, names: string[], 
     const fw = rs.map((r) => r.firstWord).filter((x): x is number => x !== null).sort((a, b) => a - b);
     out.firstWordMedian = fw.length ? fw[Math.floor(fw.length / 2)] : null;
     out.midBalance = avg(rs.map((r) => r.midBalance ?? 0));
+    out.rivals = Object.fromEntries(
+      [...others[v]].map(([name, a]) => [
+        name,
+        { score: +(a[0] / a[5]).toFixed(1), won: +(a[1] / a[5]).toFixed(1), paid: +(a[2] / a[5]).toFixed(1), balance: +(a[3] / a[5]).toFixed(1), midBalance: +(a[4] / a[5]).toFixed(1) },
+      ]),
+    );
     if (v > 0) {
       const diff: Record<string, unknown> = {};
       for (const k of keys) {
