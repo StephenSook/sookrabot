@@ -356,12 +356,13 @@ function deadRunsOf(m: RivalModel, cls: string, blk: number): [number, number][]
 /**
  * A fitted rival's bid. Always draws three numbers so its noise stream stays aligned across variants.
  * `completes`: the letter completes a 7+ word on the rival's rack (used only by models with complete7).
- * `gain`: the greedy pack value the letter adds to the rival's rack, or -1 when not computed (only models
- * with dead runs or gainCells use it: 0 draws from the dead runs, a positive gain from gainCells).
+ * `gain`: the greedy pack value the letter adds to the rival's rack, or undefined when not computed (only
+ * models with dead runs or gainCells use it: zero or less, greedy packing not being monotonic, draws from
+ * the dead runs, as rival_refit_v5u.py and rival_refit_v5g.py count it; a positive gain from gainCells).
  */
 function rivalBid(
   m: RivalModel, rng: Rng, letter: string, bagLeft: number, balance: number, auctions = 0, rankQ = 0.5,
-  completes = false, gain = -1,
+  completes = false, gain?: number,
 ): number {
   const u1 = rng();
   const u2 = rng();
@@ -373,8 +374,8 @@ function rivalBid(
   if (b.kind === "survival") {
     let u = u1;
     const c7 = completes && m.complete7 !== undefined;
-    const deadRuns = !c7 && gain === 0 ? deadRunsOf(m, VCLASS[v], blk) : undefined;
-    const gainRuns = !c7 && gain > 0 ? m.gainCells?.[`${gainBin(gain)}|${blk}`] : undefined;
+    const deadRuns = !c7 && gain !== undefined && gain <= 0 ? deadRunsOf(m, VCLASS[v], blk) : undefined;
+    const gainRuns = !c7 && gain !== undefined && gain > 0 ? m.gainCells?.[`${gainBin(gain)}|${blk}`] : undefined;
     const rho = c7 || deadRuns || gainRuns ? 0 : m.rho ?? 0;
     if (rho > 0) {
       const z = rho * normInv(Math.min(0.98, Math.max(0.02, rankQ))) + Math.sqrt(1 - rho * rho) * normInv(1 - u1);
@@ -528,7 +529,7 @@ export function rackMasks(index: WordIndex, counts: Counts): RackMasks {
   return out;
 }
 
-/** The greedy pack value `letter` adds to this seat's rack (0: a dead letter; RivalModel.dead and gainCells). */
+/** The greedy pack value `letter` adds to this seat's rack (0 or less: a dead letter; RivalModel.dead and gainCells). */
 function gainTo(index: WordIndex, seat: Seat, letter: string): number {
   return rackMasks(index, countsOf(seat.rack))[2][letterIndex(letter)];
 }
@@ -710,8 +711,9 @@ export interface SeatResult {
   /** Every letter won, sorted. */
   wonLetters: string;
   /**
-   * Fitted seats, with MatchOpts.regimes: per regime of the letter for its rack (complete7, useful, dead),
-   * the auctions it could outbid (balance above the best competing bid M), those it won and the sum of M.
+   * Fitted and SookraBot seats, with MatchOpts.regimes: per regime of the letter for its rack (complete7,
+   * useful, dead), the auctions it could outbid (balance above the best competing bid M), those it won and
+   * the sum of M.
    */
   regimes?: number[];
   /** Points by when they were scored: 0-22, 23-45, 46-60, 61-66, 67+ auctions closed. */
@@ -877,9 +879,10 @@ export async function playMatch(
       } else if (spec.kind === "fitted") {
         const m = spec.model;
         const c7 = m.complete7 !== undefined && bagLeft > 0 && completes7(index, s, letter);
-        const gain = !c7 && bagLeft > 0 && (m.dead !== undefined || m.gainCells !== undefined) ? gainTo(index, s, letter) : -1;
+        const gain = !c7 && bagLeft > 0 && (m.dead !== undefined || m.gainCells !== undefined) ? gainTo(index, s, letter) : undefined;
         const blk = rivalBlock(m, bagLeft, auctions);
-        const special = gain === 0 ? deadRunsOf(m, VCLASSOF(letter), blk) !== undefined : gain > 0 && m.gainCells !== undefined;
+        const special = gain === undefined ? false
+          : gain <= 0 ? deadRunsOf(m, VCLASSOF(letter), blk) !== undefined : m.gainCells !== undefined;
         // The rack rank only feeds the copula, which complete7, dead and gain bids do not use.
         const q = !c7 && !special && (m.rho ?? 0) > 0 && bagLeft > 0 ? rackRank(index, s, letter) : 0.5;
         let amt = rivalBid(m, s.bidRng, letter, bagLeft, s.balance, auctions, q, c7, gain);
@@ -914,11 +917,11 @@ export async function playMatch(
       if (w < 0 || a > amounts.get(seats[w])! || (a === amounts.get(seats[w])! && prio[i] > prio[w])) w = i;
     }
     if (opts.regimes && !final) {
-      // Each fitted seat's regime for this letter (rackMasks on the rack it bid with), as rival_refit_v5u.py
-      // counts live auctions: only when its balance exceeds the best competing bid M.
+      // Each fitted or SookraBot seat's regime for this letter (rackMasks on the rack it bid with), as
+      // rival_refit_v5u.py counts live auctions: only when its balance exceeds the best competing bid M.
       const bit = 1 << letterIndex(letter);
       seats.forEach((s, i) => {
-        if (s.spec.kind !== "fitted") return;
+        if (s.spec.kind !== "fitted" && s.spec.kind !== "sookra") return;
         const M = Math.max(0, ...seats.filter((_, j) => j !== i).map((o) => amounts.get(o)!));
         if (s.balance <= M) return;
         const [c7m, usem] = rackMasks(index, countsOf(s.rack));

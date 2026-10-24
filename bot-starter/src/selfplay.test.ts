@@ -329,6 +329,12 @@ test("rackMasks: one scan answers which letters complete a 7+ word and what each
     }
   }
   assert.ok(useful > 50 && dead > 50, `both cases covered (${useful} useful, ${dead} dead)`);
+  // Greedy packing is not monotonic: a letter can lower the pack value (a dead letter for the v5 fits, which
+  // count gain <= 0 as dead). VYXDITO packs to 24, VYXDITO + R to 22.
+  const [, useV, gainsV] = rackMasks(index, countsOf("VYXDITO"));
+  assert.equal(gainsV[letterIndex("R")], pack(countsOf("RVYXDITO")) - pack(countsOf("VYXDITO")));
+  assert.ok(gainsV[letterIndex("R")] < 0, "a negative gain");
+  assert.equal((useV >>> letterIndex("R")) & 1, 0, "not useful");
 });
 
 test("rival modifiers: each changes only what it names, never the fixture entry, and bad ones are refused", () => {
