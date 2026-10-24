@@ -156,6 +156,8 @@ interface RivalModel {
   policy: "shark" | "hazard" | "shark-noflush";
   hazard: { c0: number; c1: number } | null;
   bid: SurvivalBid | LognormalBid;
+  /** Robustness option: clock blocks by auction index (1-50, 51-58, 59-63, 64+) instead of auctions left. */
+  blocksByIndex?: boolean;
 }
 
 const RIVALS: Record<string, RivalModel> = JSON.parse(
@@ -170,13 +172,14 @@ function blockOf(bagLeft: number): number {
 }
 
 /** A fitted rival's bid. Always draws three numbers so its noise stream stays aligned across variants. */
-function rivalBid(m: RivalModel, rng: Rng, letter: string, bagLeft: number, balance: number): number {
+function rivalBid(m: RivalModel, rng: Rng, letter: string, bagLeft: number, balance: number, auctions = 0): number {
   const u1 = rng();
   const u2 = rng();
   const u3 = rng();
   if (bagLeft <= 0) return 0;
   const v = LETTER_VALUE[letter];
-  const blk = blockOf(bagLeft);
+  const idx = auctions - bagLeft;
+  const blk = m.blocksByIndex ? (idx <= 50 ? 0 : idx <= 58 ? 1 : idx <= 63 ? 2 : 3) : blockOf(bagLeft);
   const b = m.bid;
   if (b.kind === "survival") {
     let x = 200;
@@ -464,7 +467,7 @@ async function playMatch(index: WordIndex, specs: SeatSpec[], matchSeed: number)
         const want = (s.rack.get(letter) ?? 0) === 0 ? value + 2 : Math.max(1, value);
         amounts.set(s, Math.min(want, Math.max(0, s.balance)));
       } else if (spec.kind === "fitted") {
-        amounts.set(s, rivalBid(spec.model, s.bidRng, letter, bagLeft, s.balance));
+        amounts.set(s, rivalBid(spec.model, s.bidRng, letter, bagLeft, s.balance, auctions));
       }
     }
     const open = table.auction;
@@ -833,6 +836,12 @@ const FIELDS: Record<string, { about: string; seats: (focal: SeatSpec, rnd: Rng)
   mix5: {
     about: "focal, HEAD SookraBot, code-v2, Yezi, LetterShark",
     seats: (f) => [f, sookra("SookraHead", HEAD), fitted("code-v2"), fitted("Yezi"), fitted("LetterShark")],
+  },
+  // Robustness: LetterShark keying its endgame on the auction index, so in an 88-auction duel it bids
+  // its late-game amounts from auction 51 on (37 auctions early) instead of over the last 17.
+  "duel-ls-idx": {
+    about: "2-bot duel vs LetterShark with clock blocks by auction index",
+    seats: (f) => [f, { kind: "fitted", name: "LetterShark", model: { ...RIVALS.LetterShark, blocksByIndex: true } }],
   },
 };
 
