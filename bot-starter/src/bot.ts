@@ -105,8 +105,6 @@ export interface Logger {
   warn(msg: string): void;
 }
 
-/** In-flight words stop counting against the rack after this long. */
-export const PENDING_TTL_MS = 3000;
 /** A word the server refuses this many times in a match is not submitted again. */
 export const MAX_WORD_FAILURES = 3;
 /** A bid the server refuses this many times (other than for lateness) is not re-sent. */
@@ -341,15 +339,14 @@ export class SookraBot {
     return counts;
   }
 
-  /** Rack minus letters of words still in flight. */
+  /**
+   * Rack minus letters of words still in flight. A reservation lasts until
+   * its reducer call settles (ack, refusal, or the SDK failing in-flight
+   * calls when the connection drops); elapsed time alone proves nothing.
+   */
   private effectiveCounts(model: MatchModel, raw: Counts): Counts {
-    const t = this.now();
     const out = new Int32Array(raw);
-    for (const [id, p] of model.pending) {
-      if (t - p.at > PENDING_TTL_MS) {
-        model.pending.delete(id);
-        continue;
-      }
+    for (const p of model.pending.values()) {
       for (let i = 0; i < 26; i++) out[i] = Math.max(0, out[i] - p.counts[i]);
     }
     return out;

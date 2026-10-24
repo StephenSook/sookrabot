@@ -395,6 +395,27 @@ test("a word in flight is not submitted twice", async () => {
   assert.equal(s.wordAttempts, 1);
 });
 
+test("Codex repro: a slow acknowledgement does not release the reservation (no double QINTARS)", async () => {
+  const clock = { t: 5_000_000 };
+  const { s, bot } = setup("RETAINSQ", 30, "E", { clock });
+  s.held = [];
+  bot.refresh(s, MATCH);
+  await settle();
+  assert.equal(s.wordAttempts, 1);
+  clock.t += 3001; // well past any timer, ack still outstanding
+  bot.refresh(s, MATCH);
+  bot.tick(s);
+  await settle();
+  assert.equal(s.wordAttempts, 1, "elapsed time alone does not mean the play failed");
+  clock.t += 60_000;
+  bot.refresh(s, MATCH);
+  await settle();
+  assert.equal(s.wordAttempts, 1);
+  for (const release of s.held) release();
+  await settle();
+  assert.deepEqual(s.words, ["QINTARS"]);
+});
+
 test("refused words are retried at most MAX_WORD_FAILURES times", async () => {
   const { s, bot, warns } = setup("RETAINSQ", 30, "E");
   s.refuseWords = "Match not running";
