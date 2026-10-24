@@ -109,6 +109,12 @@ const supervisor = new Supervisor({
   reconnect: (why) => replaceConnection(why),
   log: (msg) => console.log(`[${BOT_NAME}] ${msg}`),
 });
+// A word call that is never answered: replace the connection the bot acts on.
+// Dropping it fails its in-flight calls, and the new connection's rack decides
+// whether the play happened.
+bot.onStuck = (c, why) => {
+  if (c === activeConn) supervisor.reportStuck(supervisor.conn, why);
+};
 
 // Keep the process alive through anything unexpected; log one line.
 process.on("uncaughtException", (err) => bot.warn("uncaught", err));

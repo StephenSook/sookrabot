@@ -111,6 +111,14 @@ export const MAX_WORD_FAILURES = 3;
 export const MAX_BID_FAILURES = 3;
 /** After a transport failure (disconnect), wait this long before submitting words again. */
 export const TRANSPORT_BACKOFF_MS = 1000;
+/**
+ * A word call still unanswered this long on the connection it went out on
+ * means that connection is unhealthy although events still arrive: the bot
+ * asks for a new one (onStuck). Its reservation is kept meanwhile (expiring
+ * it on time alone could submit the same letters twice); the new
+ * connection's rack settles it.
+ */
+export const PENDING_CALL_DEADLINE_MS = 5000;
 /** Log a valuation slower than this. */
 export const SLOW_VALUATION_MS = 50;
 /** Valuation tables kept per match (current rack, rack + letter on auction, flush variants). */
@@ -126,8 +134,14 @@ export const MAX_WARN_KEYS = 256;
 export const MAX_VERIFIED_MATCHES = 256;
 
 interface PendingWord {
+  word: string;
   counts: Counts;
+  reward: number;
+  /** The connection the call went out on. */
+  conn: ConnLike;
   at: number;
+  /** When it was sent or last reported overdue: it is reported again every PENDING_CALL_DEADLINE_MS. */
+  checkedAt: number;
 }
 
 interface MatchModel {
@@ -229,6 +243,12 @@ export class SookraBot {
   online = true;
   /** Called with one record per auction result in our matches (for an offline log). */
   onRecord: ((rec: Record<string, unknown>) => void) | null = null;
+  /**
+   * Called with the connection a word call has gone unanswered on for
+   * PENDING_CALL_DEADLINE_MS (and again each deadline while that lasts);
+   * index.ts has the supervisor replace that connection.
+   */
+  onStuck: ((conn: ConnLike, reason: string) => void) | null = null;
   readonly models = new Map<string, MatchModel>();
   readonly fpHistory: PricePoint[] = [];
   private readonly scheduled = new Set<string>();
@@ -357,7 +377,8 @@ export class SookraBot {
   /**
    * Rack minus letters of words still in flight. A reservation lasts until
    * its reducer call settles (ack, refusal, or the SDK failing in-flight
-   * calls when the connection drops); elapsed time alone proves nothing.
+   * calls when the connection drops), or until the bot is online on a newer
+   * connection (checkPending); elapsed time alone proves nothing.
    */
   private effectiveCounts(model: MatchModel, raw: Counts): Counts {
     const out = new Int32Array(raw);
@@ -502,12 +523,43 @@ export class SookraBot {
   tick(conn: ConnLike) {
     this.guard("tick", () => {
       if (!this.online) return;
+      this.checkPending(conn);
+      if (!this.online) return; // a stuck call just paused the bot for a new connection
       for (const id of this.runningMatches(conn)) this.scheduleRefresh(conn, id);
       for (const key of [...this.models.keys()]) {
         const m = conn.db.matchState.id.find(BigInt(key));
         if (!m || m.status.tag !== "Running") this.onMatchEnded(conn, BigInt(key));
       }
     });
+  }
+
+  /**
+   * Word calls still unanswered; `conn` is the connection the bot acts on
+   * (tick runs only while it is online, so its subscription is applied).
+   * A call sent on an earlier connection is settled by this one: the rack
+   * now comes from the server, and letters still in it mean the play did not
+   * happen, so its reservation is released. A call on `conn` itself that is
+   * overdue keeps its reservation, and the bot asks for a new connection.
+   */
+  private checkPending(conn: ConnLike) {
+    const t = this.now();
+    let overdue: string | null = null;
+    for (const [key, model] of this.models) {
+      for (const [id, p] of model.pending) {
+        if (p.conn !== conn) {
+          model.pending.delete(id);
+          this.log(`m${key}: play '${p.word}' unanswered when its connection was replaced; the rack decides`);
+          continue;
+        }
+        if (t - p.checkedAt > PENDING_CALL_DEADLINE_MS) {
+          p.checkedAt = t;
+          overdue ??= `m${key}: play '${p.word}' unanswered for ${t - p.at} ms`;
+        }
+      }
+    }
+    if (overdue === null) return;
+    this.out.warn(`[${this.name}] ${overdue}; asking for a new connection`);
+    this.onStuck?.(conn, overdue);
   }
 
   onAuctionResult(conn: ConnLike, r: AuctionResultRow) {
@@ -674,12 +726,15 @@ export class SookraBot {
   ): number {
     if (this.index.size === 0) return 0;
     if (this.now() < model.wordBackoffUntil) return 0;
-    // Outside the flush, wait for earlier plays to land before choosing more.
-    if (!flush && model.pending.size > 0) return 0;
+    // Plays still in flight do not hold up new ones: their letters are
+    // already out of `counts`, and their rewards count as landed, so a broke
+    // bot does not cash a liquidity word that a pending reward makes needless.
+    let pendingReward = 0;
+    for (const p of model.pending.values()) pendingReward += p.reward;
     const words = chooseWords(this.index, {
       counts,
       cands: val.cands,
-      myBalance: balance,
+      myBalance: balance + pendingReward,
       flush,
       alpha: val.alpha,
     }).filter((w) => (model.wordFailures.get(w) ?? 0) < MAX_WORD_FAILURES);
@@ -689,7 +744,8 @@ export class SookraBot {
 
   private submitWord(conn: ConnLike, matchId: bigint, model: MatchModel, word: string, flush: boolean) {
     const id = model.nextPendingId++;
-    model.pending.set(id, { counts: countsOf(word), at: this.now() });
+    const at = this.now();
+    model.pending.set(id, { word, counts: countsOf(word), reward: wordReward(word), conn, at, checkedAt: at });
     model.submitted++;
     this.log(`m${matchId}: play '${word}' (+${wordReward(word)}${flush ? ", flush" : ""})`);
     let p: Promise<unknown>;

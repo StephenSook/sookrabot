@@ -254,6 +254,24 @@ test("watchdog: no auction event for too long during a running match replaces th
   assert.equal(b.calls.reconnect.length, 1);
 });
 
+test("a stuck call reported on the ready connection replaces it; early or stale reports are ignored", () => {
+  const { sup, calls } = make();
+  const c1 = sup.newConnection();
+  sup.reportStuck(c1, "early"); // not ready: this attempt's own deadline already covers it
+  assert.deepEqual(calls.reconnect, []);
+  const c2 = sup.newConnection();
+  sup.onApplied(c2);
+  sup.reportStuck(c1, "from the replaced connection");
+  assert.deepEqual(calls.reconnect, []);
+  assert.equal(sup.ready, true);
+  sup.reportStuck(c2, "m1: play 'QINTARS' unanswered for 5250 ms");
+  assert.equal(sup.ready, false);
+  assert.equal(calls.online.at(-1), false, "paused before the connection is replaced");
+  assert.deepEqual(calls.reconnect, ["m1: play 'QINTARS' unanswered for 5250 ms"]);
+  sup.reportStuck(c2, "again");
+  assert.equal(calls.reconnect.length, 1, "one replacement per outage");
+});
+
 test("disconnect cancels pending timers; nothing fires afterwards", () => {
   const { sup, sched, calls } = make();
   const c = sup.newConnection();

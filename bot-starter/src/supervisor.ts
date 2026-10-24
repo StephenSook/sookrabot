@@ -143,6 +143,17 @@ export class Supervisor {
   }
 
   /**
+   * The bot found the connection unusable although events still arrive (a
+   * reducer call never answered): pause and replace it. Ignored unless it is
+   * the current, ready connection; otherwise a recovery is already under way.
+   */
+  reportStuck(conn: number, reason: string) {
+    if (conn !== this.conn || !this.ready) return;
+    this.transition(false);
+    this.hooks.reconnect(reason);
+  }
+
+  /**
    * Replace the connection unless a subscription is applied on it, or this
    * attempt is superseded (any transition), within the deadline. Never makes
    * the bot ready: only onApplied does.
