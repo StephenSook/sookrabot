@@ -8,8 +8,8 @@
 //   npx tsx src/selfplay.ts [sims|starters] [matches] [seed]
 //   npx tsx src/selfplay.ts validate [matches] [seed]
 //   npx tsx src/selfplay.ts validate4 [matches] [seed] [rho|-] [v4c|v4]
-//   npx tsx src/selfplay.ts validate5 [matches] [seed] [rho|-] [v5k|v5u|v5c|v5] [mod+mod...]
-//   npx tsx src/selfplay.ts calibrate5 [rounds] [matches] [seed] [v5u|v5c] [mod+mod...|-] [gamma]
+//   npx tsx src/selfplay.ts validate5 [matches] [seed] [rho|-] [v5k|v5p|v5u|v5c|v5] [mod+mod...]
+//   npx tsx src/selfplay.ts calibrate5 [rounds] [matches] [seed] [v5p|v5u|v5c] [mod+mod...|-] [gamma]
 //   npx tsx src/selfplay.ts list
 //
 // GitHub Actions runs compare in parallel shards (.github/workflows/selfplay.yml)
@@ -231,6 +231,13 @@ interface RivalModel {
    * rival_refit_v5u.py).
    */
   dead?: Record<string, [number, number][]>;
+  /**
+   * Optional (-v5p entries): the clock blocks' lower bounds in auctions still to come, block 0 first (the
+   * default is [18, 10, 5]: auctions 1-50, 51-58, 59-63 and 64-67 of a 68-auction match). -v5p entries use
+   * [46, 18, 10, 5], splitting the opening (1-22) from the midgame (23-50); their cells and dead runs are
+   * keyed "<class>|<block>" for all five blocks.
+   */
+  blockEdges?: number[];
 }
 
 /** Standard normal CDF (erfc via Numerical Recipes' Chebyshev fit, |error| < 1.2e-7). */
@@ -286,6 +293,21 @@ function blockOf(bagLeft: number): number {
   return bagLeft >= 18 ? 0 : bagLeft >= 10 ? 1 : bagLeft >= 5 ? 2 : 3;
 }
 
+/** A fitted rival's clock block for an auction: its blockEdges if it has them, else blockOf (or by index). */
+function rivalBlock(m: RivalModel, bagLeft: number, auctions: number): number {
+  if (m.blockEdges) {
+    const i = m.blockEdges.findIndex((edge) => bagLeft >= edge);
+    return i < 0 ? m.blockEdges.length : i;
+  }
+  const idx = auctions - bagLeft;
+  return m.blocksByIndex ? (idx <= 50 ? 0 : idx <= 58 ? 1 : idx <= 63 ? 2 : 3) : blockOf(bagLeft);
+}
+
+/** A dead letter's survival runs for this rival, value class and block (per block, else per class), if any. */
+function deadRunsOf(m: RivalModel, cls: string, blk: number): [number, number][] | undefined {
+  return m.dead?.[`${cls}|${blk}`] ?? m.dead?.[cls];
+}
+
 /**
  * A fitted rival's bid. Always draws three numbers so its noise stream stays aligned across variants.
  * `completes`: the letter completes a 7+ word on the rival's rack (used only by models with complete7).
@@ -301,13 +323,12 @@ function rivalBid(
   const u3 = rng();
   if (bagLeft <= 0) return 0;
   const v = LETTER_VALUE[letter];
-  const idx = auctions - bagLeft;
-  const blk = m.blocksByIndex ? (idx <= 50 ? 0 : idx <= 58 ? 1 : idx <= 63 ? 2 : 3) : blockOf(bagLeft);
+  const blk = rivalBlock(m, bagLeft, auctions);
   const b = m.bid;
   if (b.kind === "survival") {
     let u = u1;
     const c7 = completes && m.complete7 !== undefined;
-    const deadRuns = !c7 && dead ? m.dead?.[VCLASS[v]] : undefined;
+    const deadRuns = !c7 && dead ? deadRunsOf(m, VCLASS[v], blk) : undefined;
     const rho = c7 || deadRuns ? 0 : m.rho ?? 0;
     if (rho > 0) {
       const z = rho * normInv(Math.min(0.98, Math.max(0.02, rankQ))) + Math.sqrt(1 - rho * rho) * normInv(1 - u1);
@@ -798,7 +819,8 @@ export async function playMatch(
       } else if (spec.kind === "fitted") {
         const m = spec.model;
         const c7 = m.complete7 !== undefined && bagLeft > 0 && completes7(index, s, letter);
-        const dead = !c7 && m.dead?.[VCLASSOF(letter)] !== undefined && bagLeft > 0 && !usefulTo(index, s, letter);
+        const dead = !c7 && bagLeft > 0 && deadRunsOf(m, VCLASSOF(letter), rivalBlock(m, bagLeft, auctions)) !== undefined &&
+          !usefulTo(index, s, letter);
         // The rack rank only feeds the copula, which complete7 and dead bids do not use.
         const q = !c7 && !dead && (m.rho ?? 0) > 0 && bagLeft > 0 ? rackRank(index, s, letter) : 0.5;
         let amt = rivalBid(m, s.bidRng, letter, bagLeft, s.balance, auctions, q, c7, dead);
@@ -1114,15 +1136,15 @@ export function applyRivalMods(model: RivalModel, mods: readonly string[]): Riva
 export const V5_TOP = [
   "postturing", "guesser", "Dante", "Doppio", "Nijello", "Vickey", "LetterSharkPro", "Ally", "atlas", "marcellinus", "Cashu",
 ];
-export type V5Entries = "v5" | "v5c" | "v5u" | "v5k";
-const V5_ENTRIES: readonly V5Entries[] = ["v5", "v5c", "v5u", "v5k"];
+export type V5Entries = "v5" | "v5c" | "v5u" | "v5p" | "v5k";
+const V5_ENTRIES: readonly V5Entries[] = ["v5", "v5c", "v5u", "v5p", "v5k"];
 /**
  * The calibration of the v5 rivals: what turns a fixture entry (base) into its -v5k model (validate5 with
  * entries v5k, and the v5 fields). mods: RIVAL_MODS applied to every rival; rho: replaces each rival's
  * fitted rack awareness (absent: keep it); bidScale: per rival, every survival bid (cells, complete7 and
  * dead runs) times this (absent: 1), as fitted by calibrate5.
  */
-export const V5_CALIBRATION: { base: "v5c" | "v5u"; mods: string; rho?: number; bidScale: Record<string, number> } = {
+export const V5_CALIBRATION: { base: "v5c" | "v5u" | "v5p"; mods: string; rho?: number; bidScale: Record<string, number> } = {
   base: "v5c",
   mods: "",
   bidScale: {},
@@ -1963,12 +1985,12 @@ function scaleBids(m: RivalModel, s: number): RivalModel {
  * seed).
  */
 export async function calibrate5(
-  rounds: number, n: number, seed: number, base: "v5c" | "v5u" = "v5u", mods = "", gamma = 0.8,
+  rounds: number, n: number, seed: number, base: "v5c" | "v5u" | "v5p" = "v5u", mods = "", gamma = 0.8,
 ): Promise<Record<string, unknown>[]> {
   if (!(Number.isInteger(rounds) && rounds > 0 && rounds <= 20)) throw new Error(`rounds must be 1 to 20, got ${rounds}`);
   if (!(Number.isInteger(n) && n > 0)) throw new Error(`matches must be a whole number > 0, got ${n}`);
   if (!Number.isInteger(seed)) throw new Error(`seed must be a whole number, got ${seed}`);
-  if (base !== "v5c" && base !== "v5u") throw new Error(`base must be v5c or v5u, got ${base}`);
+  if (!["v5c", "v5u", "v5p"].includes(base)) throw new Error(`base must be v5c, v5u or v5p, got ${base}`);
   if (!(gamma > 0 && gamma <= 2)) throw new Error(`gamma must be in (0, 2], got ${gamma}`);
   const modList = parseRivalMods(mods);
   const { rivals: live } = liveV5();
@@ -2051,7 +2073,7 @@ async function main() {
       console.log(JSON.stringify(s));
     }
   } else if (mode === "calibrate5") {
-    const base = (pos[3] ?? "v5u") as "v5c" | "v5u";
+    const base = (pos[3] ?? "v5u") as "v5c" | "v5u" | "v5p";
     const gamma = pos[5] === undefined ? 0.8 : Number(pos[5]);
     for (const s of await calibrate5(Number(pos[0] ?? 6), Number(pos[1] ?? 576), Number(pos[2] ?? 1), base, pos[4] ?? "", gamma)) {
       console.log(JSON.stringify(s));

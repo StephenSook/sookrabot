@@ -268,9 +268,9 @@ test("self-play: shards merge into exactly the unsharded run", async () => {
   }
 });
 
-test("fixture v5: the 51 earlier entries are byte-identical, every v5 rival comes as -v5, -v5c and -v5u", () => {
+test("fixture v5: the 51 earlier entries are byte-identical, every v5 rival comes as -v5, -v5c, -v5u and -v5p", () => {
   const fixture = JSON.parse(fs.readFileSync(new URL("./fixtures/rival-models.json", import.meta.url), "utf8")).rivals;
-  const old = Object.keys(fixture).filter((n) => !/-v5[cu]?$/.test(n));
+  const old = Object.keys(fixture).filter((n) => !/-v5[cup]?$/.test(n));
   assert.equal(old.length, 51);
   // sha256 of "name=JSON" lines of the 51 entries as they were before the v5 refit (harness-sync 405aec0).
   const hash = crypto.createHash("sha256").update(old.map((n) => `${n}=${JSON.stringify(fixture[n])}`).join("\n")).digest("hex");
@@ -278,12 +278,16 @@ test("fixture v5: the 51 earlier entries are byte-identical, every v5 rival come
   const live = JSON.parse(fs.readFileSync(new URL("./fixtures/rival-live-v5.json", import.meta.url), "utf8"));
   const stems = Object.keys(live.rivals);
   assert.equal(stems.length, 35);
-  assert.equal(Object.keys(fixture).length, 51 + 3 * 35);
+  assert.equal(Object.keys(fixture).length, 51 + 4 * 35);
   for (const stem of stems) {
-    for (const e of ["v5", "v5c", "v5u"]) assert.ok(fixture[`${stem}-${e}`], `${stem}-${e}`);
+    for (const e of ["v5", "v5c", "v5u", "v5p"]) assert.ok(fixture[`${stem}-${e}`], `${stem}-${e}`);
     assert.equal(fixture[`${stem}-v5`].complete7, undefined, `${stem}-v5 is the existing format`);
     assert.equal(fixture[`${stem}-v5c`].dead, undefined, `${stem}-v5c has no dead runs`);
     assert.ok(Object.keys(fixture[`${stem}-v5u`].dead ?? {}).length >= 1, `${stem}-v5u has dead runs`);
+    const p = fixture[`${stem}-v5p`];
+    assert.deepEqual(p.blockEdges, [46, 18, 10, 5], `${stem}-v5p blocks`);
+    assert.equal(Object.keys(p.bid.cells).length, 25, `${stem}-v5p: five classes by five blocks`);
+    assert.ok(Object.keys(p.dead ?? {}).every((k: string) => /^v(1|2|3|4|5\+)\|[0-4]$/.test(k)), `${stem}-v5p dead keys`);
     assert.ok(live.rivals[stem].score >= 0 && live.rivals[stem].matches >= 15, stem);
   }
   for (const s of V5_TOP) assert.ok(stems.includes(s), s);

@@ -4,13 +4,13 @@
 # entries v4c or v4 (bot-starter/src/selfplay.ts validate4): the v4 rivals play each other
 # six to a table, drawn as at the live m300 to m390 tables, once per rack awareness rho.
 #
-# entries v5c, v5, v5u or v5k (validate5): the live all-real tables from m1000 on are
+# entries v5c, v5, v5u, v5p or v5k (validate5): the live all-real tables from m1000 on are
 # replayed with the v5 fits (each rival meets the opponents it met live); v5k is the
 # calibrated model (selfplay.ts V5_CALIBRATION). A configuration is a rho ("-" keeps each
 # entry's fitted rho), optionally followed by ":" and rival model modifiers joined by "+"
 # (selfplay.ts RIVAL_MODS, e.g. "0.7:shark" or "-:minlen=7+bidx=1.1").
 #
-# rounds N > 0 (entries v5u or v5c): each job fits per-rival bid scales with selfplay.ts
+# rounds N > 0 (entries v5p, v5u or v5c): each job fits per-rival bid scales with selfplay.ts
 # calibrate5, N rounds of the replay above, so each rival's simulated score meets its live
 # one; a configuration is then a damping exponent gamma, optionally :mod+mod. The last
 # round's scales go to selfplay.ts V5_CALIBRATION.bidScale (then validate entries v5k).
@@ -43,7 +43,7 @@ on:
         default: "- 0.5 0.7 0.9"
         type: string
       entries:
-        description: "Fixture entries: v4c or v4 (validate4), v5c, v5, v5u or v5k (validate5)"
+        description: "Fixture entries: v4c or v4 (validate4), v5c, v5, v5u, v5p or v5k (validate5)"
         required: true
         default: v4c
         type: string
@@ -80,11 +80,11 @@ jobs:
           [[ "$SEED" =~ ^[0-9]{1,9}$ ]] || fail "seed: a whole number from 0 to 999999999, got '$SEED'"
           case "$ENTRIES" in
             v4c|v4) mode=validate4 ;;
-            v5c|v5|v5u|v5k) mode=validate5 ;;
-            *) fail "entries: v4c, v4, v5c, v5, v5u or v5k, got '$ENTRIES'" ;;
+            v5c|v5|v5u|v5p|v5k) mode=validate5 ;;
+            *) fail "entries: v4c, v4, v5c, v5, v5u, v5p or v5k, got '$ENTRIES'" ;;
           esac
           if (( ROUNDS > 0 )); then
-            [[ "$ENTRIES" == v5u || "$ENTRIES" == v5c ]] || fail "rounds > 0 fits v5u or v5c entries, got '$ENTRIES'"
+            [[ "$ENTRIES" == v5u || "$ENTRIES" == v5c || "$ENTRIES" == v5p ]] || fail "rounds > 0 fits v5p, v5u or v5c entries, got '$ENTRIES'"
             mode=calibrate5
           fi
           read -r -a R <<< "$RHOS"
