@@ -268,6 +268,13 @@ export const DEAD_GATE_REAL_RIVALS = 0;
 export const LOOKAHEAD_WEIGHT = 0;
 export const LOOKAHEAD_HORIZON = 10;
 export const LOOKAHEAD_POOL = 1;
+/**
+ * The lookahead applies only in Vickrey auctions at tables with at least
+ * LOOKAHEAD_MIN_REAL_RIVALS real (non-sim) rivals; 0: everywhere. Ungated it
+ * lost in every duel field, at a 6-seat first-price table and was flat at 4
+ * seats (cloud run 40125994357, seed 7202).
+ */
+export const LOOKAHEAD_MIN_REAL_RIVALS = 0;
 
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
@@ -316,6 +323,7 @@ export interface Policy {
   readonly LOOKAHEAD_WEIGHT: number;
   readonly LOOKAHEAD_HORIZON: number;
   readonly LOOKAHEAD_POOL: number;
+  readonly LOOKAHEAD_MIN_REAL_RIVALS: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -361,6 +369,7 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   LOOKAHEAD_WEIGHT,
   LOOKAHEAD_HORIZON,
   LOOKAHEAD_POOL,
+  LOOKAHEAD_MIN_REAL_RIVALS,
 });
 
 // ---- Types ----

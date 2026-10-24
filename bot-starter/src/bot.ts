@@ -796,7 +796,7 @@ export class SookraBot {
       const li = letterIndex(open.letter);
       let delta = li >= 0 ? val.delta[li] : 0;
       let source = "table";
-      if (li >= 0 && this.policy.LOOKAHEAD_WEIGHT > 0) {
+      if (li >= 0 && this.lookaheadOn(conn, m, rows)) {
         const looked = this.lookahead(model, counts, val, open, li, bagTotal, alpha);
         if (looked !== null) {
           delta = looked;
@@ -809,6 +809,15 @@ export class SookraBot {
       );
       this.schedulePrecompute(conn, matchId, open.letter, bagTotal, durationMs);
     }
+  }
+
+  /** The lookahead is on (LOOKAHEAD_WEIGHT) and this table passes its gate (Vickrey, LOOKAHEAD_MIN_REAL_RIVALS). */
+  private lookaheadOn(conn: ConnLike, m: MatchStateRow, rows: ParticipantRow[]): boolean {
+    const p = this.policy;
+    if (!(p.LOOKAHEAD_WEIGHT > 0)) return false;
+    if (p.LOOKAHEAD_MIN_REAL_RIVALS <= 0) return true;
+    if (m.auctionType.tag !== "Vickrey") return false;
+    return this.opponentsFrom(conn, rows).filter((o) => !o.isSim).length >= p.LOOKAHEAD_MIN_REAL_RIVALS;
   }
 
   /**

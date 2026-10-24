@@ -1422,7 +1422,7 @@ addField(
     ...drawFrom(r, V5_FIELD.filter(([s]) => !V5_TOP5.includes(s)), 3, v5k),
   ],
 );
-for (const size of [3, 4]) {
+for (const size of [3, 4, 5]) {
   const names = V5_TOP.slice(0, size - 1);
   addField(`ar${size}-top-v5`, `focal + the ${size - 1} strongest calibrated v5 rivals: ${names.map((n) => `${n}-v5k`).join(", ")}`,
     (f) => [f, ...names.map(v5k)]);
@@ -1433,6 +1433,11 @@ for (const size of [3, 4]) {
     (f, r) => [f, ...drawFrom(r, top6.map((n): [string, number] => [n, 1]), size - 1, v5k)],
   );
 }
+addField(
+  "ar5-field-v5",
+  "focal + 4 calibrated v5 rivals drawn from the current live field by seats at the live tables (a 5-seat Swiss table)",
+  (f, r) => [f, ...drawFrom(r, V5_FIELD, 4, v5k)],
+);
 for (const stem of V5_TOP5) {
   addField(`duel-${stem.toLowerCase()}-v5`, `2-bot duel vs ${stem}-v5k (88 auctions; the final)`, (f) => [f, v5k(stem)]);
 }
