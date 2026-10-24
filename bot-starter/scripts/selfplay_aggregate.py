@@ -28,6 +28,8 @@ and matches, one column per rho, simulated score and place beside the live numbe
 validate5 lines (selfplay.ts validate5): the same, one column per configuration (rho and
 rival modifiers), with letters won, 7+ words, the pack value of the letters won and coins
 paid too, and the mean and largest absolute error over the top rivals (marked *).
+calibrate5 lines (selfplay.ts calibrate5, one per round of a bid-scale fit): the errors round
+by round and the scales after the last round.
 
 Exit status: 0 on success, 1 when the rows are incomplete, inconsistent or missing
 (no rows at all is an error, not an empty result), 2 on a usage error.
@@ -104,7 +106,7 @@ def read_lines(files):
                     raise InputError(f"{f}:{ln}: not JSON (a truncated last line means the run was cut off)")
                 if not isinstance(r, dict):
                     raise InputError(f"{f}:{ln}: not a JSON object")
-                if r.get("kind") in ("validate4", "validate5"):
+                if r.get("kind") in ("validate4", "validate5", "calibrate5"):
                     validate_rows.append(r)
                     continue
                 missing = [k for k in COMPARE_KEYS if k not in r]
@@ -297,8 +299,44 @@ def validate_groups(rows):
 V5_METRICS = (("score", 1), ("place", 2), ("won", 1), ("sevens", 2), ("pack_won", 1), ("paid", 1))
 
 
+def render_fit(rows, markdown):
+    """calibrate5 lines: per fit (base entries, modifiers, gamma), the errors round by round and the final scales."""
+    out = []
+    fits = {}
+    for r in rows:
+        fits.setdefault((r.get("base"), r.get("mods"), r.get("gamma"), r.get("matches")), []).append(r)
+    for (base, mods, gamma, matches), rs in sorted(fits.items(), key=lambda kv: str(kv[0])):
+        rs.sort(key=lambda r: r["round"])
+        title = (f"calibrate5 {base} entries{' +' + mods if mods else ''}, gamma {gamma}, {matches} matches a round: "
+                 "per-rival bid scales fitted so the replayed live tables give each rival its live score")
+        head = ["round", "seed", "mean abs top", "max abs top", "mean abs all"]
+        table = [[str(r["round"]), str(r["seed"]), fmt(r["meanAbsTop"], 1), fmt(r["maxAbsTop"], 1), fmt(r["meanAbsAll"], 1)]
+                 for r in rs]
+        last = rs[-1]
+        scales = ", ".join(f"{k} {v}" for k, v in sorted(last["next"].items()))
+        errs = ", ".join(f"{k} {v:+.1f}" for k, v in sorted(last["simMinusLive"].items(), key=lambda kv: -abs(kv[1])))
+        if markdown:
+            out += [f"### {title}", "", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+            out += ["| " + " | ".join(row) + " |" for row in table]
+            out += ["", f"Last round sim minus live: {errs}", "", f"Scales after the last round: {scales}", ""]
+        else:
+            widths = [max(len(x[c]) for x in [head] + table) for c in range(len(head))]
+            out.append(title)
+            for row in [head] + table:
+                out.append("  " + "  ".join(x.rjust(w) for x, w in zip(row, widths)))
+            out.append(f"  last round sim minus live: {errs}")
+            out.append(f"  scales after the last round: {scales}")
+            out.append("")
+    return "\n".join(out).rstrip()
+
+
 def render_validate(rows, markdown):
     out = []
+    fit = [r for r in rows if r.get("kind") == "calibrate5"]
+    rows = [r for r in rows if r.get("kind") != "calibrate5"]
+    if fit:
+        out.append(render_fit(fit, markdown))
+        out.append("")
     for (kind, entries, seed, matches), by_rho in sorted(validate_groups(rows).items(), key=lambda kv: str(kv[0])):
         labels = sorted(by_rho, key=lambda l: (l != "fitted", l))
         rivals = sorted({name for g in by_rho.values() for name in g},

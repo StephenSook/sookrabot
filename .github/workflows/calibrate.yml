@@ -10,12 +10,19 @@
 # entry's fitted rho), optionally followed by ":" and rival model modifiers joined by "+"
 # (selfplay.ts RIVAL_MODS, e.g. "0.7:shark" or "-:minlen=7+bidx=1.1").
 #
+# rounds N > 0 (entries v5u or v5c): each job fits per-rival bid scales with selfplay.ts
+# calibrate5, N rounds of the replay above, so each rival's simulated score meets its live
+# one; a configuration is then a damping exponent gamma, optionally :mod+mod. The last
+# round's scales go to selfplay.ts V5_CALIBRATION.bidScale (then validate entries v5k).
+#
 #   gh workflow run calibrate.yml --repo StephenSook/sookrabot --ref harness-sync \
 #     -f matches=400 -f seed=1 -f rhos="- 0.5 0.7 0.9" -f entries=v4c
 #   gh workflow run calibrate.yml --repo StephenSook/sookrabot --ref round2-harness \
 #     -f matches=864 -f seed=1 -f rhos="- 0.7 -:shark" -f entries=v5c
+#   gh workflow run calibrate.yml --repo StephenSook/sookrabot --ref round2-harness \
+#     -f matches=576 -f seed=11 -f rhos="0.8" -f entries=v5u -f rounds=6
 name: calibrate
-run-name: "calibrate ${{ inputs.entries }} x${{ inputs.matches }} seed ${{ inputs.seed }}: ${{ inputs.rhos }}"
+run-name: "calibrate ${{ inputs.entries }} x${{ inputs.matches }} seed ${{ inputs.seed }}: ${{ inputs.rhos }} (fit rounds ${{ inputs.rounds }})"
 
 on:
   workflow_dispatch:
@@ -40,6 +47,11 @@ on:
         required: true
         default: v4c
         type: string
+      rounds:
+        description: "0 validates; N > 0 fits per-rival bid scales in N rounds (calibrate5; entries v5u or v5c, configurations gamma[:mod+mod])"
+        required: false
+        default: "0"
+        type: string
 
 permissions:
   contents: read
@@ -60,8 +72,10 @@ jobs:
           SEED: ${{ inputs.seed }}
           RHOS: ${{ inputs.rhos }}
           ENTRIES: ${{ inputs.entries }}
+          ROUNDS: ${{ inputs.rounds }}
         run: |
           fail() { echo "::error::$1"; exit 1; }
+          [[ "$ROUNDS" =~ ^[0-9]{1,2}$ ]] && (( ROUNDS <= 20 )) || fail "rounds: 0 to 20, got '$ROUNDS'"
           [[ "$MATCHES" =~ ^[1-9][0-9]{0,4}$ ]] && (( MATCHES <= 20000 )) || fail "matches: 1 to 20000, got '$MATCHES'"
           [[ "$SEED" =~ ^[0-9]{1,9}$ ]] || fail "seed: a whole number from 0 to 999999999, got '$SEED'"
           case "$ENTRIES" in
@@ -69,10 +83,17 @@ jobs:
             v5c|v5|v5u|v5k) mode=validate5 ;;
             *) fail "entries: v4c, v4, v5c, v5, v5u or v5k, got '$ENTRIES'" ;;
           esac
+          if (( ROUNDS > 0 )); then
+            [[ "$ENTRIES" == v5u || "$ENTRIES" == v5c ]] || fail "rounds > 0 fits v5u or v5c entries, got '$ENTRIES'"
+            mode=calibrate5
+          fi
           read -r -a R <<< "$RHOS"
           (( ${#R[@]} >= 1 && ${#R[@]} <= 12 )) || fail "rhos: 1 to 12 configurations"
           for r in "${R[@]}"; do
-            if [[ "$mode" == validate5 ]]; then
+            if [[ "$mode" == calibrate5 ]]; then
+              [[ "$r" =~ ^(0\.[0-9]{1,3}|1(\.[0-9]{1,3})?|2)(:[a-z0-9]+(=[0-9]+(\.[0-9]+)?)?(\+[a-z0-9]+(=[0-9]+(\.[0-9]+)?)?)*)?$ ]] \
+                || fail "configuration '$r': a gamma in (0, 2], optionally :mod+mod"
+            elif [[ "$mode" == validate5 ]]; then
               [[ "$r" =~ ^(-|0(\.[0-9]{1,4})?)(:[a-z0-9]+(=[0-9]+(\.[0-9]+)?)?(\+[a-z0-9]+(=[0-9]+(\.[0-9]+)?)?)*)?$ ]] \
                 || fail "configuration '$r': a rho (- or a number in [0, 1)), optionally :mod+mod"
             else
@@ -122,16 +143,20 @@ jobs:
           CONFIG: ${{ matrix.rho }}
           ENTRIES: ${{ inputs.entries }}
           MODE: ${{ needs.plan.outputs.mode }}
+          ROUNDS: ${{ inputs.rounds }}
         run: |
           rho=${CONFIG%%:*}
           mods=""
           [[ "$CONFIG" == *:* ]] && mods=${CONFIG#*:}
           label=$([[ "$rho" == "-" ]] && echo fitted || echo "$rho")
+          [[ "$MODE" == calibrate5 ]] && label="fit-gamma$rho"
           [[ -n "$mods" ]] && label="$label-$(echo "$mods" | tr -c 'A-Za-z0-9.\n' '_')"
           mkdir -p "$RUNNER_TEMP/calib"
           out="$RUNNER_TEMP/calib/$MODE-$GITHUB_RUN_ID-$ENTRIES-rho-$label.jsonl"
           start=$(date +%s)
-          if [[ "$MODE" == validate5 ]]; then
+          if [[ "$MODE" == calibrate5 ]]; then
+            npx tsx src/selfplay.ts calibrate5 "$ROUNDS" "$MATCHES" "$SEED" "$ENTRIES" "${mods:--}" "$rho" > "$out"
+          elif [[ "$MODE" == validate5 ]]; then
             npx tsx src/selfplay.ts validate5 "$MATCHES" "$SEED" "$rho" "$ENTRIES" "$mods" > "$out"
           else
             npx tsx src/selfplay.ts validate4 "$MATCHES" "$SEED" "$rho" "$ENTRIES" > "$out"

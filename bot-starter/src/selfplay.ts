@@ -8,7 +8,8 @@
 //   npx tsx src/selfplay.ts [sims|starters] [matches] [seed]
 //   npx tsx src/selfplay.ts validate [matches] [seed]
 //   npx tsx src/selfplay.ts validate4 [matches] [seed] [rho|-] [v4c|v4]
-//   npx tsx src/selfplay.ts validate5 [matches] [seed] [rho|-] [v5k|v5c|v5] [mod+mod...]
+//   npx tsx src/selfplay.ts validate5 [matches] [seed] [rho|-] [v5k|v5u|v5c|v5] [mod+mod...]
+//   npx tsx src/selfplay.ts calibrate5 [rounds] [matches] [seed] [v5u|v5c] [mod+mod...|-] [gamma]
 //   npx tsx src/selfplay.ts list
 //
 // GitHub Actions runs compare in parallel shards (.github/workflows/selfplay.yml)
@@ -366,6 +367,8 @@ interface Seat {
   wonLetters: Counts;
   /** Words of 7+ letters played. */
   sevens: number;
+  /** With MatchOpts.regimes: SeatResult.regimes, accumulated. */
+  regimes?: number[];
 }
 
 /**
@@ -619,6 +622,11 @@ export interface SeatResult {
   startRack: string;
   /** Every letter won, sorted. */
   wonLetters: string;
+  /**
+   * Fitted seats, with MatchOpts.regimes: per regime of the letter for its rack (complete7, useful, dead),
+   * the auctions it could outbid (balance above the best competing bid M), those it won and the sum of M.
+   */
+  regimes?: number[];
 }
 
 /** How a match is played: the auction rule and the fitted rivals' bid scale. */
@@ -641,6 +649,8 @@ export interface MatchResult {
 export interface MatchOpts {
   focalLog?: Logger;
   fpHistory?: readonly (readonly PricePoint[] | null)[];
+  /** Count each fitted seat's auctions by letter regime (SeatResult.regimes; validate5). */
+  regimes?: boolean;
 }
 
 /**
@@ -811,6 +821,22 @@ export async function playMatch(
       if (a <= 0) continue;
       if (w < 0 || a > amounts.get(seats[w])! || (a === amounts.get(seats[w])! && prio[i] > prio[w])) w = i;
     }
+    if (opts.regimes && !final) {
+      // Each fitted seat's regime for this letter (rackMasks on the rack it bid with), as rival_refit_v5u.py
+      // counts live auctions: only when its balance exceeds the best competing bid M.
+      const bit = 1 << letterIndex(letter);
+      seats.forEach((s, i) => {
+        if (s.spec.kind !== "fitted") return;
+        const M = Math.max(0, ...seats.filter((_, j) => j !== i).map((o) => amounts.get(o)!));
+        if (s.balance <= M) return;
+        const [c7m, usem] = rackMasks(index, countsOf(s.rack));
+        const r = c7m & bit ? 0 : usem & bit ? 1 : 2;
+        s.regimes ??= Array<number>(9).fill(0);
+        s.regimes[3 * r]++;
+        if (w === i) s.regimes[3 * r + 1]++;
+        s.regimes[3 * r + 2] += M;
+      });
+    }
     table.auction = { ...open, status: { tag: "Closed" } };
     table.closed++;
     let paid = 0;
@@ -864,6 +890,7 @@ export async function playMatch(
       sevens: s.sevens,
       startRack: s.startRack,
       wonLetters: [...s.wonLetters].map((k, i) => String.fromCharCode(65 + i).repeat(k)).join(""),
+      ...(s.regimes ? { regimes: [...s.regimes] } : {}),
     })),
   };
 }
@@ -980,6 +1007,8 @@ interface LiveV5 {
   pack_all: number | null;
   /** Letters won per match by face value: 1, 2, 3, 4, 5+ points. */
   won_by_class: number[];
+  /** Auctions by letter regime (matches with a known starting rack): how many a match, the share won, mean M. */
+  regimes: Record<"complete7" | "useful" | "dead", { perMatch: number; winRate: number; M: number }>;
 }
 interface LiveV5File {
   rivals: Record<string, LiveV5>;
@@ -1065,9 +1094,14 @@ const V5_ENTRIES: readonly V5Entries[] = ["v5", "v5c", "v5u", "v5k"];
 /**
  * The calibration of the v5 rivals: what turns a fixture entry (base) into its -v5k model (validate5 with
  * entries v5k, and the v5 fields). mods: RIVAL_MODS applied to every rival; rho: replaces each rival's
- * fitted rack awareness (absent: keep it).
+ * fitted rack awareness (absent: keep it); bidScale: per rival, every survival bid (cells, complete7 and
+ * dead runs) times this (absent: 1), as fitted by calibrate5.
  */
-export const V5_CALIBRATION: { base: "v5c" | "v5u"; mods: string; rho?: number } = { base: "v5c", mods: "" };
+export const V5_CALIBRATION: { base: "v5c" | "v5u"; mods: string; rho?: number; bidScale: Record<string, number> } = {
+  base: "v5c",
+  mods: "",
+  bidScale: {},
+};
 
 /** A v5 rival's model: its -v5, -v5c or -v5u fixture entry, or for v5k its V5_CALIBRATION base entry calibrated. */
 function v5Model(stem: string, entries: V5Entries): RivalModel {
@@ -1075,7 +1109,9 @@ function v5Model(stem: string, entries: V5Entries): RivalModel {
   const base = RIVALS[name];
   if (!base) throw new Error(`no rival model ${name} in fixtures/rival-models.json`);
   if (entries !== "v5k") return base;
-  const m = applyRivalMods(base, parseRivalMods(V5_CALIBRATION.mods));
+  let m = applyRivalMods(base, parseRivalMods(V5_CALIBRATION.mods));
+  const s = V5_CALIBRATION.bidScale[stem] ?? 1;
+  if (s !== 1) m = RIVAL_MODS.bidx.apply(m, s);
   return V5_CALIBRATION.rho === undefined ? m : { ...m, rho: V5_CALIBRATION.rho };
 }
 
@@ -1774,15 +1810,70 @@ function packValue(index: WordIndex, letters: string): number {
   return index.pack(index.scan(counts, false), counts, -1, 0).total;
 }
 
+/** Per-rival sums from replaying the live tables (replayLiveTables); index RS_* below, regimes after them. */
+const RS = { score: 0, place: 1, win: 2, won: 3, paid: 4, balance: 5, words: 6, sevens: 7, used: 8, endRack: 9, packWon: 10, packAll: 11, seats: 12 } as const;
+
+/**
+ * Plays the live tables of fixtures/rival-live-v5.json: match i seats the six rivals of table i mod 288,
+ * modelOf(stem) giving each seat's model, match seed mix(seed, i, 5). Returns per stem the sums of
+ * RS (then 5 letter-class counts, then 9 regime numbers: auctions, wins and sum of M for complete7, useful
+ * and dead letters).
+ */
+async function replayLiveTables(
+  index: WordIndex, n: number, seed: number, modelOf: (stem: string) => RivalModel,
+): Promise<Map<string, number[]>> {
+  const { tables } = liveV5();
+  const acc = new Map<string, number[]>();
+  for (let i = 0; i < n; i++) {
+    const stems = tables[i % tables.length].slice(1) as string[];
+    const specs = stems.map((stem): SeatSpec => ({ kind: "fitted", name: stem, model: modelOf(stem) }));
+    const seats = (await playMatch(index, specs, mix(seed, i, 5), VICKREY, { regimes: true })).seats;
+    for (const r of seats) {
+      const ahead = seats.filter((o) => o.score > r.score).length;
+      const a = acc.get(r.name) ?? Array<number>(27).fill(0);
+      [
+        r.score, ahead + 1, ahead === 0 ? 1 : 0, r.won, r.paid, r.balance, r.words, r.sevens, RACK + r.won - r.endRack,
+        r.endRack, packValue(index, r.wonLetters), packValue(index, r.startRack + r.wonLetters), 1,
+      ].forEach((x, j) => (a[j] += x));
+      for (const c of r.wonLetters) a[13 + Math.min(LETTER_VALUE[c], 5) - 1]++;
+      (r.regimes ?? []).forEach((x, j) => (a[18 + j] += x));
+      acc.set(r.name, a);
+    }
+  }
+  return acc;
+}
+
+const r1 = (x: number) => +x.toFixed(1);
+const r2 = (x: number) => +x.toFixed(2);
+
+/** One rival's simulated numbers from replayLiveTables sums. */
+function replaySummary(a: number[]) {
+  const m = a[RS.seats];
+  const regime = (k: number) => ({
+    perMatch: r2(a[18 + 3 * k] / m), winRate: r2(a[18 + 3 * k + 1] / Math.max(1, a[18 + 3 * k])),
+    M: r1(a[18 + 3 * k + 2] / Math.max(1, a[18 + 3 * k])),
+  });
+  return {
+    score: r1(a[RS.score] / m), place: r2(a[RS.place] / m), win: r2(a[RS.win] / m), won: r1(a[RS.won] / m),
+    paid: r1(a[RS.paid] / m), final_balance: r1(a[RS.balance] / m), words: r2(a[RS.words] / m),
+    sevens: r2(a[RS.sevens] / m), used: r1(a[RS.used] / m), end_rack: r1(a[RS.endRack] / m),
+    pack_won: r1(a[RS.packWon] / m), pack_all: r1(a[RS.packAll] / m), score_over_pack_all: r2(a[RS.score] / a[RS.packAll]),
+    won_by_class: a.slice(13, 18).map((x) => r2(x / m)),
+    regimes: { complete7: regime(0), useful: regime(1), dead: regime(2) },
+  };
+}
+
 /**
  * The live tables of fixtures/rival-live-v5.json replayed with the v5 fits: match i seats the six bots of
  * table i mod 288 (every all-real table from m1000 on whose bots all have fits; SookraBot's seat is its own
  * fit, SookraBot-v5), so each rival meets the opponents it met live. Per rival, the simulated score, place,
- * win rate, letters won, coins paid, final balance, words, 7+ words, tiles used and left, and the packing
- * measures (greedy pack value of the letters won, and of the starting rack plus the letters won), beside
- * its live numbers over its fitted range. `entries`: v5 (the existing format), v5c (complete7 bids and the
- * likelihood-chosen word policies) or v5k (v5c with the calibration, V5_CALIBRATION). `rho` replaces every
- * rival's rack awareness; `mods` are rival model modifiers (RIVAL_MODS) applied to every seat.
+ * win rate, letters won, coins paid, final balance, words, 7+ words, tiles used and left, the packing
+ * measures (greedy pack value of the letters won, and of the starting rack plus the letters won) and its
+ * auctions by letter regime (completes a 7+ word, useful, dead: how many a match, the share won, the mean
+ * best competing bid), beside its live numbers over its fitted range. `entries`: v5 (the existing format),
+ * v5c (complete7 bids and the likelihood-chosen word policies), v5u (bids in three regimes) or v5k (the
+ * calibrated rivals, V5_CALIBRATION). `rho` replaces every rival's rack awareness; `mods` are rival model
+ * modifiers (RIVAL_MODS) applied to every seat.
  */
 export async function validate5(
   n: number, seed: number, rho?: number, entries: V5Entries = "v5c", mods = "",
@@ -1792,53 +1883,30 @@ export async function validate5(
   if (rho !== undefined && !(rho >= 0 && rho < 1)) throw new Error(`rho must be in [0, 1) or "-", got ${rho}`);
   if (!V5_ENTRIES.includes(entries)) throw new Error(`entries must be one of ${V5_ENTRIES.join(", ")}, got ${entries}`);
   const modList = parseRivalMods(mods);
-  const { rivals: live, tables } = liveV5();
-  const index = loadIndex();
-  const acc = new Map<string, number[]>();
+  const { rivals: live } = liveV5();
   const models = new Map<string, RivalModel>();
-  for (let i = 0; i < n; i++) {
-    const stems = tables[i % tables.length].slice(1) as string[];
-    const specs = stems.map((stem): SeatSpec => {
-      let model = models.get(stem);
-      if (!model) {
-        model = applyRivalMods(v5Model(stem, entries), modList);
-        if (rho !== undefined) model = { ...model, rho };
-        models.set(stem, model);
-      }
-      return { kind: "fitted", name: stem, model };
-    });
-    const seats = (await playMatch(index, specs, mix(seed, i, 5))).seats;
-    for (const r of seats) {
-      const ahead = seats.filter((o) => o.score > r.score).length;
-      const a = acc.get(r.name) ?? Array<number>(18).fill(0);
-      [
-        r.score, ahead + 1, ahead === 0 ? 1 : 0, r.won, r.paid, r.balance, r.words, r.sevens, RACK + r.won - r.endRack,
-        r.endRack, packValue(index, r.wonLetters), packValue(index, r.startRack + r.wonLetters), 1,
-      ].forEach((x, j) => (a[j] += x));
-      for (const c of r.wonLetters) a[13 + Math.min(LETTER_VALUE[c], 5) - 1]++;
-      acc.set(r.name, a);
+  const modelOf = (stem: string): RivalModel => {
+    let model = models.get(stem);
+    if (!model) {
+      model = applyRivalMods(v5Model(stem, entries), modList);
+      if (rho !== undefined) model = { ...model, rho };
+      models.set(stem, model);
     }
-  }
-  const r1 = (x: number) => +x.toFixed(1);
-  const r2 = (x: number) => +x.toFixed(2);
+    return model;
+  };
+  const acc = await replayLiveTables(loadIndex(), n, seed, modelOf);
   const label = (rho === undefined ? "fitted" : `rho ${rho}`) + (modList.length ? ` ${modList.join("+")}` : "");
   const out = [...acc].map(([stem, a]) => {
-    const m = a[12];
     const obs = live[stem];
-    const sim = {
-      score: r1(a[0] / m), place: r2(a[1] / m), win: r2(a[2] / m), won: r1(a[3] / m), paid: r1(a[4] / m),
-      final_balance: r1(a[5] / m), words: r2(a[6] / m), sevens: r2(a[7] / m), used: r1(a[8] / m), end_rack: r1(a[9] / m),
-      pack_won: r1(a[10] / m), pack_all: r1(a[11] / m), score_over_pack_all: r2(a[0] / a[11]),
-      won_by_class: a.slice(13, 18).map((x) => r2(x / m)),
-    };
+    const sim = replaySummary(a);
     return {
       kind: "validate5", rival: `${stem}-${entries}`, stem, entries, top: V5_TOP.includes(stem),
       rho: rho ?? models.get(stem)!.rho ?? 0, rhoFitted: rho === undefined, mods: modList.join("+"), label,
-      matches: n, seed, seats: m, sim,
+      matches: n, seed, seats: a[RS.seats], sim,
       live: {
         score: obs.score, place: obs.place, win: obs.win, won: obs.won, paid: obs.paid, final_balance: obs.final_balance,
         words: obs.n_words, sevens: obs.sevens, used: obs.used, end_rack: obs.end_rack, pack_won: obs.pack_won,
-        pack_all: obs.pack_all, won_by_class: obs.won_by_class, matches: obs.matches,
+        pack_all: obs.pack_all, won_by_class: obs.won_by_class, regimes: obs.regimes, matches: obs.matches,
       },
       simMinusLive: {
         score: r1(sim.score - obs.score), place: r2(sim.place - obs.place), won: r1(sim.won - obs.won),
@@ -1850,7 +1918,59 @@ export async function validate5(
   return out;
 }
 
+/** A model with every survival bid (cells, complete7 and dead runs) times s (1: unchanged). */
+function scaleBids(m: RivalModel, s: number): RivalModel {
+  return s === 1 ? m : RIVAL_MODS.bidx.apply(m, s);
+}
+
+/**
+ * Fits per-rival bid scales so the replayed live tables (validate5) give each rival its live score:
+ * `rounds` rounds of n matches (round r plays seed + 1000 r), every rival's bids (cells, complete7 and
+ * dead runs of its `base` entry, after `mods`) times its scale; after a round each rival's scale is
+ * multiplied by (live score / simulated score)^gamma and clamped to [0.5, 2] (a rival scoring under 20
+ * live keeps 1). One line per round: the scales it played, the errors, and the scales for the next round.
+ * The last line's scales are the fit (copy them to V5_CALIBRATION.bidScale, then validate5 v5k on a fresh
+ * seed).
+ */
+export async function calibrate5(
+  rounds: number, n: number, seed: number, base: "v5c" | "v5u" = "v5u", mods = "", gamma = 0.8,
+): Promise<Record<string, unknown>[]> {
+  if (!(Number.isInteger(rounds) && rounds > 0 && rounds <= 20)) throw new Error(`rounds must be 1 to 20, got ${rounds}`);
+  if (!(Number.isInteger(n) && n > 0)) throw new Error(`matches must be a whole number > 0, got ${n}`);
+  if (!Number.isInteger(seed)) throw new Error(`seed must be a whole number, got ${seed}`);
+  if (base !== "v5c" && base !== "v5u") throw new Error(`base must be v5c or v5u, got ${base}`);
+  if (!(gamma > 0 && gamma <= 2)) throw new Error(`gamma must be in (0, 2], got ${gamma}`);
+  const modList = parseRivalMods(mods);
+  const { rivals: live } = liveV5();
+  const index = loadIndex();
+  const scales: Record<string, number> = Object.fromEntries(Object.keys(live).map((s) => [s, 1]));
+  const out: Record<string, unknown>[] = [];
+  for (let round = 0; round < rounds; round++) {
+    const played = { ...scales };
+    const acc = await replayLiveTables(index, n, seed + 1000 * round, (stem) =>
+      scaleBids(applyRivalMods(v5Model(stem, base), modList), played[stem]));
+    const err: Record<string, number> = {};
+    for (const [stem, a] of acc) {
+      const sim = a[RS.score] / a[RS.seats];
+      err[stem] = r1(sim - live[stem].score);
+      if (live[stem].score < 20) continue;
+      const next = played[stem] * (live[stem].score / Math.max(sim, 1)) ** gamma;
+      scales[stem] = +Math.min(2, Math.max(0.5, next)).toFixed(3);
+    }
+    const abs = (keys: string[]) => keys.filter((k) => k in err).map((k) => Math.abs(err[k]));
+    const top = abs(V5_TOP);
+    const all = abs(Object.keys(err));
+    out.push({
+      kind: "calibrate5", round, base, mods: modList.join("+"), gamma, matches: n, seed: seed + 1000 * round,
+      meanAbsTop: r1(top.reduce((x, y) => x + y, 0) / top.length), maxAbsTop: r1(Math.max(...top)),
+      meanAbsAll: r1(all.reduce((x, y) => x + y, 0) / all.length), simMinusLive: err, played, next: { ...scales },
+    });
+  }
+  return out;
+}
+
 function list() {
+
   for (const [k, f] of Object.entries(FIELDS)) console.log(`${k.padEnd(16)} ${f.about}`);
   console.log("field modifiers: <field>[@<rho>][,fp][,vickrey][,shade=<s>][,warm]   e.g. ar6@0.9,fp,shade=0.8,warm");
   console.log("variants: head, or NAME=value joined by +, NAME one of (default):");
@@ -1898,6 +2018,12 @@ async function main() {
     const rho = pos[2] === undefined || pos[2] === "-" ? undefined : Number(pos[2]);
     const entries = (pos[3] ?? "v5c").replace(/^-/, "") as V5Entries;
     for (const s of await validate5(Number(pos[0] ?? 288), Number(pos[1] ?? 1), rho, entries, pos[4] ?? "")) {
+      console.log(JSON.stringify(s));
+    }
+  } else if (mode === "calibrate5") {
+    const base = (pos[3] ?? "v5u") as "v5c" | "v5u";
+    const gamma = pos[5] === undefined ? 0.8 : Number(pos[5]);
+    for (const s of await calibrate5(Number(pos[0] ?? 6), Number(pos[1] ?? 576), Number(pos[2] ?? 1), base, pos[4] ?? "", gamma)) {
       console.log(JSON.stringify(s));
     }
   } else if (mode === "list") {

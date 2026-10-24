@@ -6,6 +6,7 @@
 // same matches. The few matches here are short (one process, a few seconds).
 
 import assert from "node:assert/strict";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,16 +17,22 @@ import {
   POLICY_KEYS,
   RULES,
   type Row,
+  V5_CALIBRATION,
+  V5_TOP,
+  applyRivalMods,
   compare,
   fieldSeatNames,
   parseField,
+  parseRivalMods,
   parseVariant,
   pricePaid,
+  rackMasks,
   readRows,
   sevenCompleters,
   shardRange,
   summarize,
   validate4,
+  validate5,
 } from "./selfplay.js";
 import { DEFAULT_POLICY } from "./strategy.js";
 
@@ -259,4 +266,122 @@ test("self-play: shards merge into exactly the unsharded run", async () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("fixture v5: the 51 earlier entries are byte-identical, every v5 rival comes as -v5, -v5c and -v5u", () => {
+  const fixture = JSON.parse(fs.readFileSync(new URL("./fixtures/rival-models.json", import.meta.url), "utf8")).rivals;
+  const old = Object.keys(fixture).filter((n) => !/-v5[cu]?$/.test(n));
+  assert.equal(old.length, 51);
+  // sha256 of "name=JSON" lines of the 51 entries as they were before the v5 refit (harness-sync 405aec0).
+  const hash = crypto.createHash("sha256").update(old.map((n) => `${n}=${JSON.stringify(fixture[n])}`).join("\n")).digest("hex");
+  assert.equal(hash, "f545f68959003c1160131738a9bd2845fad2da5743b13dd1a7ac915020a9ee9f", "the pre-v5 entries are unchanged");
+  const live = JSON.parse(fs.readFileSync(new URL("./fixtures/rival-live-v5.json", import.meta.url), "utf8"));
+  const stems = Object.keys(live.rivals);
+  assert.equal(stems.length, 35);
+  assert.equal(Object.keys(fixture).length, 51 + 3 * 35);
+  for (const stem of stems) {
+    for (const e of ["v5", "v5c", "v5u"]) assert.ok(fixture[`${stem}-${e}`], `${stem}-${e}`);
+    assert.equal(fixture[`${stem}-v5`].complete7, undefined, `${stem}-v5 is the existing format`);
+    assert.equal(fixture[`${stem}-v5c`].dead, undefined, `${stem}-v5c has no dead runs`);
+    assert.ok(Object.keys(fixture[`${stem}-v5u`].dead ?? {}).length >= 1, `${stem}-v5u has dead runs`);
+    assert.ok(live.rivals[stem].score >= 0 && live.rivals[stem].matches >= 15, stem);
+  }
+  for (const s of V5_TOP) assert.ok(stems.includes(s), s);
+  assert.equal(live.tables.length, 288);
+  for (const t of live.tables) {
+    assert.equal(t.length, 7, `table m${t[0]}`);
+    for (const s of t.slice(1)) assert.ok(stems.includes(s), `table m${t[0]}: ${s}`);
+  }
+});
+
+test("rackMasks: one scan answers which letters complete a 7+ word and which add to the greedy pack value", () => {
+  const index = WordIndex.fromWords(fs.readFileSync(new URL("../../spacetimedb/wordlist.txt", import.meta.url), "utf8").split("\n"));
+  const bag = Object.entries(RULES.BAG).flatMap(([c, k]) => Array<string>(k).fill(c));
+  let seed = 777;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296);
+  const pack = (counts: Int32Array) => index.pack(index.scan(counts, false), counts, -1, 0).total;
+  let useful = 0;
+  let dead = 0;
+  for (let r = 0; r < 30; r++) {
+    const rack = Array.from({ length: 3 + Math.floor(rnd() * 9) }, () => bag[Math.floor(rnd() * bag.length)]).join("");
+    const counts = countsOf(rack);
+    const [c7, use] = rackMasks(index, counts);
+    assert.equal(c7, sevenCompleters(index, counts), rack);
+    assert.deepEqual(rackMasks(index, countsOf(rack)), [c7, use], `${rack}: cached`);
+    const base = pack(counts);
+    for (const letter of "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+      const plus = new Int32Array(counts);
+      plus[letterIndex(letter)]++;
+      const isUseful = pack(plus) > base;
+      assert.equal(((use >>> letterIndex(letter)) & 1) === 1, isUseful, `${rack} + ${letter}`);
+      if (isUseful) useful++;
+      else dead++;
+    }
+  }
+  assert.ok(useful > 50 && dead > 50, `both cases covered (${useful} useful, ${dead} dead)`);
+});
+
+test("rival modifiers: each changes only what it names, never the fixture entry, and bad ones are refused", () => {
+  const fixture = JSON.parse(fs.readFileSync(new URL("./fixtures/rival-models.json", import.meta.url), "utf8")).rivals;
+  const hazard = fixture["postturing-v5u"];
+  const shark = fixture["Dante-v5u"];
+  assert.equal(hazard.policy, "hazard");
+  assert.equal(shark.policy, "shark");
+  const before = JSON.stringify(hazard);
+  assert.deepEqual(applyRivalMods(hazard, parseRivalMods("shark")), { ...hazard, policy: "shark", minLen: undefined, sharkLen: undefined });
+  assert.equal(applyRivalMods(hazard, parseRivalMods("minlen=7")).minLen, 7);
+  assert.equal(applyRivalMods(shark, parseRivalMods("minlen=7")), shark, "minlen leaves a shark alone");
+  assert.equal(applyRivalMods(hazard, parseRivalMods("noc7+nodead")).dead, undefined);
+  const doubled = applyRivalMods(hazard, parseRivalMods("bidx=2"));
+  const cells = (doubled.bid as { cells: Record<string, [number, number][]> }).cells;
+  assert.deepEqual(cells["v1|0"], hazard.bid.cells["v1|0"].map(([x, s]: [number, number]) => [2 * x, s]));
+  assert.deepEqual(doubled.dead!.v1, hazard.dead.v1.map(([x, s]: [number, number]) => [2 * x, s]));
+  assert.equal(JSON.stringify(hazard), before, "the fixture entry is untouched");
+  assert.deepEqual(parseRivalMods(""), []);
+  assert.deepEqual(parseRivalMods("-"), []);
+  assert.deepEqual(parseRivalMods("shark+bidx=1.5"), ["shark", "bidx=1.5"]);
+  for (const bad of ["nope", "minlen", "bidx", "shark=1", "minlen=0", "minlen=-1", "shark+", "SHARK"]) {
+    assert.throws(() => parseRivalMods(bad), Error, bad);
+  }
+  assert.deepEqual(parseRivalMods(V5_CALIBRATION.mods), parseRivalMods(V5_CALIBRATION.mods), "the calibration parses");
+});
+
+test("self-play: the v5 fields seat the calibrated rivals, and validate5 replays the live tables beside live", async () => {
+  const top5 = V5_TOP.slice(0, 5).map((n) => `${n}-v5k`);
+  assert.deepEqual(fieldSeatNames("ar6-top5-v5", 1).slice(1), top5);
+  assert.deepEqual(fieldSeatNames("ar4-top-v5", 1).slice(1), top5.slice(0, 3));
+  assert.deepEqual(fieldSeatNames("ar3-top-v5", 1).slice(1), top5.slice(0, 2));
+  for (const stem of V5_TOP.slice(0, 5)) {
+    assert.deepEqual(fieldSeatNames(`duel-${stem.toLowerCase()}-v5`, 1), ["SookraBot", `${stem}-v5k`]);
+  }
+  for (const ms of [1, 2, 3, 4, 5]) {
+    const mixed = fieldSeatNames("ar6-mixed-v5", ms).slice(1);
+    assert.equal(mixed.filter((n) => top5.includes(n)).length, 2, `ar6-mixed-v5 ${ms}: ${mixed}`);
+    const field = fieldSeatNames("ar6-field-v5", ms).slice(1);
+    assert.equal(field.length, 5);
+    for (const n of [...mixed, ...field]) {
+      assert.match(n, /-v5k$/);
+      assert.ok(!/^(SookraBot|deleted61|deleted37)-/.test(n), n);
+    }
+    for (const size of [3, 4]) {
+      const draw = fieldSeatNames(`ar${size}-topdraw-v5`, ms).slice(1);
+      assert.equal(draw.length, size - 1);
+      assert.ok(draw.every((n) => V5_TOP.slice(0, 6).map((s) => `${s}-v5k`).includes(n)), draw.join());
+    }
+  }
+  const rows = await compare("ar6-top5-v5", 1, 3, ["head"], { quiet: true });
+  assert.deepEqual(rows[0].others.map((o) => o.name), top5);
+  const v = (await validate5(2, 1, undefined, "v5k")) as {
+    kind: string; stem: string; seats: number; top: boolean; live: { score: number }; sim: { score: number; pack_won: number };
+  }[];
+  assert.ok(v.length >= 6, "one line per rival seated");
+  assert.equal(v.reduce((a, s) => a + s.seats, 0), 12, "two live tables of six");
+  for (const s of v) {
+    assert.equal(s.kind, "validate5");
+    assert.ok(s.live.score >= 0 && s.sim.pack_won >= 0, s.stem);
+  }
+  const fixed = (await validate5(1, 1, 0.5, "v5c", "shark")) as { rho: number; mods: string; label: string; rival: string }[];
+  assert.ok(fixed.every((s) => s.rho === 0.5 && s.mods === "shark" && s.label === "rho 0.5 shark" && s.rival.endsWith("-v5c")));
+  await assert.rejects(validate5(1, 1, undefined, "v4c" as "v5c"), /entries/);
+  await assert.rejects(validate5(1, 1, undefined, "v5c", "nope"), /modifier/);
 });
