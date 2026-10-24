@@ -121,6 +121,8 @@ export class WordIndex {
   readonly words: string[];
   readonly reward: Uint16Array;
   readonly len: Uint8Array;
+  /** Sum of LEAVE_W7 over each key's letters (in key order, like sim.py). */
+  readonly keyLeave: Float64Array;
   private readonly mask: Uint32Array;
   private readonly offset: Uint32Array;
   private readonly letters: Uint8Array;
@@ -132,6 +134,7 @@ export class WordIndex {
     this.words = new Array<string>(n);
     this.reward = new Uint16Array(n);
     this.len = new Uint8Array(n);
+    this.keyLeave = new Float64Array(n);
     this.mask = new Uint32Array(n);
     this.offset = new Uint32Array(n + 1);
     let total = 0;
@@ -145,12 +148,15 @@ export class WordIndex {
       this.len[i] = e.key.length;
       this.offset[i] = p;
       let m = 0;
+      let leave = 0;
       for (let j = 0; j < e.key.length; j++) {
         const li = e.key.charCodeAt(j) - 65;
         this.letters[p++] = li;
         m |= 1 << li;
+        leave += W7_BY_INDEX[li];
       }
       this.mask[i] = m >>> 0;
+      this.keyLeave[i] = leave;
     }
     this.offset[n] = p;
   }
@@ -255,11 +261,21 @@ export class WordIndex {
     return ok;
   }
 
+  /** Whether key k is spellable from counts (counts unchanged). */
+  fits(k: number, counts: Counts): boolean {
+    const rem = new Int32Array(counts);
+    return this.take(k, rem);
+  }
+
   /**
    * Greedy packing of `counts` plus one optional extra tile (`extraLetter`
    * 0..25, or -1 for none), restricted to candidates from `scan`.
+   * With keepWeight > 0, a word is only taken when its reward beats
+   * keepWeight x the leave value of its own tiles (holding them is worth
+   * more otherwise), so adding a tile can never force a bad word.
+   * keepWeight 0 packs every word that fits (the end-of-match flush).
    */
-  pack(cands: Candidates, counts: Counts, extraLetter = -1): PackResult {
+  pack(cands: Candidates, counts: Counts, extraLetter = -1, keepWeight = 0): PackResult {
     const rem = new Int32Array(counts);
     if (extraLetter >= 0) rem[extraLetter]++;
     let remTiles = tileCount(rem);
@@ -269,6 +285,7 @@ export class WordIndex {
       const e = cands.extra[i];
       if (e !== -1 && e !== extraLetter) continue;
       const k = cands.keys[i];
+      if (keepWeight > 0 && this.reward[k] <= keepWeight * this.keyLeave[k]) continue;
       const l = this.len[k];
       while (l <= remTiles && this.take(k, rem)) {
         total += this.reward[k];
@@ -328,15 +345,29 @@ export interface Valuation {
   ms: number;
 }
 
-/** Marginal value of each of the 26 letters for this rack. */
-export function valuate(index: WordIndex, counts: Counts, alpha: number): Valuation {
+/**
+ * Marginal value of each of the 26 letters for this rack.
+ * mode "leave" (default, used by the bot): packing keeps tiles whose leave
+ * value beats the word they would form. Sim (leave_sim.py, 400 deal-paired
+ * matches, kappa 4.25): +18.5 points vs the forced packing in a mixed field,
+ * +13.7 vs prototype hoarders, +34.7 vs sims.
+ * mode "forced": the prototype's packing (every word that fits), kept so the
+ * Python cross-check of sim.py stays exact.
+ */
+export function valuate(
+  index: WordIndex,
+  counts: Counts,
+  alpha: number,
+  mode: "leave" | "forced" = "leave",
+): Valuation {
   const t0 = performance.now();
+  const keep = mode === "leave" ? alpha : 0;
   const cands = index.scan(counts, true);
-  const base = index.pack(cands, counts, -1);
+  const base = index.pack(cands, counts, -1, keep);
   const baseValue = packValue(base, alpha);
   const delta = new Float64Array(26);
   for (let i = 0; i < 26; i++) {
-    delta[i] = packValue(index.pack(cands, counts, i), alpha) - baseValue;
+    delta[i] = packValue(index.pack(cands, counts, i, keep), alpha) - baseValue;
   }
   return {
     rackKey: countsKey(counts),

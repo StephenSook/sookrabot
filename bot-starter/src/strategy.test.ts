@@ -24,6 +24,8 @@ import {
   DUEL_RESERVE_WINDOW,
   FLUSH_LEAD_MS,
   KAPPA,
+  LIQUIDITY_FALLBACK_MIN_LEN,
+  LIQUIDITY_FLOOR,
   type Opponent,
   chooseWords,
   decideBid,
@@ -52,10 +54,18 @@ interface FixtureRow {
 }
 const FIXTURE = JSON.parse(
   fs.readFileSync(new URL("./fixtures/py-crosscheck.json", import.meta.url), "utf8"),
-) as { alpha: number; kappa: number; keys: number; fixed: FixtureRow[]; random: FixtureRow[] };
+) as {
+  alpha: number;
+  kappa: number;
+  keys: number;
+  fixed: FixtureRow[];
+  random: FixtureRow[];
+  leave_fixed: FixtureRow[];
+  leave_random: FixtureRow[];
+};
 
-function bidsFor(rack: string): number[] {
-  const v = valuate(INDEX, countsOf(rack), 0.35);
+function bidsFor(rack: string, mode: "leave" | "forced" = "forced"): number[] {
+  const v = valuate(INDEX, countsOf(rack), 0.35, mode);
   return Array.from("ABCDEFGHIJKLMNOPQRSTUVWXYZ", (L, i) =>
     decideBid({
       letter: L,
@@ -142,21 +152,19 @@ test("cross-check: hardcoded prototype numbers for six racks", () => {
   ];
   for (const [rack, total, used, left, bids] of cases) {
     const counts = countsOf(rack);
-    const v = valuate(INDEX, counts, 0.35);
+    const v = valuate(INDEX, counts, 0.35, "forced");
     assert.equal(v.base.total, total, rack);
     assert.deepEqual(v.base.keys.map((k) => INDEX.keyString(k)), used, rack);
     assert.equal(countsKey(v.base.leftover), left, rack);
-    assert.deepEqual(bidsFor(rack), bids, rack);
+    assert.deepEqual(bidsFor(rack, "forced"), bids, rack);
   }
 });
 
-test("cross-check: every fixture rack (9 fixed + 200 random) matches the prototype", () => {
-  const rows = [...FIXTURE.fixed, ...FIXTURE.random];
-  assert.equal(rows.length, 209);
+function crossCheck(rows: FixtureRow[], mode: "leave" | "forced") {
   let bidMismatch = 0;
   for (const r of rows) {
     const counts = countsOf(r.rack);
-    const v = valuate(INDEX, counts, FIXTURE.alpha);
+    const v = valuate(INDEX, counts, FIXTURE.alpha, mode);
     assert.equal(v.base.total, r.total, r.rack);
     assert.deepEqual(v.base.keys.map((k) => INDEX.keyString(k)), r.used, r.rack);
     assert.equal(countsKey(v.base.leftover), r.left, r.rack);
@@ -164,10 +172,45 @@ test("cross-check: every fixture rack (9 fixed + 200 random) matches the prototy
     for (let i = 0; i < 26; i++) {
       assert.ok(Math.abs(v.delta[i] - r.deltas[i]) < 1e-9, `${r.rack} delta ${i}`);
     }
-    const bids = bidsFor(r.rack);
-    if (bids.join() !== r.bids.join()) bidMismatch++;
+    if (bidsFor(r.rack, mode).join() !== r.bids.join()) bidMismatch++;
   }
   assert.equal(bidMismatch, 0);
+}
+
+test("cross-check: forced packing matches sim.py on every fixture rack (9 fixed + 200 random)", () => {
+  const rows = [...FIXTURE.fixed, ...FIXTURE.random];
+  assert.equal(rows.length, 209);
+  crossCheck(rows, "forced");
+});
+
+test("cross-check: leave-aware packing matches the Python leave model on every fixture rack", () => {
+  const rows = [...FIXTURE.leave_fixed, ...FIXTURE.leave_random];
+  assert.equal(rows.length, 209);
+  crossCheck(rows, "leave");
+  // Hardcoded from crosscheck.py output: ACT is now held (6.4645) instead of played (5).
+  const act = valuate(INDEX, countsOf("CAT"), 0.35);
+  assert.equal(act.base.total, 0);
+  assert.equal(countsKey(act.base.leftover), "ACT");
+  assert.ok(Math.abs(act.baseValue - 6.4645) < 1e-9);
+  assert.deepEqual(bidsFor("CAT", "leave"),
+    [10, 10, 10, 8, 10, 27, 8, 27, 8, 25, 36, 10, 11, 10, 10, 23, 34, 10, 10, 10, 8, 13, 13, 25, 13, 17]);
+  assert.deepEqual(bidsFor("QUIZ", "leave"), bidsFor("QUIZ", "forced")); // QUIZ is still worth playing
+});
+
+test("leave-aware valuation: adding a tile never forces a bad word (Codex O + S example)", () => {
+  const S = letterIndex("S");
+  // Forced packing plays OS (2) and loses O's leave (0.35 x 6.32 = 2.212): delta -0.212.
+  const forced = valuate(INDEX, countsOf("O"), 0.35, "forced");
+  assert.ok(Math.abs(forced.delta[S] - (2 - 0.35 * 6.32)) < 1e-9);
+  assert.ok(forced.delta[S] < 0);
+  // Leave-aware: OS is worth less than holding O and S, so S adds its leave value.
+  const leave = valuate(INDEX, countsOf("O"), 0.35);
+  assert.ok(Math.abs(leave.delta[S] - 0.35 * 6.8) < 1e-9);
+  // No letter has a negative delta on small racks where only short words are possible.
+  for (const rack of ["O", "E", "AE", "ST", "CAT"]) {
+    const v = valuate(INDEX, countsOf(rack), 0.35);
+    for (let i = 0; i < 26; i++) assert.ok(v.delta[i] >= -1e-9, `${rack}+${String.fromCharCode(65 + i)}`);
+  }
 });
 
 // ---- bidding policy ----
@@ -276,7 +319,35 @@ test("duel rule: one rival means a cash reserve sized to the remaining auctions"
   );
 });
 
+test("final letter: deny it to sims (they can still score it), 0 against real bots only", () => {
+  const input = (opponents: Opponent[], myBalance = 100) =>
+    decideBid({ letter: "E", delta: 0, bagTotal: 0, auctionType: "Vickrey", myBalance, opponents });
+  assert.equal(input(REAL).amount, 0);
+  const withSims: Opponent[] = [...REAL.slice(0, 3), { isSim: true, strategy: "Aggressive", balance: 100 }];
+  assert.equal(input(withSims).amount, maxSimBid("Aggressive", "E", 100) + 1); // 8
+  assert.equal(input(withSims, 5).amount, 5); // capped by our balance
+  const brokeSim: Opponent[] = [{ isSim: true, strategy: "Aggressive", balance: 0 }];
+  assert.equal(input(brokeSim).amount, 0); // a broke sim cannot bid, nothing to deny
+});
+
 // ---- word play ----
+
+test("liquidity: a broke bot cashes a short word rather than bid 0 forever (Codex QUIZ example)", () => {
+  const play = (rack: string, myBalance: number) => {
+    const counts = countsOf(rack);
+    return chooseWords(INDEX, { counts, cands: INDEX.scan(counts, true), myBalance, flush: false });
+  };
+  // QUIZ is the only word in these tiles and has 4 letters.
+  assert.deepEqual(play("QUIZ", 0), ["QUIZ"]);
+  // Still hoards when solvent.
+  assert.deepEqual(play("QUIZ", LIQUIDITY_FLOOR), []);
+  // A 2-letter fallback when nothing longer exists, even if it cannot restore the floor.
+  assert.deepEqual(play("AX", 0), ["AX"]);
+  // 5+ letter words are preferred when they exist.
+  const five = play("QUAKES", 3);
+  assert.deepEqual(five, ["QUAKES"]);
+  assert.equal(LIQUIDITY_FALLBACK_MIN_LEN, 2);
+});
 
 test("shouldFlush: always at the final auction, earlier for short auctions", () => {
   assert.equal(FLUSH_LEAD_MS, 3000);

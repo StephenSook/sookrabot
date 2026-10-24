@@ -11,6 +11,7 @@ import {
   LETTER_VALUE,
   WordIndex,
   letterIndex,
+  packValue,
 } from "./engine.js";
 
 export { LETTER_VALUE } from "./engine.js";
@@ -26,9 +27,17 @@ export const ENDGAME_KAPPA_BOOST = 2;
 export const LEAVE_ALPHA = 0.35;
 /** Cash any word of at least this many letters as soon as it forms (multiplier saturates at 7). */
 export const CASH_MIN_LEN = 7;
-/** Below this balance (after cashing), also play the best word of LIQUIDITY_MIN_LEN+ letters. */
+/**
+ * Below this balance (after cashing), also cash one word: preferably of
+ * LIQUIDITY_MIN_LEN+ letters, else of any length (LIQUIDITY_FALLBACK_MIN_LEN),
+ * so a broke bot holding only e.g. QUIZ is never stuck bidding 0. Among the
+ * LIQUIDITY_TOP_K best-paying words that restore the floor, the one that
+ * leaves the most valuable hoard (reward + value of the rest) is chosen.
+ */
 export const LIQUIDITY_FLOOR = 15;
 export const LIQUIDITY_MIN_LEN = 5;
+export const LIQUIDITY_FALLBACK_MIN_LEN = 2;
+export const LIQUIDITY_TOP_K = 24;
 /**
  * Kappa used when every opponent is a sim. Sims cannot outbid
  * maxSimBid + 1, so the bid is also capped there (Vickrey: you pay the
@@ -148,7 +157,10 @@ export function duelReserve(opponentCount: number, bagTotal: number): number {
 
 /**
  * Bid rule, in order:
- *  - final letter (bagTotal 0): 0, a real bot can never play it;
+ *  - final letter (bagTotal 0): a real bot can never play it, but a sim that
+ *    wins it plays a word before the match ends (game.ts closeAuction), and
+ *    leftover coins are worthless, so with sims seated bid max sim bid + 1
+ *    to deny it; with no sims, 0;
  *  - no positive marginal value: 0;
  *  - every rival can bid at most BROKE_RIVAL_MAX_BID (public balances, sim
  *    rules): bid exactly their max + 1, the minimum that wins;
@@ -167,11 +179,18 @@ export function duelReserve(opponentCount: number, bagTotal: number): number {
  */
 export function decideBid(input: BidInput): BidDecision {
   const balance = Math.max(0, Math.floor(Number.isFinite(input.myBalance) ? input.myBalance : 0));
-  if (!(input.bagTotal > 0)) return { amount: 0, reason: "final-letter" };
-  if (!(input.delta > 0) || letterIndex(input.letter) < 0) {
+  const clamp = (x: number) => Math.max(0, Math.min(Math.floor(x), balance));
+  if (letterIndex(input.letter) < 0) return { amount: 0, reason: "bad-letter" };
+  if (!(input.bagTotal > 0)) {
+    const simMax = input.opponents
+      .filter((o) => o.isSim && o.strategy)
+      .reduce((m, o) => Math.max(m, maxSimBid(o.strategy!, input.letter, o.balance)), 0);
+    if (simMax > 0) return { amount: clamp(simMax + 1), reason: `final-letter deny sims (cap ${simMax + 1})` };
+    return { amount: 0, reason: "final-letter" };
+  }
+  if (!(input.delta > 0)) {
     return { amount: 0, reason: "no-value" };
   }
-  const clamp = (x: number) => Math.max(0, Math.min(Math.floor(x), balance));
   const rivalMax = input.opponents.reduce((m, o) => Math.max(m, maxPossibleBid(o, input.letter)), 0);
   const rivalCap = rivalMax + 1;
   if (rivalMax <= BROKE_RIVAL_MAX_BID) {
@@ -246,15 +265,58 @@ export function alphaFor(flush: boolean): number {
 
 export interface WordInput {
   counts: Counts;
-  /** Candidates from index.scan(counts, ...) for exactly these counts. */
+  /** Candidates from index.scan(counts, ...) for exactly these counts (or a superset rack). */
   cands: Candidates;
   myBalance: number;
   flush: boolean;
+  /** Leave weight used to judge what a liquidity play leaves behind (default LEAVE_ALPHA). */
+  alpha?: number;
+}
+
+/**
+ * Liquidity word for a bot under LIQUIDITY_FLOOR, or -1: among the
+ * LIQUIDITY_TOP_K best-paying spellable words of at least minLen letters
+ * (LIQUIDITY_MIN_LEN first, then LIQUIDITY_FALLBACK_MIN_LEN), keep those that
+ * lift the balance to the floor (or the single best-paying one if none does),
+ * and pick the one maximizing reward + value of the remaining rack.
+ */
+export function liquidityWord(
+  index: WordIndex,
+  cands: Candidates,
+  rem: Counts,
+  balance: number,
+  alpha: number,
+): number {
+  for (const minLen of [LIQUIDITY_MIN_LEN, LIQUIDITY_FALLBACK_MIN_LEN]) {
+    const top: number[] = [];
+    for (let i = 0; i < cands.n && top.length < LIQUIDITY_TOP_K; i++) {
+      if (cands.extra[i] !== -1) continue;
+      const k = cands.keys[i];
+      if (index.len[k] >= minLen && index.fits(k, rem)) top.push(k);
+    }
+    if (top.length === 0) continue;
+    const need = LIQUIDITY_FLOOR - balance;
+    let eligible = top.filter((k) => index.reward[k] >= need);
+    if (eligible.length === 0) eligible = [top[0]];
+    let best = -1;
+    let bestScore = -Infinity;
+    for (const k of eligible) {
+      const rest = new Int32Array(rem);
+      index.consume(rest, k);
+      const score = index.reward[k] + packValue(index.pack(cands, rest, -1, alpha), alpha);
+      if (score > bestScore) {
+        bestScore = score;
+        best = k;
+      }
+    }
+    return best;
+  }
+  return -1;
 }
 
 /**
  * Words to submit now, in order. Flush: the full greedy packing. Otherwise:
- * every 7+ letter word (best first), then one 5+ letter word if the balance
+ * every 7+ letter word (best first), then one liquidity word if the balance
  * would still be under LIQUIDITY_FLOOR.
  */
 export function chooseWords(index: WordIndex, input: WordInput): string[] {
@@ -272,7 +334,7 @@ export function chooseWords(index: WordIndex, input: WordInput): string[] {
     index.consume(rem, k);
   }
   if (balance < LIQUIDITY_FLOOR) {
-    const k = index.bestKey(input.cands, rem, LIQUIDITY_MIN_LEN);
+    const k = liquidityWord(index, input.cands, rem, balance, input.alpha ?? LEAVE_ALPHA);
     if (k >= 0) out.push(index.words[k]);
   }
   return out;
