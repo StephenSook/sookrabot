@@ -476,11 +476,19 @@ export class SookraBot {
     });
   }
 
-  /** Re-check every running match (covers missed events and failed plays). */
+  /**
+   * Re-check every running match (covers missed events and failed plays),
+   * and drop models of matches that are no longer running, in case their
+   * end event was missed (each model can hold several valuation tables).
+   */
   tick(conn: ConnLike) {
     this.guard("tick", () => {
       if (!this.online) return;
       for (const id of this.runningMatches(conn)) this.scheduleRefresh(conn, id);
+      for (const key of [...this.models.keys()]) {
+        const m = conn.db.matchState.id.find(BigInt(key));
+        if (!m || m.status.tag !== "Running") this.onMatchEnded(conn, BigInt(key));
+      }
     });
   }
 

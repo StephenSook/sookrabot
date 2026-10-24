@@ -437,6 +437,17 @@ test("sims-only table bids up to the sim cap", async () => {
   assert.equal(s.bids[0].amount, 6n);
 });
 
+test("tick drops the model of a match whose end event was missed", async () => {
+  const { s, bot, logs } = setup("CAT", 30, "S");
+  bot.refresh(s, MATCH);
+  await settle();
+  assert.ok(bot.models.has(String(MATCH)));
+  s.matchStates.get(MATCH)!.status = { tag: "Ended" };
+  bot.tick(s);
+  assert.ok(!bot.models.has(String(MATCH)));
+  assert.ok(logs.some((l) => l.includes("m1 ended")));
+});
+
 test("ended matches and foreign auctions are ignored", async () => {
   const { s, bot } = setup("RETAINSQ", 30, "E");
   s.matchStates.get(MATCH)!.status = { tag: "Ended" };
