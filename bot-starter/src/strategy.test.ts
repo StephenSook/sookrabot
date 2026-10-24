@@ -34,7 +34,11 @@ import {
   PACE_MAX,
   PACE_MIN,
   PACE_MIN_DUEL,
+  DEFAULT_POLICY,
   type Opponent,
+  type Policy,
+  type PricePoint,
+  alphaFor,
   auctionsPerMatch,
   chooseWords,
   decideBid,
@@ -48,6 +52,7 @@ import {
   MAX_FLUSH_LEAD_MS,
   shouldFlush,
 } from "./strategy.js";
+import * as strategy from "./strategy.js";
 
 test("budget pacing: kappa scales with the balance left per remaining auction", () => {
   assert.equal(auctionsPerMatch(6, 5), 68);
@@ -582,6 +587,96 @@ test("match 123: 10 coins, a 6-letter word in hand, 46 auctions left: cash it, t
   // The same spot in a final (a duel vs LetterShark, 88 auctions): the factor, 0.547, is held at
   // PACE_MIN_DUEL (kappa 3), so 5 rather than 4, inside the duel cap of 16 - 10 reserved = 6.
   assert.equal(bid("G", 1.943, 46, 16, [table[0]], 88), 5);
+});
+
+// ---- the policy: every knob by name, the one way a variant reaches the code ----
+
+const withPolicy = (o: Partial<Policy>): Policy => ({ ...DEFAULT_POLICY, ...o });
+
+test("policy: DEFAULT_POLICY holds each tuning constant under its own name, frozen", () => {
+  const exported = strategy as unknown as Record<string, unknown>;
+  for (const [k, v] of Object.entries(DEFAULT_POLICY)) assert.equal(v, exported[k], k);
+  assert.ok(Object.isFrozen(DEFAULT_POLICY));
+  assert.throws(() => {
+    (DEFAULT_POLICY as { KAPPA: number }).KAPPA = 9;
+  }, TypeError);
+  assert.equal(DEFAULT_POLICY.KAPPA, KAPPA);
+});
+
+test("policy: each bid knob set in the policy moves decideBid as its constant does", () => {
+  const bid = (o: Partial<Policy>, x: Partial<Parameters<typeof decideBid>[0]> = {}) =>
+    decideBid({
+      letter: "S", delta: 5, bagTotal: 40, auctionType: "Vickrey", myBalance: 100, opponents: REAL,
+      auctionsPerMatch: 68, ...x, policy: withPolicy(o),
+    }).amount;
+  // 100 coins for 41 auctions of 68: r = 68/41, pacing factor sqrt(r) = 1.2878.
+  assert.equal(bid({}), 25);
+  assert.equal(bid({}), decideBid({ letter: "S", delta: 5, bagTotal: 40, auctionType: "Vickrey", myBalance: 100, opponents: REAL, auctionsPerMatch: 68 }).amount);
+  assert.equal(bid({ PACED_KAPPA: 6 }), 38);
+  assert.equal(bid({ PACE_EXPONENT: 1 }), 33);
+  assert.equal(bid({ PACE_MAX: 1 }), 20);
+  assert.equal(bid({ PACE_MIN: 2 }), 40);
+  // Endgame (10 auctions to come, 15 coins: factor 0.963): doubled inside ENDGAME_AUCTIONS.
+  const late = { bagTotal: 10, myBalance: 15, delta: 1 };
+  assert.equal(bid({}, late), 7);
+  assert.equal(bid({ ENDGAME_AUCTIONS: 8 }, late), 3);
+  assert.equal(bid({ ENDGAME_KAPPA_BOOST: 3 }, late), 11);
+  // KAPPA is the unpaced kappa (no match length; the live bot always passes one).
+  assert.equal(bid({}, { auctionsPerMatch: undefined }), Math.floor(KAPPA * 5));
+  assert.equal(bid({ KAPPA: 3 }, { auctionsPerMatch: undefined }), 15);
+  assert.equal(bid({ KAPPA: 3 }), 25, "paced tables ignore KAPPA");
+  // Duel, 20 coins with 60 auctions to come of 88: factor 0.537, floored at PACE_MIN_DUEL.
+  const duel = { opponents: [{ isSim: false, balance: 100 }], myBalance: 20, bagTotal: 60, auctionsPerMatch: 88, delta: 2 };
+  assert.equal(bid({}, duel), 6);
+  assert.equal(bid({ PACE_MIN_DUEL: 1 }, duel), 8);
+  assert.equal(bid({ DUEL_MAX_OPPONENTS: 0 }, duel), 4, "not a duel: PACE_MIN floor");
+  // Duel reserve: 15 wanted, 20 - 10 reserved allows 10.
+  const reserve = { ...duel, delta: 5 };
+  assert.equal(bid({}, reserve), 10);
+  assert.equal(bid({ DUEL_RESERVE_WINDOW: 5 }, reserve), 15);
+  assert.equal(bid({ DUEL_RESERVE_PER_AUCTION: 0 }, reserve), 15);
+  assert.equal(duelReserve(1, 60, withPolicy({ DUEL_RESERVE_PER_AUCTION: 2, DUEL_RESERVE_WINDOW: 3 })), 6);
+  // Sims-only Vickrey: SIM_ONLY_KAPPA x value, under the sim cap (Aggressive on E: 8).
+  const simsOnly = { letter: "E", delta: 0.25, opponents: [{ isSim: true, strategy: "Aggressive" as const, balance: 100 }] };
+  assert.equal(bid({}, simsOnly), 5);
+  assert.equal(bid({ SIM_ONLY_KAPPA: 10 }, simsOnly), 2);
+  // Broke rivals (all at 2 coins): bid their max + 1 unless BROKE_RIVAL_MAX_BID says they are not broke.
+  const broke = { delta: 0.2, opponents: Array.from({ length: 5 }, () => ({ isSim: false, balance: 2 })) };
+  assert.equal(bid({}, broke), 3);
+  assert.equal(bid({ BROKE_RIVAL_MAX_BID: 1 }, broke), 1);
+  // First price, full bid 25: no history shades to FP_NO_HISTORY_SHADE, history to the FP_QUANTILE price + 1.
+  const fp = { auctionType: "FirstPrice" as const };
+  assert.equal(bid({}, fp), 18);
+  assert.equal(bid({ FP_NO_HISTORY_SHADE: 0.5 }, fp), 12);
+  const history: PricePoint[] = [1, 2, 3, 4, 5, 6, 7, 8].map((paid) => ({ face: 1, paid }));
+  const fpH = { ...fp, fpHistory: history };
+  assert.equal(bid({}, fpH), 7);
+  assert.equal(bid({ FP_QUANTILE: 0.5 }, fpH), 5);
+  assert.equal(bid({ FP_MIN_OBS: 9 }, fpH), 18);
+  assert.equal(bid({ FP_HISTORY_MAX: 5 }, fpH), 8); // the last 5 prices, 4 to 8
+  assert.equal(bid({ FP_HISTORY_MAX: 4 }, fpH), 18); // fewer than FP_MIN_OBS kept: no history
+});
+
+test("policy: word, flush and leave knobs set in the policy move chooseWords, flushLeadMs and alphaFor", () => {
+  const play = (rack: string, myBalance: number, realRivals: number, o: Partial<Policy>) => {
+    const counts = countsOf(rack);
+    return chooseWords(INDEX, {
+      counts, cands: INDEX.scan(counts, true), myBalance, flush: false, realRivals, policy: withPolicy(o),
+    });
+  };
+  assert.deepEqual(play("RETAINSQ", 100, 1, {}), ["QINTARS"]);
+  assert.deepEqual(play("RETAINSQ", 100, 1, { CASH_MIN_LEN: 8 }), []);
+  assert.deepEqual(play("RETAINSQ", 100, 1, { HOLD_MIN_REAL_RIVALS: 1 }), []);
+  assert.deepEqual(play("RETAINSQ", 100, 5, { HOLD_MIN_REAL_RIVALS: 6 }), ["QINTARS"]);
+  assert.deepEqual(play("JUTTEDVG", 10, 5, {}), ["JUTTED"]);
+  assert.deepEqual(play("JUTTEDVG", 10, 5, { LIQUIDITY_FLOOR: 10 }), [], "at the floor: no liquidity word");
+  assert.deepEqual(play("JUTTEDVG", 10, 5, { LIQUIDITY_MIN_LEN: 7, LIQUIDITY_FALLBACK_MIN_LEN: 7 }), []);
+  assert.equal(flushLeadMs([], withPolicy({ FLUSH_LEAD_MS: 5000 })), 5000);
+  assert.equal(flushLeadMs([50, 60, 3000], withPolicy({ FLUSH_LEAD_MS: 5000 })), 6900); // 2 x 2950 + 1000
+  assert.equal(flushLeadMs([50, 60, 3000], withPolicy({ FLUSH_LEAD_MS: 8000 })), 8000);
+  assert.equal(alphaFor(false, withPolicy({ LEAVE_ALPHA: 0.5 })), 0.5);
+  assert.equal(alphaFor(true, withPolicy({ LEAVE_ALPHA: 0.5 })), 0);
+  assert.equal(alphaFor(false), LEAVE_ALPHA);
 });
 
 // ---- speed ----

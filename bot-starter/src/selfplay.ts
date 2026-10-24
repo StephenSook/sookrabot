@@ -1,20 +1,61 @@
-// Offline self-play: runs the real SookraBot class (bot.ts, unchanged)
-// through simulated matches against module-exact sims, starter clones,
-// fitted models of the real rivals (fixtures/rival-models.json) and other
-// SookraBot instances.
+// Offline self-play: runs the real SookraBot (bot.ts and strategy.ts, exactly
+// as the live bot runs them) through simulated matches against module-exact
+// sims, starter clones, fitted models of the real rivals
+// (fixtures/rival-models.json) and other SookraBot instances.
 //
+//   npx tsx src/selfplay.ts compare <field> <matches> <seed> <variant>... [--shard=i/n] [--rows=file.jsonl] [--trace]
+//   npx tsx src/selfplay.ts merge <rows.jsonl>... [--expect=<matches>]
 //   npx tsx src/selfplay.ts [sims|starters] [matches] [seed]
-//   npx tsx src/selfplay.ts compare <field> <matches> <seed> <variant>... [--rows=file.jsonl]
 //   npx tsx src/selfplay.ts validate [matches] [seed]
 //   npx tsx src/selfplay.ts list
 //
+// Variants. "head" is the live bot: DEFAULT_POLICY. Any other variant names
+// strategy.ts constants to override, NAME=value joined by "+", for example
+// PACED_KAPPA=4.5+PACE_MIN=0.6 (names are the constants' own, any case; list
+// prints them with their values). The variant's policy reaches the bot only
+// through the SookraBot constructor, and bot.ts passes it to every strategy.ts
+// call, so a variant runs the live code with those constants changed and
+// nothing else; the harness never wraps or replaces a SookraBot method.
+//
+// Fields: <name>[@<rho>][,fp][,shade=<s>][,warm]. @rho gives every fitted rival
+// rack awareness rho (see RivalModel.rho); ,fp plays first-price auctions (the
+// winner pays its own bid; Vickrey otherwise); ,shade=s multiplies every fitted
+// rival's bid by s, rounded half to even (the fits come from Vickrey matches, so
+// under first price s < 1 models rivals shading their bids); ,warm (with fp)
+// starts each SookraBot with the price history of a burn-in match of the same
+// field, as the live bot carries it between first-price matches (without it
+// the history starts empty, as in a session's first first-price match).
+// arN (N 2 to 8) is the focal bot plus N - 1 drawn -ar rivals: the 3-game
+// final is a duel, the elimination bracket runs one table from the cut down to
+// 3 bots, and a Swiss round seats tables of about the match size.
+//
+// compare runs every variant of the focal SookraBot (seat 0) on the same deals
+// with common random numbers: per match, the bag order, each sim's jitter, each
+// fitted rival's bid noise and the tie-break priorities come from their own
+// seeded streams, so variants differ only through their own decisions and what
+// those change downstream. Match i's seed is mix(seed, i) whatever the shard, so
+// --shard=i/n (0 <= i < n) runs matches floor(i*N/n) to floor((i+1)*N/n) - 1 of
+// the N, and merging the shards' rows gives exactly the unsharded run. Output:
+// one JSON line per variant, with paired differences against the first variant
+// listed (mean, standard error and t over matches). --rows appends one JSON line
+// per variant and match as each match finishes; merge recomputes the summaries
+// from any set of rows files (duplicates of identical rows are dropped,
+// conflicting ones refused) and with --expect=N refuses an incomplete set.
+// Every row carries a hash of the bot, harness, rival and wordlist sources, and
+// merge refuses rows from different code. --trace prints the focal bot's own log
+// lines (every bid with its reason, every word) to stderr.
+//
 // Rules mirrored from spacetimedb/src/game.ts: 98-tile bag, 5-tile hidden
 // racks, balance 100, one letter per auction (98 - 5 x seats auctions),
-// Vickrey (second price, 1 when alone, random ties), unbid letters
-// discarded, sims bid on every letter with jitter -2..2 and play their
+// Vickrey (second price, 1 when alone) or first price, random ties, unbid
+// letters discarded, sims bid on every letter with jitter -2..2 and play their
 // longest 3+ word right after a win, a real bot cannot use the final letter
 // (the match ends when it closes). Timing is idealized: every bot's bid and
-// word plays land before each auction closes.
+// word plays land before each auction closes. Each SookraBot seat gets the
+// events the live bot gets from index.ts (onAuctionOpen, the deferred turns
+// its refreshes run in, onAuctionResult, onMatchEnded) and TURNS turns per
+// auction, or more while it is still playing words (extraTurns counts those).
+// Each match starts a fresh SookraBot (,warm aside, see above).
 //
 // Fitted rivals (rival_sim.py FittedRival, from public match data): bids
 // sample an isotonic survival curve per letter-value class and clock block
@@ -26,60 +67,35 @@
 // 2-seat duel (88 auctions) keeps the endgame where a 68-auction match has it.
 // Entries named -v2 (and Yezi, tinytung, slow-n-dumb) were refitted by
 // rival_refit.py on a later snapshot (matches up to 161): code-v2 and bot-v2
-// from match 127 on, the newer bots on all their matches. Known gap: these
-// bids do not depend on the rival's own rack, and against them the harness
-// is optimistic for SookraBot (pad-code2: 153 vs code-v2 115; live m127 and
-// m129 to m132: 101 vs code 208), so trust paired differences more than levels.
-//
-// compare runs every variant of the focal SookraBot (seat 0) on the same
-// deals with common random numbers: per match, the bag order, each sim's
-// jitter, each fitted rival's bid noise and the tie-break priorities come
-// from their own seeded streams, so variants differ only through their own
-// decisions and what those change downstream. Output: one JSON line per
-// variant, with paired differences against the first variant listed (mean
-// and standard error over matches). Variants are harness-only prototypes:
-// they wrap two SookraBot methods per instance (the bid gets a scaled
-// marginal value, so floor(kappa x delta) uses the variant's kappa; the
-// word choice is replaced) and never touch strategy.ts.
+// from match 127 on, the newer bots on all their matches; -ar entries on the
+// live all-real 6-bot matches m147 to m190. Known gap: against these rivals
+// the harness is optimistic for SookraBot (pad-code2: 153 vs code-v2 115; live
+// m127 and m129 to m132: 101 vs code 208), so trust paired differences more
+// than levels.
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
+  type AuctionResultRow,
   type AuctionRow,
   type BotRow,
   type ConnLike,
   type HoldingRow,
+  type Logger,
   type MatchStateRow,
   type ParticipantRow,
-  MAX_WORD_FAILURES,
   SookraBot,
 } from "./bot.js";
+import { LETTER_VALUE, WordIndex, countsKey, countsOf, letterIndex, valuate, wordReward } from "./engine.js";
 import {
-  type Candidates,
-  type Counts,
-  type Valuation,
-  LETTER_VALUE,
-  WordIndex,
-  countsKey,
-  countsOf,
-  letterIndex,
-  packValue,
-  valuate,
-  wordReward,
-} from "./engine.js";
-import {
-  type Opponent,
+  type AuctionKind,
+  type Policy,
+  type PricePoint,
   type SimStrategy,
-  type WordInput,
-  CASH_MIN_LEN,
-  ENDGAME_AUCTIONS,
-  ENDGAME_KAPPA_BOOST,
-  KAPPA,
+  DEFAULT_POLICY,
   LEAVE_ALPHA,
-  LIQUIDITY_FALLBACK_MIN_LEN,
-  LIQUIDITY_FLOOR,
-  LIQUIDITY_MIN_LEN,
-  LIQUIDITY_TOP_K,
-  kappaFor,
   maxSimBid,
 } from "./strategy.js";
 
@@ -96,7 +112,10 @@ const SIMS: [string, SimStrategy][] = [
 ];
 /** setImmediate turns given to the SookraBot seats per auction (bid, refresh, word acks, precompute). */
 const TURNS = 6;
+/** Further turns at most, while a SookraBot keeps playing words (each play consumes 2+ tiles). */
+const MAX_EXTRA_TURNS = 64;
 const MATCH = 1n;
+const WORDLIST = new URL("../../spacetimedb/wordlist.txt", import.meta.url);
 
 // ---- random streams ----
 
@@ -125,7 +144,7 @@ function mix(...xs: number[]): number {
   return h >>> 0;
 }
 
-const STREAM = { bag: 1, sims: 2, ties: 3, field: 4, rivalBid: 100, rivalWord: 200 } as const;
+const STREAM = { bag: 1, sims: 2, ties: 3, field: 4, warm: 5, rivalBid: 100, rivalWord: 200 } as const;
 
 /** Python round(): halves go to the even neighbour (rival_sim.py bids use it). */
 function roundHalfEven(x: number): number {
@@ -263,7 +282,7 @@ function rivalBid(
 // ---- seats and the simulated server ----
 
 type SeatSpec =
-  | { kind: "sookra"; name: string; variant: Variant }
+  | { kind: "sookra"; name: string; policy: Policy }
   | { kind: "sim"; name: string; strategy: SimStrategy }
   | { kind: "starter"; name: string }
   | { kind: "fitted"; name: string; model: RivalModel };
@@ -282,6 +301,8 @@ interface Seat {
   poor: number;
   midBalance: number | null;
   bid: { auctionId: bigint; amount: number } | null;
+  /** Word plays this seat has submitted (SookraBot seats: tells the settle loop it is still playing). */
+  wordCalls: number;
   bidRng: Rng;
   wordRng: Rng;
   bot?: SookraBot;
@@ -316,30 +337,24 @@ function rackRank(index: WordIndex, seat: Seat, letter: string): number {
   return (below + 0.5 * equal) / total;
 }
 
-interface PublicStats {
-  /** Price paid in every closed auction that had a winner, oldest first. */
-  prices: number[];
-  /** Auctions closed so far. */
-  closed: number;
-  wins: Map<bigint, number>;
-}
-
 class Table {
   matchState: MatchStateRow;
   auction: AuctionRow | null = null;
-  stats: PublicStats = { prices: [], closed: 0, wins: new Map() };
+  /** Auctions closed so far. */
+  closed = 0;
   constructor(
     readonly index: WordIndex,
     readonly seats: Seat[],
     readonly botRows: Map<bigint, BotRow>,
     readonly auctions: number,
+    auctionType: AuctionKind,
   ) {
     this.matchState = {
       id: MATCH,
       status: { tag: "Running" },
       currentAuctionId: undefined,
       bagTotal: auctions,
-      auctionType: { tag: "Vickrey" },
+      auctionType: { tag: auctionType },
       auctionDurationMs: 1000n,
       startingRackSize: RACK,
     };
@@ -372,6 +387,7 @@ class Table {
           return Promise.resolve();
         },
         submitWord: (a: { matchId: bigint; word: string }): Promise<unknown> => {
+          seat.wordCalls++;
           if (this.matchState.status.tag !== "Running") return Promise.reject(new Error("Match not running"));
           if (!this.spend(seat, a.word)) return Promise.reject(new Error(`Not enough letters for ${a.word}`));
           return Promise.resolve();
@@ -390,7 +406,7 @@ class Table {
     seat.balance += r;
     seat.score += r;
     seat.words++;
-    if (seat.firstWord === null) seat.firstWord = this.stats.closed;
+    if (seat.firstWord === null) seat.firstWord = this.closed;
     return true;
   }
 
@@ -465,7 +481,57 @@ export interface SeatResult {
   endRack: number;
 }
 
-async function playMatch(index: WordIndex, specs: SeatSpec[], matchSeed: number): Promise<SeatResult[]> {
+/** How a match is played: the auction rule and the fitted rivals' bid scale. */
+export interface MatchEnv {
+  auction: AuctionKind;
+  /** Every fitted rival's bid times this, rounded half to even (1: as fitted). */
+  shade: number;
+}
+export const VICKREY: MatchEnv = { auction: "Vickrey", shade: 1 };
+
+export interface MatchResult {
+  seats: SeatResult[];
+  /** Turns run past TURNS because a SookraBot seat was still playing words (0: the fixed window sufficed). */
+  extraTurns: number;
+  /** Each SookraBot seat's first-price price history at the end (null for other seats). */
+  fpHistory: (PricePoint[] | null)[];
+}
+
+/** Optional extras for one match: the focal bot's log, and price histories to start SookraBot seats with. */
+export interface MatchOpts {
+  focalLog?: Logger;
+  fpHistory?: readonly (readonly PricePoint[] | null)[];
+}
+
+/**
+ * What the winner pays (game.ts closeAuction): under first price its own bid; under Vickrey the best
+ * other positive bid, or AUCTION_RESERVE (1) when nobody else bid.
+ */
+export function pricePaid(auction: AuctionKind, top: number, otherBids: number[]): number {
+  if (auction === "FirstPrice") return top;
+  let second = 0;
+  let others = 0;
+  for (const a of otherBids) {
+    if (a <= 0) continue;
+    others++;
+    second = Math.max(second, a);
+  }
+  return others > 0 ? second : Math.min(1, top);
+}
+
+/** The game constants this harness plays by, for the check against spacetimedb/src. */
+export const RULES = { BAG, RACK, START_BALANCE } as const;
+
+/** One SookraBot seat: the class index.ts runs, with this seat's policy (DEFAULT_POLICY for head). */
+function makeBot(index: WordIndex, seat: Seat, policy: Policy, log: Logger): SookraBot {
+  const bot = new SookraBot(index, seat.spec.name, log, Date.now, policy);
+  bot.myBotId = seat.id;
+  return bot;
+}
+
+export async function playMatch(
+  index: WordIndex, specs: SeatSpec[], matchSeed: number, env: MatchEnv = VICKREY, opts: MatchOpts = {},
+): Promise<MatchResult> {
   const n = specs.length;
   const auctions = BAG_TILES - RACK * n;
   const bagRng = mulberry32(mix(matchSeed, STREAM.bag));
@@ -491,6 +557,7 @@ async function playMatch(index: WordIndex, specs: SeatSpec[], matchSeed: number)
     poor: 0,
     midBalance: null,
     bid: null,
+    wordCalls: 0,
     bidRng: mulberry32(mix(matchSeed, STREAM.rivalBid + i)),
     wordRng: mulberry32(mix(matchSeed, STREAM.rivalWord + i)),
   }));
@@ -509,10 +576,13 @@ async function playMatch(index: WordIndex, specs: SeatSpec[], matchSeed: number)
       s.rack.set(c, (s.rack.get(c) ?? 0) + 1);
     }
   }
-  const table = new Table(index, seats, botRows, auctions);
-  for (const s of seats) {
-    if (s.spec.kind === "sookra") s.bot = makeBot(index, table, s, s.spec.variant);
-  }
+  const table = new Table(index, seats, botRows, auctions, env.auction);
+  seats.forEach((s, i) => {
+    if (s.spec.kind !== "sookra") return;
+    s.bot = makeBot(index, s, s.spec.policy, (i === 0 && opts.focalLog) || QUIET);
+    const warm = opts.fpHistory?.[i];
+    if (warm) s.bot.fpHistory.push(...warm);
+  });
   const starterPlay = (s: Seat) => {
     for (;;) {
       const w = longestWord(index, s.rack, 2);
@@ -526,6 +596,8 @@ async function playMatch(index: WordIndex, specs: SeatSpec[], matchSeed: number)
 
   const conns = new Map<bigint, ConnLike>();
   for (const s of seats) if (s.bot) conns.set(s.id, table.connFor(s));
+  const botWordCalls = () => seats.reduce((a, s) => a + (s.bot ? s.wordCalls : 0), 0);
+  let extraTurns = 0;
   let auctionId = 1000n;
   for (let k = 1; k <= auctions; k++) {
     const letter = bag[next++];
@@ -558,12 +630,27 @@ async function playMatch(index: WordIndex, specs: SeatSpec[], matchSeed: number)
         amounts.set(s, Math.min(want, Math.max(0, s.balance)));
       } else if (spec.kind === "fitted") {
         const q = (spec.model.rho ?? 0) > 0 && bagLeft > 0 ? rackRank(index, s, letter) : 0.5;
-        amounts.set(s, rivalBid(spec.model, s.bidRng, letter, bagLeft, s.balance, auctions, q));
+        let amt = rivalBid(spec.model, s.bidRng, letter, bagLeft, s.balance, auctions, q);
+        if (env.shade !== 1 && amt > 0) amt = Math.max(0, Math.min(roundHalfEven(amt * env.shade), s.balance));
+        amounts.set(s, amt);
       }
     }
     const open = table.auction;
     for (const s of seats) if (s.bot) s.bot.onAuctionOpen(conns.get(s.id)!, open);
-    if (conns.size > 0) for (let i = 0; i < TURNS; i++) await turn();
+    if (conns.size > 0) {
+      // TURNS turns, then one more for as long as a word play went out on the last
+      // one: its acknowledgement schedules a refresh the live bot runs before the close.
+      let calls = botWordCalls();
+      for (let t = 1; ; t++) {
+        await turn();
+        const played = botWordCalls() !== calls;
+        calls = botWordCalls();
+        if (t >= TURNS) {
+          if (!played || t >= TURNS + MAX_EXTRA_TURNS) break;
+          extraTurns++;
+        }
+      }
+    }
     for (const s of seats) {
       if (s.bot) amounts.set(s, s.bid && s.bid.auctionId === auctionId ? s.bid.amount : 0);
     }
@@ -575,32 +662,30 @@ async function playMatch(index: WordIndex, specs: SeatSpec[], matchSeed: number)
       if (w < 0 || a > amounts.get(seats[w])! || (a === amounts.get(seats[w])! && prio[i] > prio[w])) w = i;
     }
     table.auction = { ...open, status: { tag: "Closed" } };
-    table.stats.closed++;
+    table.closed++;
+    let paid = 0;
     if (w >= 0) {
-      const top = amounts.get(seats[w])!;
-      let second = 0;
-      let others = 0;
-      for (let i = 0; i < n; i++) {
-        const a = amounts.get(seats[i])!;
-        if (i === w || a <= 0) continue;
-        others++;
-        second = Math.max(second, a);
-      }
-      const paid = others > 0 ? second : Math.min(1, top);
+      paid = pricePaid(env.auction, amounts.get(seats[w])!, seats.filter((_, i) => i !== w).map((s) => amounts.get(s)!));
       const ws = seats[w];
       if (ws.balance >= paid) {
         ws.balance -= paid;
         ws.paid += paid;
         ws.won++;
         ws.rack.set(letter, (ws.rack.get(letter) ?? 0) + 1);
-        table.stats.prices.push(paid);
-        table.stats.wins.set(ws.id, (table.stats.wins.get(ws.id) ?? 0) + 1);
         if (ws.spec.kind === "sim") {
           const word = longestWord(index, ws.rack, 3);
           if (word) table.spend(ws, word);
         }
       }
     }
+    const result: AuctionResultRow = {
+      auctionId,
+      matchId: MATCH,
+      letter,
+      winnerBotId: w >= 0 ? seats[w].id : undefined,
+      paid: BigInt(paid),
+    };
+    for (const s of seats) if (s.bot) s.bot.onAuctionResult(conns.get(s.id)!, result);
     if (!final) {
       for (const s of seats) {
         if (s.spec.kind === "starter") starterPlay(s);
@@ -609,288 +694,74 @@ async function playMatch(index: WordIndex, specs: SeatSpec[], matchSeed: number)
     }
   }
   table.matchState = { ...table.matchState, status: { tag: "Ended" }, currentAuctionId: undefined };
-  return seats.map((s) => ({
-    name: s.spec.name,
-    kind: s.spec.kind,
-    score: s.score,
-    balance: s.balance,
-    won: s.won,
-    paid: s.paid,
-    words: s.words,
-    firstWord: s.firstWord,
-    poor: s.poor,
-    midBalance: s.midBalance,
-    endRack: [...s.rack.values()].reduce((a, b) => a + b, 0),
-  }));
+  for (const s of seats) if (s.bot) s.bot.onMatchEnded(conns.get(s.id)!, MATCH);
+  return {
+    extraTurns,
+    fpHistory: seats.map((s) => (s.bot ? [...s.bot.fpHistory] : null)),
+    seats: seats.map((s) => ({
+      name: s.spec.name,
+      kind: s.spec.kind,
+      score: s.score,
+      balance: s.balance,
+      won: s.won,
+      paid: s.paid,
+      words: s.words,
+      firstWord: s.firstWord,
+      poor: s.poor,
+      midBalance: s.midBalance,
+      endRack: [...s.rack.values()].reduce((a, b) => a + b, 0),
+    })),
+  };
 }
 
-// ---- policy variants (harness-only prototypes) ----
+// ---- variants: strategy.ts constants overridden by name ----
 
-interface BidCtx {
-  bagTotal: number;
-  balance: number;
-  seats: number;
-  auctions: number;
-}
-interface WordCtx extends BidCtx {
-  prices: number[];
-  closed: number;
-  myWins: number;
-}
-interface WordCfg {
-  /** Liquidity floor: below it (after cashing 7+ words) one liquidity word is cashed. */
-  floor: (c: WordCtx) => number;
-  /** Minimum lengths tried in order for the liquidity word (HEAD: 5 then 2). */
-  minLens: number[];
-  /** Value-of-money extra cashing. */
-  vom?: { l0: number; ah: number; maxExtra: number };
-  /** Cash every word of at least this many letters as soon as it forms (HEAD: CASH_MIN_LEN). */
-  cashMin?: number;
-}
+export type PolicyKey = keyof Policy;
+export const POLICY_KEYS = Object.keys(DEFAULT_POLICY) as PolicyKey[];
+/** Knobs that count tiles, auctions, milliseconds, rivals, observations or coins of a cap: whole numbers only. */
+const INTEGER_KEYS: ReadonlySet<PolicyKey> = new Set<PolicyKey>([
+  "ENDGAME_AUCTIONS", "CASH_MIN_LEN", "HOLD_MIN_REAL_RIVALS", "LIQUIDITY_MIN_LEN", "LIQUIDITY_FALLBACK_MIN_LEN",
+  "LIQUIDITY_TOP_K", "FLUSH_LEAD_MS", "FP_HISTORY_MAX", "FP_MIN_OBS", "BROKE_RIVAL_MAX_BID", "DUEL_MAX_OPPONENTS",
+  "DUEL_RESERVE_WINDOW",
+]);
+
 export interface Variant {
   name: string;
-  /** Absolute kappa for this auction; the bid hook scales the marginal value by kappa / kappaFor(bagTotal). */
-  kappa?: (c: BidCtx) => number;
-  /** Multipliers applied on top of kappa (HEAD kappa when kappa is absent). */
-  kmul?: ((c: BidCtx) => number)[];
-  words?: WordCfg;
+  /** The constants this variant changes (empty for head). */
+  overrides: Partial<Record<PolicyKey, number>>;
+  /** DEFAULT_POLICY with the overrides applied: what the variant's SookraBot plays with. */
+  policy: Policy;
 }
 
-/** The two SookraBot methods a variant wraps (private in bot.ts; reached through this view). */
-interface BotHooks {
-  placeBid(
-    conn: ConnLike, model: unknown, m: MatchStateRow, auction: AuctionRow, balance: number,
-    delta: number, bagTotal: number, source: string, opponents: Opponent[],
-  ): void;
-  playWords(
-    conn: ConnLike, matchId: bigint, model: WordModel, counts: Counts, val: Valuation,
-    balance: number, flush: boolean,
-  ): number;
-  submitWord(conn: ConnLike, matchId: bigint, model: WordModel, word: string, flush: boolean): void;
-  now(): number;
-}
-interface WordModel {
-  wordBackoffUntil: number;
-  pending: Map<number, unknown>;
-  wordFailures: Map<string, number>;
-}
-
-const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
-
-/** Balance per remaining auction relative to the starting rate (100 coins over the whole match). */
-function paceRatio(c: BidCtx): number {
-  return c.balance / (c.bagTotal + 1) / (START_BALANCE / c.auctions);
-}
-
-function makeBot(index: WordIndex, table: Table, seat: Seat, variant: Variant): SookraBot {
-  const bot = new SookraBot(index, seat.spec.name, QUIET);
-  bot.myBotId = seat.id;
-  const hooks = bot as unknown as BotHooks;
-  const proto = SookraBot.prototype as unknown as BotHooks;
-  const seatsN = table.seats.length;
-  const muls = variant.kmul ?? [];
-  const kappa = variant.kappa ?? (muls.length ? headKappa : undefined);
-  if (kappa) {
-    hooks.placeBid = (conn, model, m, auction, balance, delta, bagTotal, source, opponents) => {
-      const simsOnly = opponents.length > 0 && opponents.every((o) => o.isSim);
-      const ctx: BidCtx = { bagTotal, balance, seats: seatsN, auctions: table.auctions };
-      const scale =
-        simsOnly || bagTotal <= 0 ? 1 : (kappa(ctx) * muls.reduce((p, f) => p * f(ctx), 1)) / kappaFor(bagTotal);
-      proto.placeBid.call(hooks, conn, model, m, auction, balance, delta * scale, bagTotal, source, opponents);
-    };
-  }
-  const words = variant.words;
-  if (words) {
-    // Mirrors SookraBot.playWords with the variant's word choice in place of chooseWords.
-    hooks.playWords = (conn, matchId, model, counts, val, balance, flush) => {
-      if (index.size === 0) return 0;
-      if (hooks.now() < model.wordBackoffUntil) return 0;
-      if (!flush && model.pending.size > 0) return 0;
-      const ctx: WordCtx = {
-        bagTotal: Number(conn.db.matchState.id.find(matchId)?.bagTotal ?? 0),
-        balance,
-        seats: seatsN,
-        auctions: table.auctions,
-        prices: table.stats.prices,
-        closed: table.stats.closed,
-        myWins: table.stats.wins.get(seat.id) ?? 0,
-      };
-      const chosen = variantWords(
-        index, { counts, cands: val.cands, myBalance: balance, flush, alpha: val.alpha }, words, ctx,
-      ).filter((w) => (model.wordFailures.get(w) ?? 0) < MAX_WORD_FAILURES);
-      for (const w of chosen) hooks.submitWord(conn, matchId, model, w, flush);
-      return chosen.length;
-    };
-  }
-  return bot;
-}
-
-/** strategy.ts liquidityWord with the floor and the minimum lengths as parameters. */
-function liquidityPick(
-  index: WordIndex, cands: Candidates, rem: Counts, balance: number, alpha: number, floor: number, minLens: number[],
-): number {
-  for (const minLen of minLens) {
-    const top: number[] = [];
-    for (let i = 0; i < cands.n && top.length < LIQUIDITY_TOP_K; i++) {
-      if (cands.extra[i] !== -1) continue;
-      const k = cands.keys[i];
-      if (index.len[k] >= minLen && index.fits(k, rem)) top.push(k);
-    }
-    if (top.length === 0) continue;
-    const need = floor - balance;
-    let eligible = top.filter((k) => index.reward[k] >= need);
-    if (eligible.length === 0) eligible = [top[0]];
-    let best = -1;
-    let bestScore = -Infinity;
-    for (const k of eligible) {
-      const rest = new Int32Array(rem);
-      index.consume(rest, k);
-      const score = index.reward[k] + packValue(index.pack(cands, rest, -1, alpha), alpha);
-      if (score > bestScore) {
-        bestScore = score;
-        best = k;
-      }
-    }
-    return best;
-  }
-  return -1;
-}
-
-/** Candidate words examined per value-of-money step (best-paying first). */
-const VOM_TOP_K = 48;
-
-/**
- * strategy.ts chooseWords with a variable liquidity floor, plus optional
- * value-of-money cashing: with lambda = l0 x max(0, 1 - pace ratio) points
- * per coin, cash the word w maximizing (1 + lambda) x reward(w) + V(rack - w)
- * - V(rack) while that gain is positive, where V is the packing value with
- * hoard weight ah (only words paying more than ah x their tiles' leave value
- * are packed; other tiles count ah x leave), at most maxExtra words.
- */
-function variantWords(index: WordIndex, input: WordInput, cfg: WordCfg, ctx: WordCtx): string[] {
-  if (input.flush) {
-    return index.pack(input.cands, input.counts, -1).keys.map((k) => index.words[k]);
-  }
-  const rem = new Int32Array(input.counts);
-  const out: string[] = [];
-  let balance = input.myBalance;
-  const take = (k: number) => {
-    out.push(index.words[k]);
-    balance += index.reward[k];
-    index.consume(rem, k);
-  };
-  for (;;) {
-    const k = index.bestKey(input.cands, rem, cfg.cashMin ?? CASH_MIN_LEN);
-    if (k < 0) break;
-    take(k);
-  }
-  const floor = cfg.floor(ctx);
-  if (balance < floor) {
-    const k = liquidityPick(index, input.cands, rem, balance, input.alpha ?? LEAVE_ALPHA, floor, cfg.minLens);
-    if (k >= 0) take(k);
-  }
-  if (cfg.vom) {
-    const { l0, ah, maxExtra } = cfg.vom;
-    for (let step = 0; step < maxExtra; step++) {
-      const lambda = l0 * Math.max(0, 1 - paceRatio({ ...ctx, balance }));
-      if (!(lambda > 0)) break;
-      const v0 = packValue(index.pack(input.cands, rem, -1, ah), ah);
-      let best = -1;
-      let bestGain = 0;
-      let seen = 0;
-      for (let i = 0; i < input.cands.n && seen < VOM_TOP_K; i++) {
-        if (input.cands.extra[i] !== -1) continue;
-        const k = input.cands.keys[i];
-        if (index.len[k] < 2 || !index.fits(k, rem)) continue;
-        seen++;
-        const rest = new Int32Array(rem);
-        index.consume(rest, k);
-        const gain = (1 + lambda) * index.reward[k] + packValue(index.pack(input.cands, rest, -1, ah), ah) - v0;
-        if (gain > bestGain) {
-          bestGain = gain;
-          best = k;
-        }
-      }
-      if (best < 0) break;
-      take(best);
-    }
-  }
-  return out;
-}
-
-const HEAD_WORDS: WordCfg = {
-  floor: () => LIQUIDITY_FLOOR,
-  minLens: [LIQUIDITY_MIN_LEN, LIQUIDITY_FALLBACK_MIN_LEN],
-};
-const headKappa = (c: BidCtx) => kappaFor(c.bagTotal);
-const boosted = (k: number) => (c: BidCtx) => (c.bagTotal < ENDGAME_AUCTIONS ? ENDGAME_KAPPA_BOOST : 1) * k;
-
-/**
- * Variant grammar: parts joined by "+", each "name:arg:arg...":
- *   head                   current policy, no hooks
- *   hooked                 hooks installed with the HEAD logic (must equal head exactly)
- *   kappa:K                kappa K (still doubled in the last ENDGAME_AUCTIONS auctions)
- *   pace:G[:LO[:HI[:K0[:B]]]]  budget pacing: K0 x clamp(paceRatio^G, LO, HI), x B in the last
- *                          ENDGAME_AUCTIONS auctions (defaults 0.5, 3, KAPPA, ENDGAME_KAPPA_BOOST);
- *                          paceRatio = (balance / auctions left incl. this one) / (100 / auctions per match)
- *   liq:C[:CAP[:MIN[:FB]]] liquidity floor max(15, min(CAP, C x auctions left incl. this one)),
- *                          liquidity word of MIN+ letters, else FB+ (FB 0: none); defaults 60, 5, 2
- *   liqp:Q[:CAP]           floor max(15, min(CAP, Q x mean price so far x expected share x auctions left)),
- *                          share = max(1/seats, own wins / closed auctions); defaults 1, 80
- *   vom:L0[:AH[:MAX]]      value-of-money extra cashing (variantWords); defaults AH 0.7, MAX 2
- *   early:F:A              kappa x F in auctions 1..A of the match (composes with kappa and pace)
- *   cashlen:L              cash words of L+ letters as soon as they form (HEAD: CASH_MIN_LEN = 7;
- *                          99 = hold everything until the flush, liquidity words aside)
- */
+/** "head", or NAME=value parts joined by "+", each NAME a strategy.ts constant (any case). */
 export function parseVariant(name: string): Variant {
-  const v: Variant = { name };
-  if (name === "head") return v;
-  let words: WordCfg | undefined;
-  const wordsCfg = () => (words ??= { ...HEAD_WORDS });
+  if (name === "head") return { name, overrides: {}, policy: DEFAULT_POLICY };
+  const overrides: Partial<Record<PolicyKey, number>> = {};
   for (const part of name.split("+")) {
-    const [kind, ...rest] = part.split(":");
-    const a = rest.map(Number);
-    if (a.some((x) => !Number.isFinite(x))) throw new Error(`bad number in variant part ${part}`);
-    if (kind === "hooked") {
-      v.kappa = headKappa;
-      wordsCfg();
-    } else if (kind === "kappa") {
-      v.kappa = boosted(a[0]);
-    } else if (kind === "pace") {
-      const [g, lo = 0.5, hi = 3, k0 = KAPPA, boost = ENDGAME_KAPPA_BOOST] = a;
-      v.kappa = (c) => (c.bagTotal < ENDGAME_AUCTIONS ? boost : 1) * k0 * clamp(paceRatio(c) ** g, lo, hi);
-    } else if (kind === "early") {
-      const [f, upto] = a;
-      (v.kmul ??= []).push((c) => (c.auctions - c.bagTotal <= upto ? f : 1));
-    } else if (kind === "cashlen") {
-      wordsCfg().cashMin = a[0];
-    } else if (kind === "liq") {
-      const [c, cap = 60, minLen = LIQUIDITY_MIN_LEN, fb = LIQUIDITY_FALLBACK_MIN_LEN] = a;
-      const w = wordsCfg();
-      w.floor = (x) => Math.max(LIQUIDITY_FLOOR, Math.min(cap, c * (x.bagTotal + 1)));
-      w.minLens = fb > 0 ? [minLen, fb] : [minLen];
-    } else if (kind === "liqp") {
-      const [q = 1, cap = 80] = a;
-      wordsCfg().floor = (x) => {
-        const mean = x.prices.length ? x.prices.reduce((s, p) => s + p, 0) / x.prices.length : 7;
-        const share = Math.max(1 / x.seats, x.closed > 0 ? x.myWins / x.closed : 0);
-        return Math.max(LIQUIDITY_FLOOR, Math.min(cap, q * mean * share * (x.bagTotal + 1)));
-      };
-    } else if (kind === "vom") {
-      const [l0, ah = 0.7, max = 2] = a;
-      wordsCfg().vom = { l0, ah, maxExtra: max };
-    } else {
-      throw new Error(`unknown variant part ${part}`);
+    const m = /^([A-Za-z][A-Za-z0-9_]*)=([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)$/.exec(part);
+    if (!m) {
+      throw new Error(
+        `variant part "${part}" is not NAME=number: name a strategy.ts constant, e.g. PACED_KAPPA=4.5+PACE_MIN=0.6 ` +
+          `(the kappa:, pace:, cashlen:, liq:, liqp:, vom:, early: and hooked forms were retired; see list)`,
+      );
     }
+    const key = m[1].toUpperCase() as PolicyKey;
+    if (!Object.prototype.hasOwnProperty.call(DEFAULT_POLICY, key)) {
+      throw new Error(`unknown knob ${m[1]} in variant ${name}; knobs: ${POLICY_KEYS.join(", ")}`);
+    }
+    if (Object.prototype.hasOwnProperty.call(overrides, key)) throw new Error(`${key} is set twice in variant ${name}`);
+    const value = Number(m[2]);
+    if (!Number.isFinite(value) || value < 0) throw new Error(`${key} must be a finite number >= 0, got ${m[2]}`);
+    if (INTEGER_KEYS.has(key) && !Number.isInteger(value)) throw new Error(`${key} counts whole units, got ${m[2]}`);
+    if (key === "FP_QUANTILE" && !(value > 0 && value <= 1)) throw new Error(`FP_QUANTILE must be in (0, 1], got ${m[2]}`);
+    overrides[key] = value;
   }
-  if (words) v.words = words;
-  return v;
+  return { name, overrides, policy: Object.freeze({ ...DEFAULT_POLICY, ...overrides }) };
 }
 
 // ---- fields ----
 
-const HEAD: Variant = { name: "head" };
-const sookra = (name: string, variant: Variant): SeatSpec => ({ kind: "sookra", name, variant });
+const sookra = (name: string, policy: Policy): SeatSpec => ({ kind: "sookra", name, policy });
 const fitted = (name: string): SeatSpec => ({ kind: "fitted", name, model: RIVALS[name] });
 function randomSims(rnd: Rng, k: number): SeatSpec[] {
   const pool = [...SIMS];
@@ -902,6 +773,7 @@ function randomSims(rnd: Rng, k: number): SeatSpec[] {
   return out;
 }
 
+const HEAD = DEFAULT_POLICY;
 const FIELDS: Record<string, { about: string; seats: (focal: SeatSpec, rnd: Rng) => SeatSpec[] }> = {
   sims: { about: "focal + 5 random sims", seats: (f, r) => [f, ...randomSims(r, 5)] },
   starters: {
@@ -962,12 +834,16 @@ const FIELDS: Record<string, { about: string; seats: (focal: SeatSpec, rnd: Rng)
   "duel-code-ar": { about: "2-bot duel vs code-ar", seats: (f) => [f, fitted("code-ar")] },
   "duel-bot-ar": { about: "2-bot duel vs bot-ar", seats: (f) => [f, fitted("bot-ar")] },
   "duel-tinytung-ar": { about: "2-bot duel vs tinytung-ar", seats: (f) => [f, fitted("tinytung-ar")] },
-  // Other all-real table sizes: bracket rounds shrink to 4 and 3 bots; a Swiss round with 10 or 11
-  // entrants at match size 6 is a single table (tournament.ts tableSizes), here the largest we can seat.
-  ar3: { about: "focal + 2 drawn -ar rivals (83 auctions)", seats: (f, r) => [f, ...drawRivals(r, 2)] },
-  ar4: { about: "focal + 3 drawn -ar rivals (78 auctions)", seats: (f, r) => [f, ...drawRivals(r, 3)] },
-  ar8: { about: "focal + all 7 -ar rivals (58 auctions)", seats: (f, r) => [f, ...drawRivals(r, 7)] },
 };
+// All-real tables of every size: arN is the focal bot + N - 1 drawn -ar rivals (BAG_TILES - 5N auctions).
+// The final is a duel (ar2); bracket tables shrink from the cut to 3 bots; a Swiss round seats
+// tables of about the match size, 10 or 11 entrants at match size 6 one table (tournament.ts tableSizes).
+for (let size = 2; size <= 8; size++) {
+  FIELDS[`ar${size}`] ??= {
+    about: `focal + ${size - 1} drawn -ar rival${size > 2 ? "s" : ""} (${BAG_TILES - RACK * size} auctions)`,
+    seats: (f, r) => [f, ...drawRivals(r, size - 1)],
+  };
+}
 
 /** Active all-real rivals and how many of the 44 live all-real tables (m147 to m190) each sat at. */
 const AR_POOL: [string, number][] = [
@@ -989,6 +865,54 @@ function drawRivals(rnd: Rng, k: number): SeatSpec[] {
   return out;
 }
 
+export interface FieldSpec {
+  /** As written on the command line; rows and summaries carry it. */
+  name: string;
+  base: string;
+  rho?: number;
+  env: MatchEnv;
+  /**
+   * First price only: before each match, play a burn-in match of the same field and variant
+   * (seed mix(match seed, 5)) and start every SookraBot seat with the price history it ends with,
+   * as the live bot carries its history from one first-price match to the next.
+   */
+  warm: boolean;
+}
+
+/** "<name>[@<rho>][,fp][,vickrey][,shade=<s>][,warm]" (see the header). */
+export function parseField(text: string): FieldSpec {
+  const [head, ...mods] = text.split(",");
+  const [base, rhoText, ...extra] = head.split("@");
+  if (!FIELDS[base]) throw new Error(`unknown field ${base} (try: list)`);
+  if (extra.length > 0) throw new Error(`field ${text}: one @rho at most`);
+  let rho: number | undefined;
+  if (rhoText !== undefined) {
+    rho = Number(rhoText);
+    if (rhoText === "" || !(rho >= 0 && rho < 1)) throw new Error(`rho must be in [0, 1): ${rhoText}`);
+  }
+  let auction: AuctionKind = "Vickrey";
+  let shade = 1;
+  let warm = false;
+  for (const mod of mods) {
+    if (mod === "fp") auction = "FirstPrice";
+    else if (mod === "vickrey") auction = "Vickrey";
+    else if (mod === "warm") warm = true;
+    else if (mod.startsWith("shade=")) {
+      shade = Number(mod.slice("shade=".length));
+      if (mod === "shade=" || !(shade > 0 && Number.isFinite(shade))) throw new Error(`shade must be a number > 0: ${mod}`);
+    } else throw new Error(`unknown field modifier ${mod} in ${text} (fp, vickrey, shade=<s>, warm)`);
+  }
+  if (warm && auction !== "FirstPrice") throw new Error(`field ${text}: warm carries first-price history; add fp`);
+  return { name: text, base, rho, env: { auction, shade }, warm };
+}
+
+/** The seats of match `ms` of this field, with the focal SookraBot playing `policy`. */
+function fieldSeats(field: FieldSpec, policy: Policy, ms: number): SeatSpec[] {
+  const specs = FIELDS[field.base].seats(sookra("SookraBot", policy), mulberry32(mix(ms, STREAM.field)));
+  const rho = field.rho;
+  return rho === undefined ? specs : specs.map((s) => (s.kind === "fitted" ? { ...s, model: { ...s.model, rho } } : s));
+}
+
 // ---- statistics ----
 
 function meanSe(xs: number[]): { mean: number; se: number } {
@@ -996,6 +920,16 @@ function meanSe(xs: number[]): { mean: number; se: number } {
   const mean = xs.reduce((a, b) => a + b, 0) / n;
   const sd = Math.sqrt(xs.reduce((a, b) => a + (b - mean) ** 2, 0) / Math.max(1, n - 1));
   return { mean: +mean.toFixed(3), se: +(sd / Math.sqrt(n)).toFixed(3) };
+}
+
+/** Paired difference: mean, standard error and t (null when every difference is the same). */
+function pairedDiff(xs: number[]): { mean: number; se: number; t: number | null } {
+  const { mean, se } = meanSe(xs);
+  const n = xs.length;
+  const m = xs.reduce((a, b) => a + b, 0) / n;
+  const sd = Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(1, n - 1));
+  const exactSe = sd / Math.sqrt(n);
+  return { mean, se, t: exactSe > 0 ? +(m / exactSe).toFixed(2) : null };
 }
 
 interface FocalRow {
@@ -1045,9 +979,114 @@ function focalRow(i: number, res: SeatResult[]): FocalRow {
   };
 }
 
+/** One line of --rows: a variant's result in one match. */
+export interface Row extends FocalRow {
+  field: string;
+  auction: AuctionKind;
+  seats: number;
+  seed: number;
+  variant: string;
+  /** Hash of the bot, harness, rival and wordlist sources that produced it. */
+  code: string;
+  extraTurns: number;
+  /** Wall time of this match, ms (left out when rows are compared). */
+  ms: number;
+  others: { name: string; kind: string; score: number; won: number; paid: number; balance: number; midBalance: number | null }[];
+}
+
+const DIFF_KEYS: (keyof FocalRow)[] = ["score", "margin", "win", "swiss", "last"];
+
+/** One summary per variant (in first-appearance order) of rows from one field and seed. */
+export function summarize(rows: Row[]): Record<string, unknown>[] {
+  const byVariant = new Map<string, Row[]>();
+  for (const r of rows) {
+    let list = byVariant.get(r.variant);
+    if (!list) byVariant.set(r.variant, (list = []));
+    list.push(r);
+  }
+  const names = [...byVariant.keys()];
+  for (const list of byVariant.values()) list.sort((a, b) => a.i - b.i);
+  const ids = byVariant.get(names[0])!.map((r) => r.i).join(",");
+  for (const name of names) {
+    if (byVariant.get(name)!.map((r) => r.i).join(",") !== ids) {
+      throw new Error(`variants ${names[0]} and ${name} cover different matches; paired differences need the same ones`);
+    }
+  }
+  const hasLs = rows.every((r) => r.ls !== null);
+  const keys: (keyof FocalRow)[] = ["score", "margin", "win", "swiss", ...(hasLs ? (["lsMargin"] as const) : [])];
+  const pick = (rs: Row[], key: keyof FocalRow) => rs.map((r) => Number(r[key] ?? 0));
+  const avg = (xs: number[]) => +(xs.reduce((a, b) => a + b, 0) / xs.length).toFixed(2);
+  const first = byVariant.get(names[0])!;
+  const secs = +(rows.reduce((a, r) => a + r.ms, 0) / 1000).toFixed(1);
+  return names.map((name, v) => {
+    const rs = byVariant.get(name)!;
+    const r0 = rs[0];
+    const out: Record<string, unknown> = {
+      field: r0.field, auction: r0.auction, seats: r0.seats, variant: name,
+      overrides: parseVariant(name).overrides, n: rs.length, seed: r0.seed,
+    };
+    for (const k of keys) out[k] = meanSe(pick(rs, k));
+    if (hasLs) {
+      out.ls = avg(pick(rs, "ls"));
+      out.lsWinRate = avg(rs.map((r) => (r.lsMargin! >= 0 ? 1 : 0)));
+    }
+    out.last = avg(pick(rs, "last"));
+    for (const k of ["won", "paid", "balance", "words", "poor", "endRack"] as const) out[k] = avg(pick(rs, k));
+    const fw = rs.map((r) => r.firstWord).filter((x): x is number => x !== null).sort((a, b) => a - b);
+    out.firstWordMedian = fw.length ? fw[Math.floor(fw.length / 2)] : null;
+    out.midBalance = avg(rs.map((r) => r.midBalance ?? 0));
+    const rivals = new Map<string, number[]>();
+    for (const r of rs) {
+      for (const o of r.others) {
+        const key = o.kind === "sim" ? "sims" : o.name;
+        const acc = rivals.get(key) ?? [0, 0, 0, 0, 0, 0];
+        [o.score, o.won, o.paid, o.balance, o.midBalance ?? 0, 1].forEach((x, j) => (acc[j] += x));
+        rivals.set(key, acc);
+      }
+    }
+    out.rivals = Object.fromEntries(
+      [...rivals].map(([key, a]) => [
+        key,
+        { score: +(a[0] / a[5]).toFixed(1), won: +(a[1] / a[5]).toFixed(1), paid: +(a[2] / a[5]).toFixed(1), balance: +(a[3] / a[5]).toFixed(1), midBalance: +(a[4] / a[5]).toFixed(1) },
+      ]),
+    );
+    if (v > 0) {
+      const diff: Record<string, unknown> = {};
+      for (const k of [...new Set([...DIFF_KEYS, ...keys])]) {
+        const a = pick(rs, k);
+        const b = pick(first, k);
+        diff[k] = pairedDiff(a.map((x, i) => x - b[i]));
+      }
+      diff.identical = rs.filter((r, i) => sameMatch(r, first[i])).length;
+      out.vsFirst = diff;
+    }
+    out.extraTurns = rs.reduce((a, r) => a + r.extraTurns, 0);
+    out.msPerMatch = Math.round(rs.reduce((a, r) => a + r.ms, 0) / rs.length);
+    out.secs = secs;
+    out.code = r0.code;
+    return out;
+  });
+}
+
+/** Whether two rows of one match agree on every focal and rival result (the variant name, ms and code aside). */
+function sameMatch(a: Row, b: Row): boolean {
+  const strip = (r: Row) => JSON.stringify({ ...r, variant: "", ms: 0, code: "" });
+  return strip(a) === strip(b);
+}
+
 function loadIndex(): WordIndex {
-  const words = fs.readFileSync(new URL("../../spacetimedb/wordlist.txt", import.meta.url), "utf8").split("\n");
-  return WordIndex.fromWords(words);
+  return WordIndex.fromWords(fs.readFileSync(WORDLIST, "utf8").split("\n"));
+}
+
+/** sha256 (first 12 hex) of everything a self-play result depends on. */
+function codeHash(): string {
+  const h = crypto.createHash("sha256");
+  for (const f of ["bot.ts", "strategy.ts", "engine.ts", "selfplay.ts", "fixtures/rival-models.json"]) {
+    h.update(f);
+    h.update(fs.readFileSync(new URL(`./${f}`, import.meta.url)));
+  }
+  h.update(fs.readFileSync(WORDLIST));
+  return h.digest("hex").slice(0, 12);
 }
 
 // ---- modes ----
@@ -1062,7 +1101,7 @@ async function legacy(field: "sims" | "starters", n: number, seed: number) {
   for (let i = 0; i < n; i++) {
     const ms = mix(seed, i);
     const specs = FIELDS[field].seats(sookra("SookraBot", HEAD), mulberry32(mix(ms, STREAM.field)));
-    const r = focalRow(i, await playMatch(index, specs, ms));
+    const r = focalRow(i, (await playMatch(index, specs, ms)).seats);
     scores.push(r.score);
     best += r.best;
     endBal += r.balance;
@@ -1080,72 +1119,125 @@ async function legacy(field: "sims" | "starters", n: number, seed: number) {
   );
 }
 
-/** "<field>" or "<field>@<rho>": the suffix gives every fitted rival in the field that rack awareness. */
-async function compare(field: string, n: number, seed: number, names: string[], rowsPath?: string) {
-  const [base, rhoText] = field.split("@");
-  const f = FIELDS[base];
-  if (!f) throw new Error(`unknown field ${base} (try: list)`);
-  const rho = rhoText === undefined ? undefined : Number(rhoText);
-  if (rho !== undefined && !(rho >= 0 && rho < 1)) throw new Error(`rho must be in [0, 1): ${rhoText}`);
+/** Matches lo..hi-1 of n for shard "i/n" (0 <= i < count): contiguous blocks, every match in exactly one. */
+export function shardRange(n: number, shard: string | undefined): [number, number] {
+  if (shard === undefined) return [0, n];
+  const m = /^(\d+)\/(\d+)$/.exec(shard);
+  const i = m ? Number(m[1]) : NaN;
+  const count = m ? Number(m[2]) : NaN;
+  if (!(count >= 1 && i >= 0 && i < count)) throw new Error(`--shard=${shard}: want i/n with 0 <= i < n`);
+  return [Math.floor((i * n) / count), Math.floor(((i + 1) * n) / count)];
+}
+
+export async function compare(
+  fieldText: string, n: number, seed: number, names: string[],
+  opts: { rowsPath?: string; shard?: string; quiet?: boolean; trace?: (line: string) => void } = {},
+): Promise<Row[]> {
+  const field = parseField(fieldText);
+  if (!(Number.isInteger(n) && n > 0)) throw new Error(`matches must be a whole number > 0, got ${n}`);
+  if (!Number.isInteger(seed)) throw new Error(`seed must be a whole number, got ${seed}`);
   if (names.length === 0) throw new Error("name at least one variant");
+  if (new Set(names).size !== names.length) throw new Error("a variant is listed twice");
   const variants = names.map(parseVariant);
+  const [lo, hi] = shardRange(n, opts.shard);
   const index = loadIndex();
-  const rows: FocalRow[][] = variants.map(() => []);
-  /** Per variant, per rival seat name: summed score, letters won, coins paid, end and mid balance, matches. */
-  const others: Map<string, number[]>[] = variants.map(() => new Map());
-  const t0 = performance.now();
-  const withRho = (s: SeatSpec): SeatSpec => (rho !== undefined && s.kind === "fitted" ? { ...s, model: { ...s.model, rho } } : s);
-  for (let i = 0; i < n; i++) {
+  const code = codeHash();
+  const rows: Row[] = [];
+  for (let i = lo; i < hi; i++) {
     const ms = mix(seed, i);
-    for (let v = 0; v < variants.length; v++) {
-      const specs = f.seats(sookra("SookraBot", variants[v]), mulberry32(mix(ms, STREAM.field))).map(withRho);
-      const res = await playMatch(index, specs, ms);
-      rows[v].push(focalRow(i, res));
-      for (const r of res.slice(1)) {
-        const name = r.kind === "sim" ? "sims" : r.name;
-        const acc = others[v].get(name) ?? [0, 0, 0, 0, 0, 0];
-        [r.score, r.won, r.paid, r.balance, r.midBalance ?? 0, 1].forEach((x, j) => (acc[j] += x));
-        others[v].set(name, acc);
+    const matchRows: Row[] = [];
+    for (const variant of variants) {
+      const t0 = performance.now();
+      let fpHistory: (PricePoint[] | null)[] | undefined;
+      if (field.warm) {
+        const burn = mix(ms, STREAM.warm);
+        fpHistory = (await playMatch(index, fieldSeats(field, variant.policy, burn), burn, field.env)).fpHistory;
       }
+      const trace = opts.trace;
+      const focalLog: Logger | undefined = trace
+        ? { log: (msg) => trace(`[${i} ${variant.name}] ${msg}`), warn: (msg) => trace(`[${i} ${variant.name}] WARN ${msg}`) }
+        : undefined;
+      const res = await playMatch(index, fieldSeats(field, variant.policy, ms), ms, field.env, { focalLog, fpHistory });
+      const wall = performance.now() - t0;
+      matchRows.push({
+        field: field.name, auction: field.env.auction, seats: res.seats.length, seed, variant: variant.name, code,
+        ...focalRow(i, res.seats),
+        extraTurns: res.extraTurns,
+        ms: Math.round(wall),
+        others: res.seats.slice(1).map((o) => ({
+          name: o.name, kind: o.kind, score: o.score, won: o.won, paid: o.paid, balance: o.balance, midBalance: o.midBalance,
+        })),
+      });
+    }
+    if (opts.rowsPath) fs.appendFileSync(opts.rowsPath, matchRows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    rows.push(...matchRows);
+  }
+  if (!opts.quiet && rows.length > 0) {
+    for (const s of summarize(rows)) {
+      console.log(JSON.stringify(opts.shard ? { ...s, shard: opts.shard, matches: [lo, hi - 1] } : s));
     }
   }
-  if (rowsPath) {
-    const lines = variants.flatMap((v, j) => rows[j].map((r) => JSON.stringify({ field, seed, variant: v.name, ...r })));
-    fs.appendFileSync(rowsPath, lines.join("\n") + "\n");
-  }
-  const secs = +((performance.now() - t0) / 1000).toFixed(1);
-  const pick = (rs: FocalRow[], key: keyof FocalRow) => rs.map((r) => Number(r[key] ?? 0));
-  const avg = (xs: number[]) => +(xs.reduce((a, b) => a + b, 0) / xs.length).toFixed(2);
-  const hasLs = rows[0][0].ls !== null;
-  const keys: (keyof FocalRow)[] = ["score", "margin", "win", "swiss", ...(hasLs ? (["lsMargin"] as const) : [])];
-  for (let v = 0; v < variants.length; v++) {
-    const rs = rows[v];
-    const out: Record<string, unknown> = { field, variant: variants[v].name, n, seed };
-    for (const k of keys) out[k] = meanSe(pick(rs, k));
-    if (hasLs) out.ls = avg(pick(rs, "ls"));
-    out.lsWinRate = hasLs ? avg(rs.map((r) => (r.lsMargin! >= 0 ? 1 : 0))) : undefined;
-    out.last = avg(pick(rs, "last"));
-    for (const k of ["won", "paid", "balance", "words", "poor", "endRack"] as const) out[k] = avg(pick(rs, k));
-    const fw = rs.map((r) => r.firstWord).filter((x): x is number => x !== null).sort((a, b) => a - b);
-    out.firstWordMedian = fw.length ? fw[Math.floor(fw.length / 2)] : null;
-    out.midBalance = avg(rs.map((r) => r.midBalance ?? 0));
-    out.rivals = Object.fromEntries(
-      [...others[v]].map(([name, a]) => [
-        name,
-        { score: +(a[0] / a[5]).toFixed(1), won: +(a[1] / a[5]).toFixed(1), paid: +(a[2] / a[5]).toFixed(1), balance: +(a[3] / a[5]).toFixed(1), midBalance: +(a[4] / a[5]).toFixed(1) },
-      ]),
-    );
-    if (v > 0) {
-      const diff: Record<string, unknown> = {};
-      for (const k of keys) {
-        const a = pick(rs, k);
-        const b = pick(rows[0], k);
-        diff[k] = meanSe(a.map((x, i) => x - b[i]));
+  return rows;
+}
+
+/** Rows from several files, grouped by field and seed, with identical duplicates dropped. */
+export function readRows(paths: string[]): Map<string, Row[]> {
+  const groups = new Map<string, Map<string, Row>>();
+  for (const p of paths) {
+    const lines = fs.readFileSync(p, "utf8").split("\n");
+    lines.forEach((line, ln) => {
+      if (line.trim() === "") return;
+      let r: Row;
+      try {
+        r = JSON.parse(line);
+      } catch {
+        throw new Error(`${p}:${ln + 1}: not JSON (a truncated last line means the run was cut off)`);
       }
-      out.vsFirst = diff;
+      if (typeof r.variant !== "string" || !Number.isInteger(r.i) || typeof r.field !== "string" || !Array.isArray(r.others)) {
+        throw new Error(`${p}:${ln + 1}: not a self-play row`);
+      }
+      const g = `${r.field}|${r.seed}`;
+      let rows = groups.get(g);
+      if (!rows) groups.set(g, (rows = new Map()));
+      const key = `${r.variant}|${r.i}`;
+      const had = rows.get(key);
+      if (had) {
+        if (!sameMatch(had, r) || had.code !== r.code) throw new Error(`${p}:${ln + 1}: ${key} of ${g} differs from an earlier row`);
+        return;
+      }
+      rows.set(key, r);
+    });
+  }
+  const out = new Map<string, Row[]>();
+  for (const [g, rows] of groups) {
+    const list = [...rows.values()];
+    const codes = new Set(list.map((r) => r.code));
+    if (codes.size > 1) throw new Error(`${g}: rows from different code (${[...codes].join(", ")})`);
+    out.set(g, list);
+  }
+  return out;
+}
+
+function merge(paths: string[], expect?: number) {
+  if (paths.length === 0) throw new Error("name at least one rows file");
+  for (const [g, rows] of readRows(paths)) {
+    if (expect !== undefined) {
+      const byVariant = new Map<string, Set<number>>();
+      for (const r of rows) {
+        let ids = byVariant.get(r.variant);
+        if (!ids) byVariant.set(r.variant, (ids = new Set()));
+        ids.add(r.i);
+      }
+      for (const [variant, ids] of byVariant) {
+        const missing: number[] = [];
+        for (let i = 0; i < expect; i++) if (!ids.has(i)) missing.push(i);
+        const extra = [...ids].filter((i) => i >= expect);
+        if (missing.length || extra.length) {
+          throw new Error(`${g} ${variant}: ${missing.length} of ${expect} matches missing (first ${missing.slice(0, 5).join(", ")}), ${extra.length} beyond`);
+        }
+      }
     }
-    out.secs = secs;
-    console.log(JSON.stringify(out));
+    for (const s of summarize(rows)) console.log(JSON.stringify(s));
   }
 }
 
@@ -1164,7 +1256,7 @@ async function validate(n: number, seed: number) {
     for (let i = 0; i < n; i++) {
       const ms = mix(seed, i, title.length);
       const specs = [...names.map(fitted), ...randomSims(mulberry32(mix(ms, STREAM.field)), 6 - names.length)];
-      for (const r of await playMatch(index, specs, ms)) {
+      for (const r of (await playMatch(index, specs, ms)).seats) {
         if (r.kind !== "fitted") continue;
         if (!acc.has(r.name)) acc.set(r.name, []);
         acc.get(r.name)!.push(r);
@@ -1187,26 +1279,53 @@ async function validate(n: number, seed: number) {
   }
 }
 
+function list() {
+  for (const [k, f] of Object.entries(FIELDS)) console.log(`${k.padEnd(16)} ${f.about}`);
+  console.log("field modifiers: <field>[@<rho>][,fp][,vickrey][,shade=<s>][,warm]   e.g. ar6@0.9,fp,shade=0.8,warm");
+  console.log("variants: head, or NAME=value joined by +, NAME one of (default):");
+  for (const k of POLICY_KEYS) console.log(`  ${k.padEnd(28)} ${DEFAULT_POLICY[k]}${INTEGER_KEYS.has(k) ? "  (whole number)" : ""}`);
+}
+
 async function main() {
   const [mode = "sims", ...args] = process.argv.slice(2);
   const opts = args.filter((a) => a.startsWith("--"));
   const pos = args.filter((a) => !a.startsWith("--"));
+  const opt = (name: string) => opts.find((o) => o.startsWith(`--${name}=`))?.slice(name.length + 3);
+  const known = new Set(["rows", "shard", "expect"]);
+  for (const o of opts) {
+    if (o === "--trace") continue;
+    const name = /^--([a-z]+)=/.exec(o)?.[1];
+    if (!name || !known.has(name)) {
+      throw new Error(`unknown option ${o} (--rows=<file>, --shard=i/n, --trace, --expect=<matches>)`);
+    }
+  }
   if (mode === "sims" || mode === "starters") {
     await legacy(mode, Number(pos[0] ?? 50), Number(pos[1] ?? 1));
   } else if (mode === "compare") {
-    const rows = opts.find((o) => o.startsWith("--rows="))?.slice("--rows=".length);
-    await compare(pos[0], Number(pos[1] ?? 400), Number(pos[2] ?? 1), pos.slice(3), rows);
+    if (pos.length < 4) throw new Error("usage: compare <field> <matches> <seed> <variant>... [--shard=i/n] [--rows=file] [--trace]");
+    await compare(pos[0], Number(pos[1]), Number(pos[2]), pos.slice(3), {
+      rowsPath: opt("rows"),
+      shard: opt("shard"),
+      trace: opts.includes("--trace") ? (line) => process.stderr.write(`${line}\n`) : undefined,
+    });
+  } else if (mode === "merge") {
+    const expect = opt("expect");
+    if (expect !== undefined && !(Number.isInteger(Number(expect)) && Number(expect) > 0)) throw new Error(`--expect=${expect}`);
+    merge(pos, expect === undefined ? undefined : Number(expect));
   } else if (mode === "validate") {
     await validate(Number(pos[0] ?? 300), Number(pos[1] ?? 1));
   } else if (mode === "list") {
-    for (const [k, f] of Object.entries(FIELDS)) console.log(`${k.padEnd(12)} ${f.about}`);
-    console.log("variants: see parseVariant (head, hooked, kappa:K, pace:G, liq:C, liqp:Q, vom:L0, joined by +)");
+    list();
   } else {
     throw new Error(`unknown mode ${mode}`);
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exitCode = 1;
-});
+// Run only as a script (tests import this module).
+const invoked = process.argv[1] ? path.resolve(process.argv[1]) : "";
+if (invoked === fileURLToPath(import.meta.url) || invoked === fileURLToPath(import.meta.url).replace(/\.ts$/, "")) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exitCode = 1;
+  });
+}

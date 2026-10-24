@@ -21,7 +21,7 @@ import {
 } from "./bot.js";
 import { WordIndex, countsOf, letterIndex, valuate, wordReward } from "./engine.js";
 import { ConnectionLifecycle } from "./lifecycle.js";
-import { LEAVE_ALPHA, PACED_KAPPA, PACE_MIN_DUEL, maxSimBid } from "./strategy.js";
+import { DEFAULT_POLICY, LEAVE_ALPHA, PACED_KAPPA, PACE_MIN_DUEL, type Policy, maxSimBid } from "./strategy.js";
 import { Supervisor, type Scheduler } from "./supervisor.js";
 
 const INDEX = WordIndex.fromWords(
@@ -183,7 +183,7 @@ function setup(
   rack: string,
   bagTotal: number,
   letter = "S",
-  opts: { durationMs?: number; withSim?: boolean; clock?: { t: number } } = {},
+  opts: { durationMs?: number; withSim?: boolean; clock?: { t: number }; policy?: Policy } = {},
 ) {
   const s = new FakeServer();
   s.bots.set(ME, { name: "SookraBot", isSimulated: false, strategy: { tag: "Human" } });
@@ -209,6 +209,7 @@ function setup(
     "T",
     { log: (m) => logs.push(m), warn: (m) => warns.push(m) },
     clock ? () => clock.t : Date.now,
+    opts.policy,
   );
   bot.myBotId = ME;
   return { s, bot, logs, warns };
@@ -970,4 +971,40 @@ test("ended matches and foreign auctions are ignored", async () => {
   await settle();
   assert.equal(other.s.bids.length + other.s.words.length, 0);
   assert.equal(letterIndex("E"), 4);
+});
+
+test("the policy given to the constructor reaches every strategy call the bot makes", async () => {
+  const P = (o: Partial<Policy>): Policy => ({ ...DEFAULT_POLICY, ...o });
+  assert.equal(setup("CAT", 30).bot.policy, DEFAULT_POLICY, "no policy: the live one");
+  // decideBid: the duel spot above (40 coins, 71 to go) bids 18; PACE_MIN_DUEL 1 makes it 4 x 1 x 6.
+  const duel = setup("AEINST", 70, "R", { withSim: false, policy: P({ PACE_MIN_DUEL: 1 }) });
+  duel.s.balance(ME, 40);
+  duel.bot.refresh(duel.s, MATCH);
+  await settle();
+  assert.equal(duel.s.bids.at(-1)!.amount, 24n);
+  // chooseWords: a duel cashes QINTARS at once; CASH_MIN_LEN 8 keeps it.
+  const cash = setup("RETAINSQ", 30, "E", { withSim: false, policy: P({ CASH_MIN_LEN: 8 }) });
+  cash.bot.refresh(cash.s, MATCH);
+  await settle();
+  assert.deepEqual(cash.s.words, []);
+  // shouldFlush and flushLeadMs: 3 auctions out still hoards; FLUSH_LEAD_MS 5000 flushes from 4 out.
+  const lead = setup("CATSX", 3, "O", { policy: P({ FLUSH_LEAD_MS: 5000 }) });
+  lead.bot.refresh(lead.s, MATCH);
+  await settle();
+  assert.deepEqual(lead.s.words, ["SAX"]);
+  // alphaFor: every valuation table (current rack and the precomputed ones) uses the policy's LEAVE_ALPHA.
+  const leave = setup("CAT", 30, "S", { policy: P({ LEAVE_ALPHA: 0.5 }) });
+  leave.bot.refresh(leave.s, MATCH);
+  await settle();
+  const vals = [...leave.bot.models.get(String(MATCH))!.vals.keys()];
+  assert.ok(vals.length >= 2 && vals.every((k) => k.endsWith("|0.5")), vals.join(", "));
+  // The first-price price history is capped at 26 x FP_HISTORY_MAX.
+  for (const [max, kept] of [[1, 26], [DEFAULT_POLICY.FP_HISTORY_MAX, 40]] as const) {
+    const fp = setup("CAT", 30, "S", { policy: P({ FP_HISTORY_MAX: max }) });
+    fp.s.matchStates.set(MATCH, { ...fp.s.matchStates.get(MATCH)!, auctionType: { tag: "FirstPrice" } });
+    for (let i = 0; i < 40; i++) {
+      fp.bot.onAuctionResult(fp.s, { auctionId: BigInt(200 + i), matchId: MATCH, letter: "E", winnerBotId: RIVAL, paid: 3n });
+    }
+    assert.equal(fp.bot.fpHistory.length, kept);
+  }
 });

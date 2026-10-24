@@ -27,9 +27,10 @@ import {
   type AuctionKind,
   type BidDecision,
   type Opponent,
+  type Policy,
   type PricePoint,
   type SimStrategy,
-  FP_HISTORY_MAX,
+  DEFAULT_POLICY,
   alphaFor,
   auctionsPerMatch,
   chooseWords,
@@ -273,12 +274,23 @@ export class SookraBot {
    */
   private readonly wordLatencies: number[] = [];
 
+  /**
+   * `policy` holds every tuning constant this bot plays with (strategy.ts);
+   * the live bot uses DEFAULT_POLICY, and the self-play harness passes a
+   * variant's here, the one place a variant reaches the bot.
+   */
   constructor(
     private readonly index: WordIndex,
     private readonly name: string,
     private readonly out: Logger = console,
     private readonly now: () => number = Date.now,
+    readonly policy: Policy = DEFAULT_POLICY,
   ) {}
+
+  /** The fixed flush rule (FLUSH_LEAD_MS), which valuation alpha and the precomputed tables follow. */
+  private flushAt(bagTotal: number, durationMs: number): boolean {
+    return shouldFlush(bagTotal, durationMs, this.policy.FLUSH_LEAD_MS);
+  }
 
   // ---- logging ----
 
@@ -484,7 +496,7 @@ export class SookraBot {
       const opensMs = microsToMs(a.opensAt);
       if (opensMs !== undefined) model.recvLags.push(recvWall - opensMs);
       const bagTotal = Number(m.bagTotal);
-      const alpha = alphaFor(shouldFlush(bagTotal, Number(m.auctionDurationMs)));
+      const alpha = alphaFor(this.flushAt(bagTotal, Number(m.auctionDurationMs)), this.policy);
       const counts = this.effectiveCounts(model, this.rackCounts(conn, a.matchId));
       const { delta, source } = this.lookupDelta(a.matchId, counts, alpha, a.letter);
       this.placeBid(conn, model, m, a, Number(me.balance), delta, bagTotal, source, this.opponentsFrom(conn, rows));
@@ -513,7 +525,7 @@ export class SookraBot {
     const key = String(matchId);
     if (this.precomputeScheduled.has(key)) return;
     this.precomputeScheduled.add(key);
-    const nextAlpha = alphaFor(shouldFlush(bagTotal - 1, durationMs));
+    const nextAlpha = alphaFor(this.flushAt(bagTotal - 1, durationMs), this.policy);
     const step = (withLetter: boolean) => () =>
       this.guard(`precompute m${key}`, () => {
         if (!this.online) return;
@@ -613,7 +625,7 @@ export class SookraBot {
         const bot = conn.db.bot.id.find(winner);
         if (bot && !bot.isSimulated) {
           this.fpHistory.push({ face: LETTER_VALUE[r.letter] ?? 1, paid: Number(r.paid) });
-          if (this.fpHistory.length > 26 * FP_HISTORY_MAX) this.fpHistory.shift();
+          if (this.fpHistory.length > 26 * this.policy.FP_HISTORY_MAX) this.fpHistory.shift();
         }
       }
       const model = this.models.get(String(r.matchId));
@@ -717,9 +729,10 @@ export class SookraBot {
     const durationMs = Number(m.auctionDurationMs);
     // Valuation keeps the fixed flush rule (so precomputed tables match); only word
     // plays move earlier when this match has seen a network stall (flushLeadMs).
-    const flush = open !== undefined && shouldFlush(bagTotal, durationMs);
-    const flushWords = open !== undefined && (flush || shouldFlush(bagTotal, durationMs, flushLeadMs(model.recvLags)));
-    const alpha = alphaFor(flush);
+    const flush = open !== undefined && this.flushAt(bagTotal, durationMs);
+    const flushWords =
+      open !== undefined && (flush || shouldFlush(bagTotal, durationMs, flushLeadMs(model.recvLags, this.policy)));
+    const alpha = alphaFor(flush, this.policy);
     const balance = Number(me.balance);
 
     let counts = this.effectiveCounts(model, this.rackCounts(conn, matchId));
@@ -783,6 +796,7 @@ export class SookraBot {
       flush,
       alpha: val.alpha,
       realRivals: this.opponents(conn, matchId).filter((o) => !o.isSim).length,
+      policy: this.policy,
     }).filter((w) => (model.wordFailures.get(w) ?? 0) < MAX_WORD_FAILURES);
     for (const w of words) this.submitWord(conn, matchId, model, w, flush);
     return words.length;
@@ -846,6 +860,7 @@ export class SookraBot {
         opponents,
         fpHistory: this.fpHistory,
         auctionsPerMatch: auctionsPerMatch(opponents.length + 1, m.startingRackSize ?? DEFAULT_RACK_SIZE),
+        policy: this.policy,
       });
     } catch (err) {
       this.warn("decideBid", err);

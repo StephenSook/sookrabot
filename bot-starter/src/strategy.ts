@@ -4,6 +4,11 @@
 // file turns a marginal value into a bid and a rack into word plays. Every
 // tuning knob is a named constant below; the measured basis for each is in
 // research_notes/.../scrabblebot_strategy.md (sim.py results).
+//
+// DEFAULT_POLICY collects those constants by name. A SookraBot plays with one
+// Policy (the live bot: DEFAULT_POLICY) and passes it to every function here;
+// the self-play harness tests a variant by overriding fields of it, so the
+// variant runs exactly this code with one value changed.
 
 import {
   type Candidates,
@@ -120,6 +125,68 @@ export const DUEL_MAX_OPPONENTS = 1;
 export const DUEL_RESERVE_PER_AUCTION = 1;
 export const DUEL_RESERVE_WINDOW = 10;
 
+/**
+ * The tuning constants above, by name: what a SookraBot plays with. Game rules
+ * (STARTING_BALANCE, BAG_TILES, SIM_BID_JITTER) and the network-stall bounds of
+ * flushLeadMs are not knobs and stay plain constants.
+ */
+export interface Policy {
+  readonly KAPPA: number;
+  readonly ENDGAME_AUCTIONS: number;
+  readonly ENDGAME_KAPPA_BOOST: number;
+  readonly PACE_EXPONENT: number;
+  readonly PACE_MIN: number;
+  readonly PACE_MAX: number;
+  readonly PACE_MIN_DUEL: number;
+  readonly PACED_KAPPA: number;
+  readonly LEAVE_ALPHA: number;
+  readonly CASH_MIN_LEN: number;
+  readonly HOLD_MIN_REAL_RIVALS: number;
+  readonly LIQUIDITY_FLOOR: number;
+  readonly LIQUIDITY_MIN_LEN: number;
+  readonly LIQUIDITY_FALLBACK_MIN_LEN: number;
+  readonly LIQUIDITY_TOP_K: number;
+  readonly SIM_ONLY_KAPPA: number;
+  readonly FLUSH_LEAD_MS: number;
+  readonly FP_HISTORY_MAX: number;
+  readonly FP_MIN_OBS: number;
+  readonly FP_QUANTILE: number;
+  readonly FP_NO_HISTORY_SHADE: number;
+  readonly BROKE_RIVAL_MAX_BID: number;
+  readonly DUEL_MAX_OPPONENTS: number;
+  readonly DUEL_RESERVE_PER_AUCTION: number;
+  readonly DUEL_RESERVE_WINDOW: number;
+}
+
+/** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
+export const DEFAULT_POLICY: Policy = Object.freeze({
+  KAPPA,
+  ENDGAME_AUCTIONS,
+  ENDGAME_KAPPA_BOOST,
+  PACE_EXPONENT,
+  PACE_MIN,
+  PACE_MAX,
+  PACE_MIN_DUEL,
+  PACED_KAPPA,
+  LEAVE_ALPHA,
+  CASH_MIN_LEN,
+  HOLD_MIN_REAL_RIVALS,
+  LIQUIDITY_FLOOR,
+  LIQUIDITY_MIN_LEN,
+  LIQUIDITY_FALLBACK_MIN_LEN,
+  LIQUIDITY_TOP_K,
+  SIM_ONLY_KAPPA,
+  FLUSH_LEAD_MS,
+  FP_HISTORY_MAX,
+  FP_MIN_OBS,
+  FP_QUANTILE,
+  FP_NO_HISTORY_SHADE,
+  BROKE_RIVAL_MAX_BID,
+  DUEL_MAX_OPPONENTS,
+  DUEL_RESERVE_PER_AUCTION,
+  DUEL_RESERVE_WINDOW,
+});
+
 // ---- Types ----
 
 export type AuctionKind = "Vickrey" | "FirstPrice";
@@ -152,6 +219,8 @@ export interface BidInput {
   fpHistory?: PricePoint[];
   /** Auctions in this match (auctionsPerMatch()); budget pacing is off when absent. */
   auctionsPerMatch?: number;
+  /** Tuning constants (default DEFAULT_POLICY). */
+  policy?: Policy;
 }
 
 export interface BidDecision {
@@ -177,8 +246,10 @@ function quantile(xs: number[], q: number): number {
   return s[pos];
 }
 
-export function kappaFor(bagTotal: number, base = KAPPA): number {
-  return bagTotal < ENDGAME_AUCTIONS ? base * ENDGAME_KAPPA_BOOST : base;
+/** Kappa `base` (default the policy's KAPPA), times ENDGAME_KAPPA_BOOST in the last ENDGAME_AUCTIONS auctions. */
+export function kappaFor(bagTotal: number, base?: number, p: Policy = DEFAULT_POLICY): number {
+  const k = base ?? p.KAPPA;
+  return bagTotal < p.ENDGAME_AUCTIONS ? k * p.ENDGAME_KAPPA_BOOST : k;
 }
 
 /** Pacing is on at tables with a real rival once the match length is known. */
@@ -193,23 +264,30 @@ export function auctionsPerMatch(seats: number, startingRackSize: number): numbe
 
 /**
  * Budget pacing multiplier on kappa (see PACE_EXPONENT), clamped to
- * min..PACE_MAX (min: PACE_MIN, or PACE_MIN_DUEL in a duel); 1 when the
- * match length is unknown.
+ * min..PACE_MAX (min: PACE_MIN, or PACE_MIN_DUEL in a duel; default the
+ * policy's PACE_MIN); 1 when the match length is unknown.
  */
 export function paceMultiplier(
   balance: number,
   bagTotal: number,
   auctions: number | undefined,
-  min = PACE_MIN,
+  min?: number,
+  p: Policy = DEFAULT_POLICY,
 ): number {
   if (auctions === undefined || !(auctions > 0) || !(bagTotal >= 0)) return 1;
   const r = Math.max(0, balance) / (bagTotal + 1) / (STARTING_BALANCE / auctions);
-  return Math.min(PACE_MAX, Math.max(min, r ** PACE_EXPONENT));
+  return Math.min(p.PACE_MAX, Math.max(min ?? p.PACE_MIN, r ** p.PACE_EXPONENT));
 }
 
 /** Kappa with budget pacing: PACED_KAPPA, doubled in the last ENDGAME_AUCTIONS auctions, times paceMultiplier. */
-export function pacedKappa(bagTotal: number, balance: number, auctions: number | undefined, min = PACE_MIN): number {
-  return kappaFor(bagTotal, PACED_KAPPA) * paceMultiplier(balance, bagTotal, auctions, min);
+export function pacedKappa(
+  bagTotal: number,
+  balance: number,
+  auctions: number | undefined,
+  min?: number,
+  p: Policy = DEFAULT_POLICY,
+): number {
+  return kappaFor(bagTotal, p.PACED_KAPPA, p) * paceMultiplier(balance, bagTotal, auctions, min, p);
 }
 
 /** Highest bid this opponent can place right now (real bots: their whole balance). */
@@ -223,9 +301,9 @@ export function maxPossibleBid(o: Opponent, letter: string): number {
  * DUEL_RESERVE_PER_AUCTION for each remaining auction, counting at most
  * DUEL_RESERVE_WINDOW of them. 0 at tables with more than DUEL_MAX_OPPONENTS rivals.
  */
-export function duelReserve(opponentCount: number, bagTotal: number): number {
-  if (opponentCount > DUEL_MAX_OPPONENTS) return 0;
-  return DUEL_RESERVE_PER_AUCTION * Math.max(0, Math.min(bagTotal, DUEL_RESERVE_WINDOW));
+export function duelReserve(opponentCount: number, bagTotal: number, p: Policy = DEFAULT_POLICY): number {
+  if (opponentCount > p.DUEL_MAX_OPPONENTS) return 0;
+  return p.DUEL_RESERVE_PER_AUCTION * Math.max(0, Math.min(bagTotal, p.DUEL_RESERVE_WINDOW));
 }
 
 /**
@@ -253,6 +331,7 @@ export function duelReserve(opponentCount: number, bagTotal: number): number {
  *  - always clamp to 0..balance.
  */
 export function decideBid(input: BidInput): BidDecision {
+  const p = input.policy ?? DEFAULT_POLICY;
   const balance = Math.max(0, Math.floor(Number.isFinite(input.myBalance) ? input.myBalance : 0));
   const clamp = (x: number) => Math.max(0, Math.min(Math.floor(x), balance));
   if (letterIndex(input.letter) < 0) return { amount: 0, reason: "bad-letter" };
@@ -270,14 +349,14 @@ export function decideBid(input: BidInput): BidDecision {
   const rivalCap = rivalMax + 1;
   let amount: number;
   let reason: string;
-  if (rivalMax <= BROKE_RIVAL_MAX_BID) {
+  if (rivalMax <= p.BROKE_RIVAL_MAX_BID) {
     amount = rivalCap;
     reason = `rivals broke (max ${rivalMax})`;
   } else {
-    ({ amount, reason } = valueBid(input, rivalCap, balance));
+    ({ amount, reason } = valueBid(input, rivalCap, balance, p));
   }
   // The duel reserve applies to every branch, the broke-rival one included.
-  const reserve = duelReserve(input.opponents.length, input.bagTotal);
+  const reserve = duelReserve(input.opponents.length, input.bagTotal, p);
   if (reserve > 0) {
     const evenShare = Math.floor(balance / (input.bagTotal + 1));
     const duelCap = Math.max(balance - reserve, evenShare);
@@ -290,24 +369,24 @@ export function decideBid(input: BidInput): BidDecision {
 }
 
 /** Bid from the marginal value (kappa, pacing, sims-only cap, first-price shading), capped at rivalCap. */
-function valueBid(input: BidInput, rivalCap: number, balance: number): BidDecision {
+function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy): BidDecision {
   const sims = input.opponents.filter((o) => o.isSim && o.strategy);
   const simCap = sims.length
     ? Math.max(...sims.map((o) => maxSimBid(o.strategy!, input.letter, o.balance))) + 1
     : 0;
   const simsOnly = input.opponents.length > 0 && sims.length === input.opponents.length;
   const paced = pacingOn(simsOnly, input.auctionsPerMatch);
-  const paceMin = input.opponents.length <= DUEL_MAX_OPPONENTS ? PACE_MIN_DUEL : PACE_MIN;
+  const paceMin = input.opponents.length <= p.DUEL_MAX_OPPONENTS ? p.PACE_MIN_DUEL : p.PACE_MIN;
   const kappaExact = paced
-    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin)
-    : kappaFor(input.bagTotal);
+    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin, p)
+    : kappaFor(input.bagTotal, undefined, p);
   const kappa = +kappaExact.toFixed(4); // for the reason strings
   const full = Math.floor(kappaExact * input.delta);
 
   let amount: number;
   let reason: string;
   if (simsOnly && input.auctionType === "Vickrey") {
-    amount = Math.min(Math.floor(SIM_ONLY_KAPPA * input.delta), simCap);
+    amount = Math.min(Math.floor(p.SIM_ONLY_KAPPA * input.delta), simCap);
     reason = `sims-only cap ${simCap}`;
   } else if (input.auctionType === "FirstPrice" && simsOnly) {
     amount = Math.min(full, simCap);
@@ -315,15 +394,15 @@ function valueBid(input: BidInput, rivalCap: number, balance: number): BidDecisi
   } else if (input.auctionType === "FirstPrice") {
     const face = LETTER_VALUE[input.letter] ?? 1;
     const obs = (input.fpHistory ?? [])
-      .filter((p) => p.face === face)
-      .slice(-FP_HISTORY_MAX)
-      .map((p) => p.paid);
+      .filter((pp) => pp.face === face)
+      .slice(-p.FP_HISTORY_MAX)
+      .map((pp) => pp.paid);
     let target: number;
-    if (obs.length >= FP_MIN_OBS) {
-      target = Math.max(simCap, quantile(obs, FP_QUANTILE) + 1);
-      reason = `fp q${FP_QUANTILE}x${obs.length} k${kappa}`;
+    if (obs.length >= p.FP_MIN_OBS) {
+      target = Math.max(simCap, quantile(obs, p.FP_QUANTILE) + 1);
+      reason = `fp q${p.FP_QUANTILE}x${obs.length} k${kappa}`;
     } else {
-      target = Math.max(simCap, Math.floor(full * FP_NO_HISTORY_SHADE));
+      target = Math.max(simCap, Math.floor(full * p.FP_NO_HISTORY_SHADE));
       reason = `fp no-history k${kappa}`;
     }
     amount = Math.min(full, target);
@@ -360,18 +439,18 @@ export const FLUSH_BASELINE_PERCENTILE = 0.1;
  * self-play harness (no lag) are unchanged. It only moves word plays earlier;
  * valuation alpha keeps the fixed rule, so precomputed bid tables stay valid.
  */
-export function flushLeadMs(lagsMs: readonly number[]): number {
+export function flushLeadMs(lagsMs: readonly number[], p: Policy = DEFAULT_POLICY): number {
   // Baseline: a low percentile of the recent lags, so one early outlier (a clock
   // correction mid-match) expires instead of making every later lag look stalled.
   const recent = lagsMs.filter((lag) => Number.isFinite(lag)).slice(-FLUSH_BASELINE_WINDOW);
-  if (recent.length === 0) return FLUSH_LEAD_MS;
+  if (recent.length === 0) return p.FLUSH_LEAD_MS;
   const sorted = [...recent].sort((a, b) => a - b);
   const baseline = sorted[Math.floor(FLUSH_BASELINE_PERCENTILE * (sorted.length - 1))];
   let stall = 0;
   for (const lag of lagsMs.slice(-FLUSH_LAG_WINDOW)) {
     if (Number.isFinite(lag) && lag - baseline > stall) stall = lag - baseline;
   }
-  return Math.min(MAX_FLUSH_LEAD_MS, Math.max(FLUSH_LEAD_MS, Math.ceil(2 * stall + 1000)));
+  return Math.min(MAX_FLUSH_LEAD_MS, Math.max(p.FLUSH_LEAD_MS, Math.ceil(2 * stall + 1000)));
 }
 
 /** True once the match ends within leadMs (always at the final auction). */
@@ -382,8 +461,8 @@ export function shouldFlush(bagTotal: number, auctionDurationMs: number, leadMs:
 }
 
 /** Leave weight for the valuation: leftovers are worthless once flushing. */
-export function alphaFor(flush: boolean): number {
-  return flush ? 0 : LEAVE_ALPHA;
+export function alphaFor(flush: boolean, p: Policy = DEFAULT_POLICY): number {
+  return flush ? 0 : p.LEAVE_ALPHA;
 }
 
 export interface WordInput {
@@ -396,6 +475,8 @@ export interface WordInput {
   alpha?: number;
   /** Real (non-sim) rivals at the table; HOLD_MIN_REAL_RIVALS or more holds words for the flush. */
   realRivals?: number;
+  /** Tuning constants (default DEFAULT_POLICY). */
+  policy?: Policy;
 }
 
 /**
@@ -411,16 +492,17 @@ export function liquidityWord(
   rem: Counts,
   balance: number,
   alpha: number,
+  p: Policy = DEFAULT_POLICY,
 ): number {
-  for (const minLen of [LIQUIDITY_MIN_LEN, LIQUIDITY_FALLBACK_MIN_LEN]) {
+  for (const minLen of [p.LIQUIDITY_MIN_LEN, p.LIQUIDITY_FALLBACK_MIN_LEN]) {
     const top: number[] = [];
-    for (let i = 0; i < cands.n && top.length < LIQUIDITY_TOP_K; i++) {
+    for (let i = 0; i < cands.n && top.length < p.LIQUIDITY_TOP_K; i++) {
       if (cands.extra[i] !== -1) continue;
       const k = cands.keys[i];
       if (index.len[k] >= minLen && index.fits(k, rem)) top.push(k);
     }
     if (top.length === 0) continue;
-    const need = LIQUIDITY_FLOOR - balance;
+    const need = p.LIQUIDITY_FLOOR - balance;
     let eligible = top.filter((k) => index.reward[k] >= need);
     if (eligible.length === 0) eligible = [top[0]];
     let best = -1;
@@ -445,22 +527,23 @@ export function liquidityWord(
  * would still be under LIQUIDITY_FLOOR.
  */
 export function chooseWords(index: WordIndex, input: WordInput): string[] {
+  const p = input.policy ?? DEFAULT_POLICY;
   if (input.flush) {
     return index.pack(input.cands, input.counts, -1).keys.map((k) => index.words[k]);
   }
   const rem = new Int32Array(input.counts);
   const out: string[] = [];
   let balance = input.myBalance;
-  const hold = (input.realRivals ?? 0) >= HOLD_MIN_REAL_RIVALS;
+  const hold = (input.realRivals ?? 0) >= p.HOLD_MIN_REAL_RIVALS;
   while (!hold) {
-    const k = index.bestKey(input.cands, rem, CASH_MIN_LEN);
+    const k = index.bestKey(input.cands, rem, p.CASH_MIN_LEN);
     if (k < 0) break;
     out.push(index.words[k]);
     balance += index.reward[k];
     index.consume(rem, k);
   }
-  if (balance < LIQUIDITY_FLOOR) {
-    const k = liquidityWord(index, input.cands, rem, balance, input.alpha ?? LEAVE_ALPHA);
+  if (balance < p.LIQUIDITY_FLOOR) {
+    const k = liquidityWord(index, input.cands, rem, balance, input.alpha ?? p.LEAVE_ALPHA, p);
     if (k >= 0) out.push(index.words[k]);
   }
   return out;
