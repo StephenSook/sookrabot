@@ -1006,7 +1006,7 @@ export type PolicyKey = keyof Policy;
 export const POLICY_KEYS = Object.keys(DEFAULT_POLICY) as PolicyKey[];
 /** Knobs that count tiles, auctions, milliseconds, rivals, observations or coins of a cap: whole numbers only. */
 const INTEGER_KEYS: ReadonlySet<PolicyKey> = new Set<PolicyKey>([
-  "ENDGAME_AUCTIONS", "EARLY_AUCTIONS", "EARLY_MIN_RIVALS", "LEAVE_DECAY_BAG", "CASH_MIN_LEN", "HOLD_MIN_REAL_RIVALS",
+  "ENDGAME_AUCTIONS", "EARLY_AUCTIONS", "EARLY_MIN_REAL_RIVALS", "LEAVE_DECAY_BAG", "CASH_MIN_LEN", "HOLD_MIN_REAL_RIVALS",
   "HOLD_FROM_BAG",
   "LIQUIDITY_MIN_LEN", "LIQUIDITY_FALLBACK_MIN_LEN",
   "LIQUIDITY_TOP_K", "FLUSH_LEAD_MS", "FP_HISTORY_MAX", "FP_MIN_OBS", "BROKE_RIVAL_MAX_BID", "DUEL_MAX_OPPONENTS",
