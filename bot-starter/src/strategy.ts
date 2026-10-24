@@ -341,11 +341,32 @@ function valueBid(input: BidInput, rivalCap: number, balance: number): BidDecisi
 
 // ---- Word play ----
 
-/** True once the match ends within FLUSH_LEAD_MS (always at the final auction). */
-export function shouldFlush(bagTotal: number, auctionDurationMs: number): boolean {
+/** Never start the flush earlier than this, whatever the lag (12 auctions at 1000 ms). */
+export const MAX_FLUSH_LEAD_MS = 12000;
+/** How many of the most recent auction receive lags the flush lead looks at. */
+export const FLUSH_LAG_WINDOW = 20;
+
+/**
+ * Flush lead for the current match: FLUSH_LEAD_MS normally, longer after a stall.
+ * Held words must reach the server before the final auction closes, and m276 lost
+ * its whole hoard to a 3,253 ms receive lag. If a recent auction reached us N ms
+ * late, the end of the match can too, so allow twice the worst recent lag plus a
+ * second. Lags under 1,000 ms leave the lead at FLUSH_LEAD_MS, so normal play
+ * (and the self-play harness, which has no lag) is unchanged.
+ */
+export function flushLeadMs(recentLagsMs: readonly number[]): number {
+  let worst = 0;
+  for (const lag of recentLagsMs.slice(-FLUSH_LAG_WINDOW)) {
+    if (Number.isFinite(lag) && lag > worst) worst = lag;
+  }
+  return Math.min(MAX_FLUSH_LEAD_MS, Math.max(FLUSH_LEAD_MS, Math.ceil(2 * worst + 1000)));
+}
+
+/** True once the match ends within leadMs (always at the final auction). */
+export function shouldFlush(bagTotal: number, auctionDurationMs: number, leadMs: number = FLUSH_LEAD_MS): boolean {
   if (bagTotal <= 0) return true;
   const ms = auctionDurationMs > 0 ? auctionDurationMs : 1000;
-  return (bagTotal + 1) * ms <= FLUSH_LEAD_MS;
+  return (bagTotal + 1) * ms <= leadMs;
 }
 
 /** Leave weight for the valuation: leftovers are worthless once flushing. */
