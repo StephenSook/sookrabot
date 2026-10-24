@@ -452,10 +452,10 @@ test("decideBid: sims-only table caps at the max sim bid + 1", () => {
 test("decideBid: first price shades toward the observed price", () => {
   const input = { letter: "T", delta: 6, bagTotal: 30, auctionType: "FirstPrice" as const, myBalance: 100, opponents: REAL };
   assert.equal(FP_NO_HISTORY_SHADE, 0.4);
-  assert.equal(FP_QUANTILE, 0.3);
+  assert.equal(FP_QUANTILE, 0.2);
   // No history: 40% of the full bid (25 -> 10).
   assert.equal(decideBid(input).amount, 10);
-  // History of 1-point letters selling for 4..8 (sorted 4 5 5 6 6 7 8): q0.3 = 5, bid 6.
+  // History of 1-point letters selling for 4..8 (sorted 4 5 5 6 6 7 8): q0.2 = 5, bid 6.
   const fpHistory = [4, 5, 6, 7, 8, 6, 5].map((paid) => ({ face: 1, paid }));
   assert.equal(decideBid({ ...input, fpHistory }).amount, 6);
   // The same history at quantile 0.75 (the default before 2026-10-24): q0.75 = 7, bid 8.

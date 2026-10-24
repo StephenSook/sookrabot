@@ -175,7 +175,12 @@ export const FLUSH_LEAD_MS = 3000;
  */
 export const FP_HISTORY_MAX = 40;
 export const FP_MIN_OBS = 5;
-export const FP_QUANTILE = 0.3;
+/**
+ * FP_QUANTILE 0.2 (from 0.3), round 3 on top of the early-cut retune: first-price fields, seeds 9201
+ * and 9602, 500 to 600 matches each: +4.3 to +7.6 points at 2 to 6 seats (each CI above zero, also
+ * against rivals shading by 0.8), +0.3 to +1.0 at 8 seats (CI includes zero); 0.4 lost 1.4 to 6.2.
+ */
+export const FP_QUANTILE = 0.2;
 /** First-price shading with too little price history: bid this share of the full bid. */
 export const FP_NO_HISTORY_SHADE = 0.4;
 /**
@@ -328,13 +333,26 @@ export const EMP_DEAD_SCALE = 0;
  * LOOKAHEAD_POOL 0 the draws come from the full bag instead. MLOOK_SCALE
  * multiplies the value it returns (it runs above the one-step values, so this
  * matches spend only where it applies). 0: off.
+ *
+ * Round 3 settings, on by default: MLOOK_M 3, MLOOK_RATE 1 (three letters ahead until the last two
+ * auctions), MLOOK_SAMPLES 32, MLOOK_SCALE 0.75. Paired cloud self-play against the early-cut build
+ * (f773eff), calibrated v5 rivals, 600 matches a field: seed 9301 (alone) and 9601 (with the spite
+ * and first-price settings below; those touch only duels and first price): 6-seat field and mixed
+ * +10.3 to +11.3 points, place -0.07 to -0.13; top-five table +7.0 to +8.4, place -0.11 to -0.17;
+ * ,smart top five +7.1; 3 seats +26 to +27, 4 seats +21 to +22, 5 seats +13 to +17; 7 seats +4.0
+ * to +4.9, place -0.09;
+ * 8 seats +1.7 to +2.7 (place -0.06 and -0.01, CIs include zero); padded pad-ls-code +17.5. A
+ * spend control (PACED_KAPPA 3.23, the same 0.85 bid cut without the lookahead) gained +1.1 at 6
+ * seats and lost 1.8 at 8, so the gain is the multi-letter value, not spending less. At m 12 and
+ * rate 0.2 it lost (seed 8201); 16 samples gained 1 to 2.3 points less than 32 (seed 9301). It costs
+ * about 20 ms of CPU per auction on a CI runner (32 samples), after the instant bid has gone out.
  */
-export const MLOOK_M = 0;
-export const MLOOK_RATE = 0.2;
-export const MLOOK_SAMPLES = 16;
+export const MLOOK_M = 3;
+export const MLOOK_RATE = 1;
+export const MLOOK_SAMPLES = 32;
 export const MLOOK_ALPHA_SCALE = 1;
 export const MLOOK_TILT = 0;
-export const MLOOK_SCALE = 1;
+export const MLOOK_SCALE = 0.75;
 /** EARLY_RAMP 1: the early cut ramps linearly up to 1 over the window instead of a step (earlyScale). 0: step. */
 export const EARLY_RAMP = 0;
 /**
@@ -342,12 +360,15 @@ export const EARLY_RAMP = 0;
  * (median of its bids seen this match on letters of the same face, at least SPITE_MIN_OBS of them) is
  * above ours, bid ours + SPITE_ALPHA x (predicted - ours), capped at SPITE_CAP x ours, tapering to 0
  * over the last SPITE_HORIZON auctions: our bid is the rival's price, so it pays more (Brandt,
- * Sandholm and Shoham 2007). 0: off.
+ * Sandholm and Shoham 2007). 0: off. Round 3, on: alpha 0.5, cap 2, 2 observations. Duel fields
+ * (postturing, Dante, guesser, Doppio, Nijello, james, LetterShark, Yezi), seeds 9001 and 9401, 800
+ * a field: score margin +5.2 (CI +2.7 to +7.6, n 5600) and +5.4 (CI +3.0 to +7.8, n 6400), wins +1
+ * point; alpha 1 lost 11.6. Gated to two-seat Vickrey tables, so nothing else changes.
  */
-export const SPITE_ALPHA = 0;
-export const SPITE_CAP = 1.5;
+export const SPITE_ALPHA = 0.5;
+export const SPITE_CAP = 2;
 export const SPITE_HORIZON = 15;
-export const SPITE_MIN_OBS = 3;
+export const SPITE_MIN_OBS = 2;
 /**
  * SPEND_FLOOR: every value bid (paced, Vickrey, at tables of at least
  * SPEND_FLOOR_MIN_REAL_RIVALS real rivals) is raised by
