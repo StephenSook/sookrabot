@@ -75,8 +75,10 @@ export const PACED_KAPPA = 4;
  * shark-policy rivals, +1.2 at 8 seats. Window 28 against 22 and 34 in the same
  * run: 34 lost 1.1 to 1.2 points at 7 and 8 seats, 22 lost 5.4 at 4 seats, and
  * elsewhere the three were within 2.6 points. A cut in duels lost 31 to 63
- * points a game (round 1), hence EARLY_MIN_RIVALS 2. Rivals are counted as
- * seated opponents, sims included (tournament tables seat no sims).
+ * points a game (round 1), hence EARLY_MIN_RIVALS 2. Rivals are all seated
+ * opponents, sims included, so a table of one real rival and sims is cut too
+ * (a casual lobby can be padded with sims, and an admin can enter sims into a
+ * tournament with registerSimBots); the search measured all-real tables.
  */
 export const EARLY_AUCTIONS = 28;
 export const EARLY_KAPPA_SCALE = 0.4;
