@@ -435,14 +435,30 @@ test("chooseWords: hoards short words, cashes 7+, flushes everything at the end"
 
 // ---- speed ----
 
-test("valuation of a 20-tile rack stays well inside a 250 ms auction", () => {
+/**
+ * CPU time this process spends in fn, in ms. Time spent waiting for a CPU
+ * while other processes run is not counted, so a busy machine cannot fail a
+ * speed check; a slower algorithm still does.
+ */
+function cpuMs(fn: () => void): number {
+  const start = process.cpuUsage();
+  fn();
+  const used = process.cpuUsage(start);
+  return (used.user + used.system) / 1000;
+}
+
+test("valuation of a 20-tile rack stays well inside a 250 ms auction", (t) => {
+  // CPU time, best of 3 (the first run can include JIT warmup). Wall time failed
+  // this check under other processes' load (224 ms) with the code unchanged.
   const racks = ["AEEIINORSSTTLDGU", "BCDFGHJKLMNPQRSTVWXZ", "AAEEIIOOUURRSSTTNNLL", "AEINSTRLDGBCMPFHVWY"];
   for (const r of racks) {
-    const v = valuate(INDEX, countsOf(r), 0.35);
-    assert.ok(v.ms < 120, `${r} took ${v.ms.toFixed(1)} ms`);
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) best = Math.min(best, cpuMs(() => valuate(INDEX, countsOf(r), 0.35)));
+    t.diagnostic(`${r}: ${best.toFixed(1)} ms of CPU`);
+    assert.ok(best > 0, "the measurement saw the work");
+    assert.ok(best < 120, `${r} took ${best.toFixed(1)} ms of CPU (best of 3)`);
   }
-  const t0 = performance.now();
-  WordIndex.fromWords(WORDLIST);
-  const buildMs = performance.now() - t0;
-  assert.ok(buildMs < 5000, `index build ${buildMs} ms`);
+  const buildMs = cpuMs(() => WordIndex.fromWords(WORDLIST));
+  t.diagnostic(`index build: ${buildMs.toFixed(0)} ms of CPU`);
+  assert.ok(buildMs < 5000, `index build ${buildMs.toFixed(0)} ms of CPU`);
 });
