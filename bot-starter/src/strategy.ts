@@ -227,8 +227,10 @@ export const CASH_BROKE_AUCTIONS = 0;
  */
 export const DEAD_KAPPA_SCALE = 1;
 
-// Prediction v2 knobs. Each is off by default, so DEFAULT_POLICY plays exactly
-// as the live build does; the self-play harness turns one on by name.
+// Prediction v2 knobs. All are off by default except the gated lookahead
+// (LOOKAHEAD_WEIGHT 1 with LOOKAHEAD_MIN_REAL_RIVALS 2), so DEFAULT_POLICY plays
+// as the live build 5318ca6 everywhere the lookahead's gate is closed; the
+// self-play harness turns any knob on or off by name.
 
 /**
  * WORDS_EXACT_NODES: word choices use the optimal packing of the rack
@@ -264,17 +266,32 @@ export const DEAD_GATE_REAL_RIVALS = 0;
  * last LOOKAHEAD_HORIZON auctions. LOOKAHEAD_POOL 1 weights the next letter by
  * the unseen pool (bag minus auctioned letters minus our starting tiles), 0 by
  * the full bag. LOOKAHEAD_WEIGHT 0: off.
+ *
+ * Cloud self-play, paired against 5318ca6 (head), LOOKAHEAD_WEIGHT 1:
+ *  - 6-seat Vickrey, calibrated v5 rivals (top5, field, mixed; seeds 7102,
+ *    7201, 7203; 6000 paired matches): +6.1 points (95% CI +5.4 to +6.7),
+ *    place -0.24 (CI -0.27 to -0.21), wins +11.4 points of share;
+ *  - the same tables with stronger rivals (,smart / @0.9 / shade=1.2, seed
+ *    7202, 1800): +5.0 points (CI +3.8 to +6.3), place -0.15;
+ *  - 3 seats (1200): +8.7 points, place -0.13; 5 seats (1800): +1.8 points
+ *    (CI +0.4 to +3.3), place -0.11; 4 seats (2400): -0.7 points (CI -2.3 to
+ *    +0.9), place -0.05 (CI -0.09 to -0.02);
+ *  - duels: -9.6 to -62.7 points; 6-seat first price: -4.4. Hence the gate.
+ * Weights 0.5, 0.75, 1.5 and 2 each gained less than 1. The unseen pool and
+ * the full-bag prior measured the same (seed 7102: +6.4 / +7.4 / +4.2 against
+ * +6.7 / +7.0 / +4.3). A spend-matched control (PACED_KAPPA 4.6, seed 7203)
+ * gained only +0.6 to +1.9, so the gain is not just spending more.
  */
-export const LOOKAHEAD_WEIGHT = 0;
+export const LOOKAHEAD_WEIGHT = 1;
 export const LOOKAHEAD_HORIZON = 10;
 export const LOOKAHEAD_POOL = 1;
 /**
  * The lookahead applies only in Vickrey auctions at tables with at least
- * LOOKAHEAD_MIN_REAL_RIVALS real (non-sim) rivals; 0: everywhere. Ungated it
- * lost in every duel field, at a 6-seat first-price table and was flat at 4
- * seats (cloud run 40125994357, seed 7202).
+ * LOOKAHEAD_MIN_REAL_RIVALS real (non-sim) rivals (3 or more seats); 0:
+ * everywhere. Gated off, duels, first-price and sim-padded tables play exactly
+ * as head (cloud run seed 7301: 600 of 600 identical in each such field).
  */
-export const LOOKAHEAD_MIN_REAL_RIVALS = 0;
+export const LOOKAHEAD_MIN_REAL_RIVALS = 2;
 /**
  * EMP_DEAD_SCALE: a letter the rack's packing has no use for (its marginal
  * value is only its own leave value, alpha x LEAVE_W7) is valued instead at

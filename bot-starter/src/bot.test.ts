@@ -925,8 +925,9 @@ test("duel: a cash-poor bot's paced bid is held at PACE_MIN_DUEL (the 3-game fin
 });
 
 test("early bid cut: a six-bot all-real table bids 0.4 of the paced kappa for 28 auctions; a duel is exempt", async () => {
-  // Six seats with 5-tile racks: 68 auctions. AEINST values R at 6.
-  const six = setup("AEINST", 67, "R", { withSim: false });
+  // Six seats with 5-tile racks: 68 auctions. AEINST values R at 6. The lookahead is off here: this checks
+  // the 5318ca6 rules it refines (the lookahead's own test follows).
+  const six = setup("AEINST", 67, "R", { withSim: false, policy: { ...DEFAULT_POLICY, LOOKAHEAD_WEIGHT: 0 } });
   for (const id of [11n, 12n, 13n, 14n]) {
     six.s.bots.set(id, { name: `Rival${id}`, isSimulated: false, strategy: { tag: "Human" } });
     six.s.participants.push({ matchId: MATCH, botId: id, balance: 100n, score: 0n });
@@ -960,7 +961,7 @@ test("early bid cut: a six-bot all-real table bids 0.4 of the paced kappa for 28
 test("round 2 levers reach the bot: a 7+ completer bid, a dead-letter bid and held words cashed when broke or late", async () => {
   // Six seats (68 auctions), all real, so words are held for the flush.
   const six = (rack: string, bagTotal: number, letter: string, o?: Partial<Policy>) => {
-    const t = setup(rack, bagTotal, letter, { withSim: false, policy: o ? { ...DEFAULT_POLICY, ...o } : undefined });
+    const t = setup(rack, bagTotal, letter, { withSim: false, policy: { ...DEFAULT_POLICY, LOOKAHEAD_WEIGHT: 0, ...(o ?? {}) } });
     for (const id of [11n, 12n, 13n, 14n]) {
       t.s.bots.set(id, { name: `Rival${id}`, isSimulated: false, strategy: { tag: "Human" } });
       t.s.participants.push({ matchId: MATCH, botId: id, balance: 100n, score: 0n });
@@ -1095,4 +1096,30 @@ test("the policy given to the constructor reaches every strategy call the bot ma
     }
     assert.equal(fp.bot.fpHistory.length, kept);
   }
+});
+
+test("lookahead: refines the bid at an all-real Vickrey table, never in a duel or with sims only", async () => {
+  const seated = (rivals: number, o: Partial<Policy>) => {
+    const t = setup("AEINST", 39, "R", { withSim: false, policy: { ...DEFAULT_POLICY, ...o } });
+    for (let k = 0; k < rivals; k++) {
+      const id = 11n + BigInt(k);
+      t.s.bots.set(id, { name: `Rival${id}`, isSimulated: false, strategy: { tag: "Human" } });
+      t.s.participants.push({ matchId: MATCH, botId: id, balance: 100n, score: 0n });
+    }
+    return t;
+  };
+  // Six seats (the focal bot, its rival and four more): the refined bid comes from the lookahead.
+  const on = seated(4, {});
+  on.bot.refresh(on.s, MATCH);
+  await settle();
+  assert.ok(on.logs.some((l) => l.includes("table+look")), "lookahead source logged");
+  // A duel (one rival) is gated out: the same bid as with the lookahead off.
+  const duelOn = setup("AEINST", 87, "R", { withSim: false });
+  duelOn.bot.refresh(duelOn.s, MATCH);
+  await settle();
+  const duelOff = setup("AEINST", 87, "R", { withSim: false, policy: { ...DEFAULT_POLICY, LOOKAHEAD_WEIGHT: 0 } });
+  duelOff.bot.refresh(duelOff.s, MATCH);
+  await settle();
+  assert.equal(duelOn.s.bids.at(-1)!.amount, duelOff.s.bids.at(-1)!.amount);
+  assert.ok(!duelOn.logs.some((l) => l.includes("table+look")));
 });

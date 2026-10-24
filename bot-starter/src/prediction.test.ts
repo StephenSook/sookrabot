@@ -90,8 +90,9 @@ test("PoolTracker: unseen = bag - auctioned - our start, each auction counted on
   assert.equal(w[16], 0);
 });
 
-test("lookahead: off by default, ramps to 0 at the end, and a U with a Q gains", () => {
-  assert.equal(DEFAULT_POLICY.LOOKAHEAD_WEIGHT, 0);
+test("lookahead: on and gated by default, ramps to 0 at the end", () => {
+  assert.equal(DEFAULT_POLICY.LOOKAHEAD_WEIGHT, 1);
+  assert.equal(DEFAULT_POLICY.LOOKAHEAD_MIN_REAL_RIVALS, 2);
   assert.equal(lookaheadLambda(1, 0, 10), 0);
   assert.equal(lookaheadLambda(1, 5, 10), 0.5);
   assert.equal(lookaheadLambda(1, 40, 10), 1);
