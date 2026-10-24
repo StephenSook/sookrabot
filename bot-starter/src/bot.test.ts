@@ -924,7 +924,7 @@ test("duel: a cash-poor bot's paced bid is held at PACE_MIN_DUEL (the 3-game fin
   assert.equal(three.s.bids.at(-1)!.amount, 15n);
 });
 
-test("early bid cut: a six-bot all-real table bids 0.55 of the paced kappa for 28 auctions; a duel is exempt", async () => {
+test("early bid cut: a six-bot all-real table bids 0.7 of the paced kappa for 28 auctions; a duel is exempt", async () => {
   // Six seats with 5-tile racks: 68 auctions. AEINST values R at 6. The lookahead is off here: this checks
   // the 5318ca6 rules it refines (the lookahead's own test follows).
   const six = setup("AEINST", 67, "R", { withSim: false, policy: { ...DEFAULT_POLICY, LOOKAHEAD_WEIGHT: 0 } });
@@ -934,8 +934,8 @@ test("early bid cut: a six-bot all-real table bids 0.55 of the paced kappa for 2
   }
   six.bot.refresh(six.s, MATCH);
   await settle();
-  // First auction (index 0), even spend: kappa 3.8 x 0.55 = 2.09, floor(2.09 x 6) = 12 (22 without the cut).
-  assert.equal(six.s.bids.at(-1)!.amount, 12n);
+  // First auction (index 0), even spend: kappa 3.8 x 0.7 = 2.66, floor(2.66 x 6) = 15 (22 without the cut).
+  assert.equal(six.s.bids.at(-1)!.amount, 15n);
   // Index 28 (39 auctions to come), still 100 coins: past the window, 3.8 x sqrt(1.7) = 4.955, so 29.
   six.s.nextAuction(AUCTION + 1n, "R", 39);
   six.bot.refresh(six.s, MATCH);

@@ -101,9 +101,15 @@ export const PACED_KAPPA = 3.8;
  * +6.1; duels (postturing, Dante; 1200) +4.2 (CI +0.05 to +8.4). With the
  * lookahead the 0.4 cut is too deep: 0.3 lost 2 to 9 points everywhere (seed
  * 8101), 0.5 to 0.65 all gained at 6 seats, 0.75 gained nothing.
+ *
+ * 0.7 (from 0.55) once the 3-letter lookahead (MLOOK, x0.75) was on, against that build
+ * (f8c8ac2), seeds 9701 and 9801, 400 and 600 matches a field: 6-seat field and mixed +2.5 (CI
+ * +1.3 to +3.7); top-five table, plain and ,smart, +1.5 (CI +0.5 to +2.6), place -0.04 (CI -0.07
+ * to -0.01); 7 seats place -0.09, 8 seats place -0.05; 3 seats +10.0, 4 seats +2.9; first price
+ * +2.4 at 6 seats, +0.6 at 4 (place +0.02, CI +0.00 to +0.04). 0.45 lost 0.2 to 7.0 points everywhere.
  */
 export const EARLY_AUCTIONS = 28;
-export const EARLY_KAPPA_SCALE = 0.55;
+export const EARLY_KAPPA_SCALE = 0.7;
 export const EARLY_MIN_REAL_RIVALS = 2;
 /** Every bot starts a match with this balance (game.ts STARTING_BALANCE). */
 export const STARTING_BALANCE = 100;
