@@ -275,6 +275,14 @@ export const LOOKAHEAD_POOL = 1;
  * seats (cloud run 40125994357, seed 7202).
  */
 export const LOOKAHEAD_MIN_REAL_RIVALS = 0;
+/**
+ * EMP_DEAD_SCALE: a letter the rack's packing has no use for (its marginal
+ * value is only its own leave value, alpha x LEAVE_W7) is valued instead at
+ * alpha x EMP_DEAD_SCALE x the empirical points per won tile of that letter
+ * (empirical.ts: final score regressed on tiles won, live all-real 6-seat
+ * matches). 0: off. 0.85 keeps the table's mean near LEAVE_W7's.
+ */
+export const EMP_DEAD_SCALE = 0;
 
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
@@ -324,6 +332,7 @@ export interface Policy {
   readonly LOOKAHEAD_HORIZON: number;
   readonly LOOKAHEAD_POOL: number;
   readonly LOOKAHEAD_MIN_REAL_RIVALS: number;
+  readonly EMP_DEAD_SCALE: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -370,6 +379,7 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   LOOKAHEAD_HORIZON,
   LOOKAHEAD_POOL,
   LOOKAHEAD_MIN_REAL_RIVALS,
+  EMP_DEAD_SCALE,
 });
 
 // ---- Types ----

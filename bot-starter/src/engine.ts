@@ -456,6 +456,7 @@ export function valuate(
   alpha: number,
   mode: "leave" | "forced" = "leave",
   exactNodes = 0,
+  deadValue?: Float64Array,
 ): Valuation {
   const t0 = performance.now();
   const leave = mode === "leave";
@@ -469,7 +470,11 @@ export function valuate(
   const delta = new Float64Array(26);
   for (let i = 0; i < 26; i++) {
     const repacked = packValue(packer(i), alpha) - baseValue;
-    delta[i] = leave ? Math.max(repacked, alpha * W7_BY_INDEX[i]) : repacked;
+    const floor = alpha * W7_BY_INDEX[i];
+    // deadValue (leave mode): a letter the packing has no use for (worth only its own leave
+    // value) is valued at alpha x deadValue[i] instead, an empirical value per letter.
+    if (leave && deadValue !== undefined && repacked <= floor + 1e-9) delta[i] = alpha * deadValue[i];
+    else delta[i] = leave ? Math.max(repacked, floor) : repacked;
   }
   return {
     rackKey: countsKey(counts),

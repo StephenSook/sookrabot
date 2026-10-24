@@ -40,6 +40,7 @@ import {
   shouldFlush,
 } from "./strategy.js";
 import { PoolTracker, lookaheadDelta, lookaheadLambda, poolWeights } from "./pool.js";
+import { scaledEmpirical } from "./empirical.js";
 
 /** Starting rack size when match_state does not carry one (game.ts STARTING_RACK_SIZE). */
 const DEFAULT_RACK_SIZE = 5;
@@ -284,6 +285,8 @@ export class SookraBot {
    * COMPLETE7_PREMIUM is on, so the bid on an auction's open stays a lookup.
    */
   private readonly sevenMasks = new WeakMap<Valuation, number>();
+  /** EMP_DEAD_SCALE's table (empirical.ts), or undefined while that knob is off. */
+  private readonly deadValue: Float64Array | undefined;
 
   /**
    * `policy` holds every tuning constant this bot plays with (strategy.ts);
@@ -296,7 +299,9 @@ export class SookraBot {
     private readonly out: Logger = console,
     private readonly now: () => number = Date.now,
     readonly policy: Policy = DEFAULT_POLICY,
-  ) {}
+  ) {
+    this.deadValue = policy.EMP_DEAD_SCALE > 0 ? scaledEmpirical(policy.EMP_DEAD_SCALE) : undefined;
+  }
 
   /** The fixed flush rule (FLUSH_LEAD_MS), which valuation alpha and the precomputed tables follow. */
   private flushAt(bagTotal: number, durationMs: number): boolean {
@@ -457,7 +462,7 @@ export class SookraBot {
       model.vals.set(key, hit);
       return hit;
     }
-    const v = valuate(this.index, counts, alpha, "leave", this.policy.EXACT_VALUE_NODES);
+    const v = valuate(this.index, counts, alpha, "leave", this.policy.EXACT_VALUE_NODES, this.deadValue);
     if (v.ms > SLOW_VALUATION_MS) {
       this.log(`slow valuation: ${v.ms.toFixed(1)} ms for ${v.rackKey.length} tiles`);
     }
