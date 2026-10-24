@@ -826,7 +826,10 @@ test("round 2 levers are off in DEFAULT_POLICY, and their inputs then change not
     const counts = countsOf(rack);
     return chooseWords(INDEX, { counts, cands: INDEX.scan(counts, true), myBalance, flush: false, realRivals: 5, bagTotal });
   };
-  for (const bag of [undefined, 0, 1, 19, 40]) assert.deepEqual(play("RETAINSQ", 20, bag), [], `bag ${bag}: held`);
+  // Held whatever the bag position, ones no match has included (HOLD_FROM_BAG 999 and CASH_BROKE_AUCTIONS 0 are off).
+  for (const bag of [undefined, 0, 1, 19, 40, 98, 999, 1000, NaN, Infinity, -1]) {
+    assert.deepEqual(play("RETAINSQ", 20, bag), [], `bag ${bag}: held`);
+  }
 });
 
 test("COMPLETE7_PREMIUM: a letter that completes a 7+ word is bid at the factor, the raise capped by a share of the balance", () => {

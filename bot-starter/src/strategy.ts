@@ -120,7 +120,7 @@ export const HOLD_MIN_REAL_RIVALS = 2;
  * Holding (HOLD_MIN_REAL_RIVALS) starts only once fewer than this many
  * auctions are still to come; before that, words of CASH_MIN_LEN+ letters are
  * cashed as they form, so their reward buys letters while most are still to
- * be auctioned. 999 (default): hold for the whole match.
+ * be auctioned. 999 or more (default 999): off, hold for the whole match.
  */
 export const HOLD_FROM_BAG = 999;
 /**
@@ -193,9 +193,11 @@ export const DUEL_RESERVE_WINDOW = 10;
  * COMPLETE7_PREMIUM: when winning the letter lets the bot spell a 7+ letter
  * word it cannot spell now (sevenCompleterMask: a 7+ letter word needs exactly
  * this letter, and the rack plus it packs into more 7+ letter words than the
- * rack alone), the value bid is raised to COMPLETE7_PREMIUM x the bid, but
- * the raise stops at COMPLETE7_CAP_SHARE x the balance (it never lowers a
- * bid). 1: off. Live (rival-data-v4): Chinese Dante wins 61% of the auctions
+ * rack alone), the letter is bid at COMPLETE7_PREMIUM x kappa, so
+ * floor(kappa x COMPLETE7_PREMIUM x delta) (one coin above twice the plain
+ * bid at times, from the rounding), but the raise stops at
+ * COMPLETE7_CAP_SHARE x the balance and never takes the bid below the plain
+ * one. 1: off. Live (rival-data-v4): Chinese Dante wins 61% of the auctions
  * where the letter completes a 7-letter word, against 25% otherwise.
  */
 export const COMPLETE7_PREMIUM = 1;
@@ -516,9 +518,9 @@ export function sevenCompleterMask(index: WordIndex, cands: Candidates, counts: 
  *    rivals (earlyScale);
  *  - round 2 levers, off by default: kappa x DEAD_KAPPA_SCALE on a dead
  *    letter (isDeadLetter), and on a letter that completes a 7+ word
- *    (completes7) the bid raised to COMPLETE7_PREMIUM x itself, the raise
- *    stopping at COMPLETE7_CAP_SHARE x the balance; neither applies at a
- *    sims-only Vickrey table;
+ *    (completes7) kappa x COMPLETE7_PREMIUM, the raise stopping at
+ *    COMPLETE7_CAP_SHARE x the balance; neither applies at a sims-only
+ *    Vickrey table;
  *  - first price (you pay your own bid): shade to min(full bid, estimated
  *    price to win), where the estimate is max(max sim bid + 1, FP_QUANTILE
  *    of recent real-rival winning prices for letters of the same face value
@@ -779,8 +781,10 @@ export function chooseWords(index: WordIndex, input: WordInput): string[] {
   const rem = new Int32Array(input.counts);
   const out: string[] = [];
   let balance = input.myBalance;
-  const hold =
-    (input.realRivals ?? 0) >= p.HOLD_MIN_REAL_RIVALS && (input.bagTotal === undefined || input.bagTotal < p.HOLD_FROM_BAG);
+  // HOLD_FROM_BAG (999 or more: off, so no bag position can reach it) cashes 7+ words while at least that
+  // many auctions are still to come.
+  const cashEarly = p.HOLD_FROM_BAG < 999 && input.bagTotal !== undefined && input.bagTotal >= p.HOLD_FROM_BAG;
+  const hold = (input.realRivals ?? 0) >= p.HOLD_MIN_REAL_RIVALS && !cashEarly;
   // CASH_WHEN_BROKE (0 and 0: off): late in the match every held CASH_MIN_LEN+ word is cashed, and
   // while broke the best one at a time until the balance is back at CASH_BROKE_BALANCE.
   const late = p.CASH_BROKE_AUCTIONS > 0 && input.bagTotal !== undefined && input.bagTotal < p.CASH_BROKE_AUCTIONS;
