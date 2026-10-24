@@ -35,7 +35,7 @@ import {
   validate4,
   validate5,
 } from "./selfplay.js";
-import { DEFAULT_POLICY, sevenCompleterMask } from "./strategy.js";
+import { DEFAULT_POLICY, PACED_KAPPA, sevenCompleterMask } from "./strategy.js";
 
 /** A row with what may differ between equal runs (wall time) or variants (the name) blanked. */
 const content = (r: Row) => JSON.stringify({ ...r, ms: 0, variant: "" });
@@ -48,7 +48,7 @@ test("variants: head is DEFAULT_POLICY; NAME=value overrides that strategy.ts co
   assert.deepEqual(v.overrides, { PACED_KAPPA: 4.5, PACE_MIN: 0.6 });
   assert.deepEqual(v.policy, { ...DEFAULT_POLICY, PACED_KAPPA: 4.5, PACE_MIN: 0.6 });
   assert.ok(Object.isFrozen(v.policy));
-  assert.equal(DEFAULT_POLICY.PACED_KAPPA, 4, "the live policy is untouched");
+  assert.equal(DEFAULT_POLICY.PACED_KAPPA, PACED_KAPPA, "the live policy is untouched");
   assert.deepEqual(parseVariant("CASH_MIN_LEN=99+HOLD_MIN_REAL_RIVALS=99").overrides, { CASH_MIN_LEN: 99, HOLD_MIN_REAL_RIVALS: 99 });
   assert.equal(parseVariant("FP_QUANTILE=1e-1").policy.FP_QUANTILE, 0.1);
   for (const bad of [
