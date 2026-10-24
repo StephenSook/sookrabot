@@ -31,10 +31,14 @@ import {
   type SimStrategy,
   FP_HISTORY_MAX,
   alphaFor,
+  auctionsPerMatch,
   chooseWords,
   decideBid,
   shouldFlush,
 } from "./strategy.js";
+
+/** Starting rack size when match_state does not carry one (game.ts STARTING_RACK_SIZE). */
+const DEFAULT_RACK_SIZE = 5;
 
 type Tagged = { tag: string };
 type Micros = { microsSinceUnixEpoch: bigint };
@@ -682,6 +686,7 @@ export class SookraBot {
       myBalance: balance,
       flush,
       alpha: val.alpha,
+      realRivals: this.opponents(conn, matchId).filter((o) => !o.isSim).length,
     }).filter((w) => (model.wordFailures.get(w) ?? 0) < MAX_WORD_FAILURES);
     for (const w of words) this.submitWord(conn, matchId, model, w, flush);
     return words.length;
@@ -739,6 +744,7 @@ export class SookraBot {
         myBalance: balance,
         opponents,
         fpHistory: this.fpHistory,
+        auctionsPerMatch: auctionsPerMatch(opponents.length + 1, m.startingRackSize ?? DEFAULT_RACK_SIZE),
       });
     } catch (err) {
       this.warn("decideBid", err);

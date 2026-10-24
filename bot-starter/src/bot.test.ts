@@ -214,9 +214,11 @@ test("mid-match: cashes a 7-letter word, then bids from the post-play rack", asy
   await settle();
   assert.deepEqual(s.words, ["QINTARS"]);
   assert.equal(s.participants[0].score, 48n);
-  assert.equal(s.bids.length, 1, "one bid, not re-sent after the word landed");
-  assert.equal(s.bids[0].auctionId, AUCTION);
-  assert.ok(s.bids[0].amount > 0n);
+  // Budget pacing: the reward raises the balance, so the bid is re-sent at most once, at the paced amount.
+  assert.ok(s.bids.length >= 1 && s.bids.length <= 2, "at most one re-send, after the word landed");
+  assert.ok(s.bids.every((b) => b.auctionId === AUCTION));
+  assert.ok(s.bids.at(-1)!.amount > 0n);
+  assert.equal(s.bids.at(-1)!.amount, await referenceBid(s), "final bid = a fresh bot's bid on the post-play state");
 });
 
 test("mid-match: hoards short words and does not resend an unchanged bid", async () => {
@@ -252,8 +254,9 @@ test("1000 ms auctions: flush starts 2 auctions before the end, and those letter
   bot.refresh(s, MATCH);
   await settle();
   assert.deepEqual(s.words, ["SAX"]);
-  assert.equal(s.bids.length, 1);
-  assert.equal(s.bids[0].amount, 42n); // floor(8.5 * 5), leave value 0 while flushing
+  // Leave value 0 while flushing: the O is worth exactly COT's 5 points (the amount is paced).
+  assert.ok(logs.some((l) => /'O' bag 2: bid \d+ \(value 5\.00,/.test(l)));
+  assert.ok(s.bids.length >= 1 && s.bids.every((b) => b.amount > 0n));
   assert.ok(logs.some((l) => l.includes("m1 start: 3 bots (1 real rivals, 1 sims)")));
   // Three auctions out it still hoards.
   const early = setup("CATSX", 3, "O");
@@ -457,7 +460,7 @@ test("offline: no decisions on a stale cache while disconnected", async () => {
   bot.tick(s);
   await settle();
   assert.deepEqual(s.words, ["QINTARS"]);
-  assert.equal(s.bids.length, 1);
+  assert.ok(s.bids.length >= 1 && s.bids.length <= 2); // a paced re-send after the reward lands
 });
 
 test("participant index is used when it agrees with a scan and dropped when it does not", async () => {

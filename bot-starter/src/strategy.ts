@@ -23,10 +23,39 @@ export const KAPPA = 4.25;
 /** Kappa is multiplied by ENDGAME_KAPPA_BOOST when fewer than this many auctions remain. */
 export const ENDGAME_AUCTIONS = 12;
 export const ENDGAME_KAPPA_BOOST = 2;
+/**
+ * Budget pacing at tables with a real rival: kappa is multiplied by
+ * clamp(r ^ PACE_EXPONENT, PACE_MIN, PACE_MAX), where r = (balance / auctions
+ * left including this one) / (STARTING_BALANCE / auctions per match). r is 1
+ * at the first auction; a bot behind an even spend (r > 1) bids more, one
+ * ahead of it (r < 1) bids less, so coins, which score nothing at the end,
+ * are spent down instead of being stranded or run out early.
+ */
+export const PACE_EXPONENT = 0.5;
+export const PACE_MIN = 0.5;
+export const PACE_MAX = 3;
+/**
+ * Base kappa while pacing (in place of KAPPA, which stays the kappa of the
+ * unpaced rule and of the Python cross-check), still doubled in the last
+ * ENDGAME_AUCTIONS auctions.
+ */
+export const PACED_KAPPA = 4;
+/** Every bot starts a match with this balance (game.ts STARTING_BALANCE). */
+export const STARTING_BALANCE = 100;
+/** Tiles in the bag at the start of a match (letters.ts DEFAULT_BAG). */
+export const BAG_TILES = 98;
 /** Weight of the leave value of held tiles (sim: 0.35 best; 0 scored 107 vs 314). */
 export const LEAVE_ALPHA = 0.35;
 /** Cash any word of at least this many letters as soon as it forms (multiplier saturates at 7). */
 export const CASH_MIN_LEN = 7;
+/**
+ * At tables with at least this many real rivals, no word is cashed before the
+ * end-of-match flush except the liquidity word below: every tile stays
+ * available to the final packing (the live all-real table leader,
+ * YeziShanYang, scores 62% of its points after auction 46). Duels and
+ * sim-padded tables keep CASH_MIN_LEN.
+ */
+export const HOLD_MIN_REAL_RIVALS = 2;
 /**
  * Below this balance (after cashing), also cash one word: preferably of
  * LIQUIDITY_MIN_LEN+ letters, else of any length (LIQUIDITY_FALLBACK_MIN_LEN),
@@ -110,6 +139,8 @@ export interface BidInput {
   opponents: Opponent[];
   /** First-price prices paid by real rivals, oldest first. */
   fpHistory?: PricePoint[];
+  /** Auctions in this match (auctionsPerMatch()); budget pacing is off when absent. */
+  auctionsPerMatch?: number;
 }
 
 export interface BidDecision {
@@ -135,8 +166,25 @@ function quantile(xs: number[], q: number): number {
   return s[pos];
 }
 
-export function kappaFor(bagTotal: number): number {
-  return bagTotal < ENDGAME_AUCTIONS ? KAPPA * ENDGAME_KAPPA_BOOST : KAPPA;
+export function kappaFor(bagTotal: number, base = KAPPA): number {
+  return bagTotal < ENDGAME_AUCTIONS ? base * ENDGAME_KAPPA_BOOST : base;
+}
+
+/** Pacing is on at tables with a real rival once the match length is known. */
+function pacingOn(simsOnly: boolean, auctions: number | undefined): boolean {
+  return !simsOnly && auctions !== undefined && auctions > 0;
+}
+
+/** Auctions in a match: every tile not dealt into a starting rack is auctioned once. */
+export function auctionsPerMatch(seats: number, startingRackSize: number): number {
+  return Math.max(1, BAG_TILES - startingRackSize * seats);
+}
+
+/** Budget pacing multiplier on kappa (see PACE_EXPONENT); 1 when the match length is unknown. */
+export function paceMultiplier(balance: number, bagTotal: number, auctions: number | undefined): number {
+  if (auctions === undefined || !(auctions > 0) || !(bagTotal >= 0)) return 1;
+  const r = Math.max(0, balance) / (bagTotal + 1) / (STARTING_BALANCE / auctions);
+  return Math.min(PACE_MAX, Math.max(PACE_MIN, r ** PACE_EXPONENT));
 }
 
 /** Highest bid this opponent can place right now (real bots: their whole balance). */
@@ -165,7 +213,8 @@ export function duelReserve(opponentCount: number, bagTotal: number): number {
  *  - every rival can bid at most BROKE_RIVAL_MAX_BID (public balances, sim
  *    rules): bid exactly their max + 1, the minimum that wins;
  *  - sims-only table (Vickrey): min(floor(SIM_ONLY_KAPPA * delta), max sim bid + 1);
- *  - otherwise floor(kappa * delta), kappa doubled in the last 12 auctions;
+ *  - otherwise floor(kappa * delta), kappa doubled in the last 12 auctions
+ *    and multiplied by the budget pacing factor (paceMultiplier);
  *  - first price (you pay your own bid): shade to min(full bid, estimated
  *    price to win), where the estimate is max(max sim bid + 1, FP_QUANTILE
  *    of recent real-rival winning prices for letters of the same face value
@@ -199,7 +248,7 @@ export function decideBid(input: BidInput): BidDecision {
     amount = rivalCap;
     reason = `rivals broke (max ${rivalMax})`;
   } else {
-    ({ amount, reason } = valueBid(input, rivalCap));
+    ({ amount, reason } = valueBid(input, rivalCap, balance));
   }
   // The duel reserve applies to every branch, the broke-rival one included.
   const reserve = duelReserve(input.opponents.length, input.bagTotal);
@@ -214,15 +263,18 @@ export function decideBid(input: BidInput): BidDecision {
   return { amount: clamp(amount), reason };
 }
 
-/** Bid from the marginal value (kappa, sims-only cap, first-price shading), capped at rivalCap. */
-function valueBid(input: BidInput, rivalCap: number): BidDecision {
+/** Bid from the marginal value (kappa, pacing, sims-only cap, first-price shading), capped at rivalCap. */
+function valueBid(input: BidInput, rivalCap: number, balance: number): BidDecision {
   const sims = input.opponents.filter((o) => o.isSim && o.strategy);
   const simCap = sims.length
     ? Math.max(...sims.map((o) => maxSimBid(o.strategy!, input.letter, o.balance))) + 1
     : 0;
   const simsOnly = input.opponents.length > 0 && sims.length === input.opponents.length;
-  const kappa = kappaFor(input.bagTotal);
-  const full = Math.floor(kappa * input.delta);
+  const paced = pacingOn(simsOnly, input.auctionsPerMatch);
+  const pace = paced ? paceMultiplier(balance, input.bagTotal, input.auctionsPerMatch) : 1;
+  const base = kappaFor(input.bagTotal, paced ? PACED_KAPPA : KAPPA);
+  const kappa = +(base * pace).toFixed(4);
+  const full = Math.floor(base * pace * input.delta);
 
   let amount: number;
   let reason: string;
@@ -281,6 +333,8 @@ export interface WordInput {
   flush: boolean;
   /** Leave weight used to judge what a liquidity play leaves behind (default LEAVE_ALPHA). */
   alpha?: number;
+  /** Real (non-sim) rivals at the table; HOLD_MIN_REAL_RIVALS or more holds words for the flush. */
+  realRivals?: number;
 }
 
 /**
@@ -336,7 +390,8 @@ export function chooseWords(index: WordIndex, input: WordInput): string[] {
   const rem = new Int32Array(input.counts);
   const out: string[] = [];
   let balance = input.myBalance;
-  for (;;) {
+  const hold = (input.realRivals ?? 0) >= HOLD_MIN_REAL_RIVALS;
+  while (!hold) {
     const k = index.bestKey(input.cands, rem, CASH_MIN_LEN);
     if (k < 0) break;
     out.push(index.words[k]);

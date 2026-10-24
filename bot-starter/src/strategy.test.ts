@@ -27,15 +27,55 @@ import {
   KAPPA,
   LIQUIDITY_FALLBACK_MIN_LEN,
   LIQUIDITY_FLOOR,
+  HOLD_MIN_REAL_RIVALS,
+  PACED_KAPPA,
+  PACE_MAX,
+  PACE_MIN,
   type Opponent,
+  auctionsPerMatch,
   chooseWords,
   decideBid,
   duelReserve,
   kappaFor,
   maxPossibleBid,
   maxSimBid,
+  paceMultiplier,
   shouldFlush,
 } from "./strategy.js";
+
+test("budget pacing: kappa scales with the balance left per remaining auction", () => {
+  assert.equal(auctionsPerMatch(6, 5), 68);
+  assert.equal(auctionsPerMatch(2, 5), 88);
+  assert.equal(paceMultiplier(100, 67, 68), 1); // first auction of a 6-bot match: even spend
+  assert.equal(paceMultiplier(100, 30, undefined), 1); // match length unknown: pacing off
+  assert.ok(Math.abs(paceMultiplier(25, 33, 68) - Math.sqrt(25 / 34 / (100 / 68))) < 1e-12);
+  assert.equal(paceMultiplier(0, 30, 68), PACE_MIN);
+  assert.equal(paceMultiplier(1000, 1, 68), PACE_MAX);
+  const real: Opponent[] = Array.from({ length: 5 }, () => ({ isSim: false, balance: 100 }));
+  const bid = (myBalance: number, bagTotal: number) =>
+    decideBid({ letter: "S", delta: 6, bagTotal, auctionType: "Vickrey", myBalance, opponents: real, auctionsPerMatch: 68 })
+      .amount;
+  assert.equal(bid(100, 67), Math.floor(PACED_KAPPA * 6)); // even spend: the paced base kappa
+  assert.equal(bid(20, 40), Math.floor(PACED_KAPPA * paceMultiplier(20, 40, 68) * 6)); // ahead of even spend
+  assert.ok(bid(20, 40) < Math.floor(PACED_KAPPA * 6));
+  assert.ok(bid(60, 20) > Math.floor(PACED_KAPPA * 6)); // behind even spend: bids more
+  const endgame = decideBid({
+    letter: "S", delta: 1, bagTotal: 5, auctionType: "Vickrey", myBalance: 30, opponents: real, auctionsPerMatch: 68,
+  }).amount;
+  assert.equal(endgame, Math.floor(PACED_KAPPA * 2 * paceMultiplier(30, 5, 68) * 1)); // endgame boost kept (14)
+  // Without a match length (as in the rules below and the Python cross-check) the unpaced KAPPA rule holds.
+  assert.equal(
+    decideBid({ letter: "S", delta: 6, bagTotal: 40, auctionType: "Vickrey", myBalance: 100, opponents: real }).amount,
+    Math.floor(KAPPA * 6),
+  );
+  // Sims-only tables keep their own rule.
+  const sims: Opponent[] = [{ isSim: true, strategy: "Aggressive", balance: 100 }];
+  assert.equal(
+    decideBid({ letter: "E", delta: 3, bagTotal: 30, auctionType: "Vickrey", myBalance: 100, opponents: sims, auctionsPerMatch: 88 })
+      .amount,
+    8,
+  );
+});
 
 const WORDLIST = fs
   .readFileSync(new URL("../../spacetimedb/wordlist.txt", import.meta.url), "utf8")
@@ -431,6 +471,20 @@ test("chooseWords: hoards short words, cashes 7+, flushes everything at the end"
   // Flush plays the greedy packing.
   const flush = play("EEIIOUA", 50, true);
   assert.deepEqual(flush.map((w) => w.split("").sort().join("")), ["AEU", "EO"]);
+});
+
+test("chooseWords: with HOLD_MIN_REAL_RIVALS real rivals, words wait for the flush (liquidity aside)", () => {
+  const play = (rack: string, myBalance: number, flush: boolean, realRivals: number) => {
+    const counts = countsOf(rack);
+    return chooseWords(INDEX, { counts, cands: INDEX.scan(counts, false), myBalance, flush, realRivals });
+  };
+  assert.equal(HOLD_MIN_REAL_RIVALS, 2);
+  assert.deepEqual(play("RETAINSQ", 100, false, 1), ["QINTARS"]); // duel: cash the 7 at once
+  assert.deepEqual(play("RETAINSQ", 100, false, 5), []); // all-real table: hold it
+  const liq = play("QUAKES", 3, false, 5); // broke: the liquidity word still goes
+  assert.equal(liq.length, 1);
+  assert.ok(liq[0].length >= 5);
+  assert.ok(play("RETAINSQ", 100, true, 5).includes("QINTARS")); // the flush plays everything
 });
 
 // ---- speed ----
