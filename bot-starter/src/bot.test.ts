@@ -915,12 +915,38 @@ test("duel: a cash-poor bot's paced bid is held at PACE_MIN_DUEL (the 3-game fin
   assert.equal(s.bids.length, 1);
   assert.equal(s.bids[0].amount, BigInt(Math.floor(PACED_KAPPA * PACE_MIN_DUEL * delta))); // 18
   assert.ok(logs.some((l) => l.includes("'R' bag 70: bid 18 (value 6.00")));
-  // With a sim seated (3 bots, 83 auctions) there is no duel floor: 4 x sqrt(40 / 71 / (100 / 83)) x 6 = 16.
+  // With a sim seated (3 bots, 83 auctions) there is no duel floor: 4 x sqrt(40 / 71 / (100 / 83)) = 2.74,
+  // which would bid 16; auction index 12 is inside the early window and the sim makes two rivals, so the
+  // early cut applies: 2.74 x 0.4 x 6, so 6.
   const three = setup("AEINST", 70, "R");
   three.s.balance(ME, 40);
   three.bot.refresh(three.s, MATCH);
   await settle();
-  assert.equal(three.s.bids.at(-1)!.amount, 16n);
+  assert.equal(three.s.bids.at(-1)!.amount, 6n);
+});
+
+test("early bid cut: a six-bot all-real table bids 0.4 of the paced kappa for 28 auctions; a duel is exempt", async () => {
+  // Six seats with 5-tile racks: 68 auctions. AEINST values R at 6.
+  const six = setup("AEINST", 67, "R", { withSim: false });
+  for (const id of [11n, 12n, 13n, 14n]) {
+    six.s.bots.set(id, { name: `Rival${id}`, isSimulated: false, strategy: { tag: "Human" } });
+    six.s.participants.push({ matchId: MATCH, botId: id, balance: 100n, score: 0n });
+  }
+  six.bot.refresh(six.s, MATCH);
+  await settle();
+  // First auction (index 0), even spend: kappa 4 x 0.4 = 1.6, floor(1.6 x 6) = 9 (24 without the cut).
+  assert.equal(six.s.bids.at(-1)!.amount, 9n);
+  // Index 28 (39 auctions to come), still 100 coins: past the window, 4 x sqrt(1.7) = 5.215, so 31.
+  six.s.nextAuction(AUCTION + 1n, "R", 39);
+  six.bot.refresh(six.s, MATCH);
+  await settle();
+  assert.equal(six.s.bids.at(-1)!.auctionId, AUCTION + 1n);
+  assert.equal(six.s.bids.at(-1)!.amount, 31n);
+  // A duel's first auction (88 auctions) keeps the full paced kappa: 4 x 6 = 24.
+  const duel = setup("AEINST", 87, "R", { withSim: false });
+  duel.bot.refresh(duel.s, MATCH);
+  await settle();
+  assert.equal(duel.s.bids.at(-1)!.amount, 24n);
 });
 
 test("sims-only table bids up to the sim cap", async () => {
