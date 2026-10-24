@@ -262,7 +262,48 @@ test("a failed re-floor keeps the current window; a failed window or base asks f
   assert.deepEqual(events, ["error:Error: removed"]);
   events.length = 0;
   handles[0].fail(new Error("base gone"));
-  assert.deepEqual(events, ["error:Error: base gone"]);
+  assert.deepEqual(events, [], "a failed plan reports one error; the resubscribe replaces it");
+
+  const other = harness();
+  other.plan.start();
+  other.handles[0].apply();
+  other.handles[0].fail(new Error("base gone"));
+  assert.deepEqual(other.events, ["error:Error: base gone"]);
+});
+
+test("a plan whose base failed never reports ready again, even when its window replays", () => {
+  // Codex round 3: a replay where the base fails and the window survives
+  // reports the error; if a second drop cancels the resubscribe, the next
+  // replay holds only the window. It must not mark the bot ready without
+  // the base (credential, bot table, rack, lobby memberships).
+  const { plan, handles, events } = harness();
+  plan.start();
+  handles[0].apply();
+  handles[1].apply();
+  plan.openWindow(9n, [1n, 2n, 3n], NOW);
+  handles[2].apply();
+  assert.deepEqual(events, ["base", "ready"]);
+  events.length = 0;
+  // First replay: the SDK emits the window's apply, then the base's failure.
+  handles[2].apply();
+  handles[0].fail(new Error("base replay refused"));
+  assert.deepEqual(events, ["ready", "error:Error: base replay refused"]);
+  events.length = 0;
+  // Second replay: only the window comes back.
+  handles[2].apply();
+  assert.deepEqual(events, [], "no readiness without the base");
+  assert.equal(handles[2].unsubscribes, 0, "its rows stay for the resubscribe to overlap");
+});
+
+test("the window reports ready only while the base is applied", () => {
+  const { plan, handles, events } = harness();
+  plan.start();
+  handles[0].apply();
+  handles[1].apply();
+  plan.openWindow(9n, [1n, 2n, 3n], NOW);
+  handles[0].active = false; // the base dropped out underneath (no callback yet)
+  handles[2].apply();
+  assert.deepEqual(events, ["base"]);
 });
 
 test("stop drops every applied handle; late applies retire themselves and report nothing", () => {

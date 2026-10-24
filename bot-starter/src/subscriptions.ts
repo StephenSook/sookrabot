@@ -269,6 +269,10 @@ export class TargetedSubscription {
           this.hooks.log(`re-floor failed (${err instanceof Error ? err.message : String(err)}); keeping the current window`);
           return;
         }
+        // A required handle failed: this plan never reports ready again (a
+        // later replay of its surviving window included). Its handles stay,
+        // silent, so their rows overlap the resubscribe that replaces it.
+        this.quiesced = true;
         this.hooks.onError(err);
       },
     );
@@ -290,6 +294,8 @@ export class TargetedSubscription {
           );
           return;
         }
+        // Ready needs the base too (credential, bot table, rack, lobby memberships).
+        if (!this.base?.handle?.isActive()) return;
         // The seed did its job; the window holds the seats from our floor on.
         if (this.seed) {
           drop(this.seed.handle);
