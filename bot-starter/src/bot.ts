@@ -200,6 +200,8 @@ interface MatchModel {
   pool: PoolTracker;
   /** Multi-letter lookahead values (MLOOK_M), by auction, rack and alpha. */
   mlook: Map<string, number>;
+  /** Duel rival bids seen this match (SPITE_ALPHA): exact when we won (its bid set our price), else a lower bound. */
+  rivalBids: { face: number; bid: number }[];
 }
 
 function newModel(): MatchModel {
@@ -229,6 +231,7 @@ function newModel(): MatchModel {
     recvLags: [],
     pool: new PoolTracker(),
     mlook: new Map(),
+    rivalBids: [],
   };
 }
 
@@ -677,6 +680,13 @@ export class SookraBot {
       const model = this.models.get(String(r.matchId));
       if (!model) return;
       const mine = model.lastBid.get(String(r.auctionId));
+      if (this.policy.SPITE_ALPHA > 0 && m?.auctionType.tag === "Vickrey" && winner !== undefined) {
+        // Vickrey: when we win, the price is the rival's bid; when it wins, its bid was at least ours.
+        const face = LETTER_VALUE[r.letter] ?? 1;
+        if (winner === this.myBotId) model.rivalBids.push({ face, bid: Number(r.paid) });
+        else if (mine !== undefined && mine > 0) model.rivalBids.push({ face, bid: mine });
+        if (model.rivalBids.length > 60) model.rivalBids.shift();
+      }
       const who = winner === undefined ? "nobody" : winner === this.myBotId ? "US" : `bot ${winner}`;
       this.log(
         `m${r.matchId} a${r.auctionId} '${r.letter}' -> ${who} paid ${r.paid}` +
@@ -1002,7 +1012,13 @@ export class SookraBot {
     const key = String(auction.id);
     // What the round 2 levers read about this letter on this rack, only while they are on
     // (`val`: the table of exactly this rack the delta comes from, else nothing is known).
-    const extras: { completes7?: boolean; leaveAlpha?: number } = {};
+    const extras: { completes7?: boolean; leaveAlpha?: number; rivalBidHint?: number } = {};
+    if (this.policy.SPITE_ALPHA > 0) {
+      // The duel rival's predicted bid on this letter: the median of its bids seen on letters of the same face.
+      const face = LETTER_VALUE[auction.letter] ?? 1;
+      const same = model.rivalBids.filter((b) => b.face === face).map((b) => b.bid).sort((a, b) => a - b);
+      if (same.length >= this.policy.SPITE_MIN_OBS) extras.rivalBidHint = same[Math.floor((same.length - 1) / 2)];
+    }
     if (val !== undefined) {
       const li = letterIndex(auction.letter);
       const mask = this.policy.COMPLETE7_PREMIUM !== 1 ? this.sevenMasks.get(val) : undefined;

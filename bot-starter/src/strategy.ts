@@ -338,6 +338,17 @@ export const MLOOK_SCALE = 1;
 /** EARLY_RAMP 1: the early cut ramps linearly up to 1 over the window instead of a step (earlyScale). 0: step. */
 export const EARLY_RAMP = 0;
 /**
+ * SPITE_ALPHA: in a Vickrey duel (the 3-game final), when the rival's predicted bid on the letter
+ * (median of its bids seen this match on letters of the same face, at least SPITE_MIN_OBS of them) is
+ * above ours, bid ours + SPITE_ALPHA x (predicted - ours), capped at SPITE_CAP x ours, tapering to 0
+ * over the last SPITE_HORIZON auctions: our bid is the rival's price, so it pays more (Brandt,
+ * Sandholm and Shoham 2007). 0: off.
+ */
+export const SPITE_ALPHA = 0;
+export const SPITE_CAP = 1.5;
+export const SPITE_HORIZON = 15;
+export const SPITE_MIN_OBS = 3;
+/**
  * SPEND_FLOOR: every value bid (paced, Vickrey, at tables of at least
  * SPEND_FLOOR_MIN_REAL_RIVALS real rivals) is raised by
  * floor(SPEND_FLOOR x balance / auctions left including this one), an even
@@ -403,6 +414,10 @@ export interface Policy {
   readonly MLOOK_TILT: number;
   readonly MLOOK_SCALE: number;
   readonly EARLY_RAMP: number;
+  readonly SPITE_ALPHA: number;
+  readonly SPITE_CAP: number;
+  readonly SPITE_HORIZON: number;
+  readonly SPITE_MIN_OBS: number;
   readonly SPEND_FLOOR: number;
   readonly SPEND_FLOOR_MIN_REAL_RIVALS: number;
 }
@@ -459,6 +474,10 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   MLOOK_TILT,
   MLOOK_SCALE,
   EARLY_RAMP,
+  SPITE_ALPHA,
+  SPITE_CAP,
+  SPITE_HORIZON,
+  SPITE_MIN_OBS,
   SPEND_FLOOR,
   SPEND_FLOOR_MIN_REAL_RIVALS,
 });
@@ -503,6 +522,8 @@ export interface BidInput {
    * when COMPLETE7_PREMIUM is on; absent: unknown, no premium.
    */
   completes7?: boolean;
+  /** Predicted bid of a duel rival on this letter (SPITE_ALPHA); absent: unknown, no spite. */
+  rivalBidHint?: number;
   /**
    * Leave weight of the valuation the delta comes from (Valuation.alpha), for
    * isDeadLetter. Read only when DEAD_KAPPA_SCALE is on; absent: never dead.
@@ -714,6 +735,26 @@ export function decideBid(input: BidInput): BidDecision {
     reason = `rivals broke (max ${rivalMax})`;
   } else {
     ({ amount, reason } = valueBid(input, rivalCap, balance, p));
+  }
+  // Round 3 lever, off by default (SPITE_ALPHA 0): in a Vickrey duel, when the rival is predicted to outbid us,
+  // raise our bid (its price) toward its predicted bid, capped at SPITE_CAP x our own bid, tapering to 0 over
+  // the last SPITE_HORIZON auctions (coins drained at the end are worth nothing).
+  const hint = input.rivalBidHint;
+  if (
+    p.SPITE_ALPHA > 0 &&
+    hint !== undefined &&
+    input.auctionType === "Vickrey" &&
+    input.opponents.length === 1 &&
+    !input.opponents[0].isSim &&
+    amount > 0 &&
+    hint > amount
+  ) {
+    const a = p.SPITE_ALPHA * Math.min(1, input.bagTotal / Math.max(1, p.SPITE_HORIZON));
+    const spite = Math.min(Math.floor(amount + a * (hint - amount)), Math.floor(p.SPITE_CAP * amount), rivalCap);
+    if (spite > amount) {
+      amount = spite;
+      reason += ` spite ${hint}`;
+    }
   }
   // The duel reserve applies to every branch, the broke-rival one included.
   const reserve = duelReserve(input.opponents.length, input.bagTotal, p);
