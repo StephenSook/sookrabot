@@ -38,12 +38,15 @@ export interface MatchStateRow {
   bagTotal: number;
   auctionType: Tagged;
   auctionDurationMs: bigint;
+  startingRackSize?: number;
 }
 export interface AuctionRow {
   id: bigint;
   matchId: bigint;
   letter: string;
   status: Tagged;
+  /** Server close time; compared with the local clock only for logging. */
+  closesAt?: { microsSinceUnixEpoch: bigint };
 }
 export interface ParticipantRow {
   matchId: bigint;
@@ -110,6 +113,7 @@ interface MatchModel {
   nextPendingId: number;
   wordFailures: Map<string, number>;
   submitted: number;
+  announced: boolean;
 }
 
 function newModel(): MatchModel {
@@ -122,6 +126,7 @@ function newModel(): MatchModel {
     nextPendingId: 1,
     wordFailures: new Map(),
     submitted: 0,
+    announced: false,
   };
 }
 
@@ -344,6 +349,15 @@ export class SookraBot {
 
   // ---- the decision loop ----
 
+  private logMatchStart(conn: ConnLike, m: MatchStateRow) {
+    const opps = this.opponents(conn, m.id);
+    const sims = opps.filter((o) => o.isSim).length;
+    this.log(
+      `m${m.id} start: ${opps.length + 1} bots (${opps.length - sims} real rivals, ${sims} sims), ` +
+        `${m.auctionType.tag}, auction ${m.auctionDurationMs} ms, rack ${m.startingRackSize ?? "?"}, bag ${m.bagTotal}`,
+    );
+  }
+
   /** Value the rack, play any words due, then bid on the open auction. */
   refresh(conn: ConnLike, matchId: bigint) {
     if (this.myBotId === null) return;
@@ -352,6 +366,10 @@ export class SookraBot {
     const me = this.myParticipant(conn, matchId);
     if (!me) return;
     const model = this.modelFor(matchId);
+    if (!model.announced) {
+      model.announced = true;
+      this.logMatchStart(conn, m);
+    }
     const row = m.currentAuctionId !== undefined ? conn.db.auction.id.find(m.currentAuctionId) : undefined;
     const open = row && row.status.tag === "Open" && row.matchId === matchId ? row : undefined;
     const bagTotal = Number(m.bagTotal);
@@ -470,9 +488,13 @@ export class SookraBot {
       return;
     }
     model.lastBid.set(key, amount);
+    // Time to close by the local clock (includes any clock skew); a value near
+    // or below 0 explains "Auction closed" refusals.
+    const closeUs = auction.closesAt?.microsSinceUnixEpoch;
+    const left = closeUs !== undefined ? `, ${Math.round(Number(closeUs) / 1000 - this.now())} ms left` : "";
     this.log(
       `m${m.id} a${key} '${auction.letter}' bag ${bagTotal}: bid ${amount} ` +
-        `(value ${delta.toFixed(2)}, ${decision.reason}${prev !== undefined ? `, was ${prev}` : ""})`,
+        `(value ${delta.toFixed(2)}, ${decision.reason}${prev !== undefined ? `, was ${prev}` : ""}${left})`,
     );
     try {
       conn.reducers

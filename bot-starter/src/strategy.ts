@@ -40,9 +40,12 @@ export const SIM_BID_JITTER = 2;
 /**
  * Start dumping the whole packing once the match will end within this many
  * ms: at bagTotal 0 always, and earlier when auctions are short, so word
- * plays reach the server before the final auction closes.
+ * plays reach the server before the final auction closes. 3000 ms means the
+ * last 3 auctions at 1000 ms and the last 12 at 250 ms: the live starter log
+ * had 70 of 1,027 bids refused "Auction closed", and a late flush loses the
+ * whole hoard while an early one only strands the last few letters.
  */
-export const FLUSH_LEAD_MS = 2000;
+export const FLUSH_LEAD_MS = 3000;
 /** First-price shading: recent rival prices kept, minimum sample, quantile. */
 export const FP_HISTORY_MAX = 40;
 export const FP_MIN_OBS = 5;

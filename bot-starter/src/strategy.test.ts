@@ -22,6 +22,7 @@ import {
   DUEL_MAX_OPPONENTS,
   DUEL_RESERVE_PER_AUCTION,
   DUEL_RESERVE_WINDOW,
+  FLUSH_LEAD_MS,
   KAPPA,
   type Opponent,
   chooseWords,
@@ -278,13 +279,15 @@ test("duel rule: one rival means a cash reserve sized to the remaining auctions"
 // ---- word play ----
 
 test("shouldFlush: always at the final auction, earlier for short auctions", () => {
+  assert.equal(FLUSH_LEAD_MS, 3000);
   assert.equal(shouldFlush(0, 1000), true);
-  assert.equal(shouldFlush(1, 1000), true);
-  assert.equal(shouldFlush(2, 1000), false);
-  assert.equal(shouldFlush(7, 250), true);
-  assert.equal(shouldFlush(8, 250), false);
+  assert.equal(shouldFlush(2, 1000), true);
+  assert.equal(shouldFlush(3, 1000), false);
+  assert.equal(shouldFlush(11, 250), true);
+  assert.equal(shouldFlush(12, 250), false);
   assert.equal(shouldFlush(0, 10000), true);
   assert.equal(shouldFlush(1, 10000), false);
+  assert.equal(shouldFlush(2, 0), true); // unknown duration is treated as 1000 ms
   assert.equal(shouldFlush(3, 0), false);
 });
 
