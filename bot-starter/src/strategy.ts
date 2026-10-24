@@ -321,6 +321,15 @@ export const MLOOK_RATE = 0.2;
 export const MLOOK_SAMPLES = 16;
 export const MLOOK_ALPHA_SCALE = 1;
 export const MLOOK_TILT = 0;
+/**
+ * SPEND_FLOOR: every value bid (paced, Vickrey, at tables of at least
+ * SPEND_FLOOR_MIN_REAL_RIVALS real rivals) is raised by
+ * floor(SPEND_FLOOR x balance / auctions left including this one), an even
+ * share of the purse, so letters nobody else wants are bought at the
+ * runner-up price (the rival gaucho bot's tuned pace term, 0.738). 0: off.
+ */
+export const SPEND_FLOOR = 0;
+export const SPEND_FLOOR_MIN_REAL_RIVALS = 2;
 
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
@@ -376,6 +385,8 @@ export interface Policy {
   readonly MLOOK_SAMPLES: number;
   readonly MLOOK_ALPHA_SCALE: number;
   readonly MLOOK_TILT: number;
+  readonly SPEND_FLOOR: number;
+  readonly SPEND_FLOOR_MIN_REAL_RIVALS: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -428,6 +439,8 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   MLOOK_SAMPLES,
   MLOOK_ALPHA_SCALE,
   MLOOK_TILT,
+  SPEND_FLOOR,
+  SPEND_FLOOR_MIN_REAL_RIVALS,
 });
 
 // ---- Types ----
@@ -736,6 +749,19 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
     if (raised > full) {
       full = raised;
       tag += ` c7 x${p.COMPLETE7_PREMIUM}`;
+    }
+  }
+  // Round 3 lever, off by default (SPEND_FLOOR 0): an additive spend floor per auction.
+  if (
+    p.SPEND_FLOOR > 0 &&
+    paced &&
+    input.auctionType === "Vickrey" &&
+    realRivals >= p.SPEND_FLOOR_MIN_REAL_RIVALS
+  ) {
+    const add = Math.floor((p.SPEND_FLOOR * balance) / (input.bagTotal + 1));
+    if (add > 0) {
+      full += add;
+      tag += ` floor+${add}`;
     }
   }
 
