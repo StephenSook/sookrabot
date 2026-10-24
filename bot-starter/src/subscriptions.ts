@@ -300,11 +300,14 @@ export class TargetedSubscription {
         // so a base refused in the same replay is known only once the message
         // is done. The rows and their insert callbacks are already in place
         // by then; index.ts's onReady runs bot.tick at once, which refreshes
-        // (and bids on) an auction that opened meanwhile.
+        // (and bids on) an auction that opened meanwhile. The check is on the
+        // current window: a replay that also applies a pending re-floor
+        // promotes it in the same message, and that must not cancel readiness.
         queueMicrotask(() => {
-          if (this.stopped || this.quiesced || entry !== this.window) return;
+          const window = this.window;
+          if (this.stopped || this.quiesced || window === null) return;
           // Ready needs the base too (credential, bot table, rack, lobby memberships).
-          if (!this.base?.handle?.isActive() || !entry.handle?.isActive()) return;
+          if (!this.base?.handle?.isActive() || !window.handle?.isActive()) return;
           // The seed did its job; the window holds the seats from our floor on.
           if (this.seed) {
             drop(this.seed.handle);

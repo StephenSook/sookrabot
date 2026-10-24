@@ -252,6 +252,30 @@ test("re-floor: a new window replaces the old only once applied; small moves are
   assert.equal(handles[4].queries[0].includes("mp.match_id >= 20"), true);
 });
 
+test("a reconnect replay with a re-floor pending reports ready once, on the promoted window", async () => {
+  // Codex round 5: the replay applies the base, the old window and the
+  // pending re-floor in one message; the pending one is promoted on the way.
+  // Readiness must still come, or the bot sits offline until the supervisor
+  // replaces the connection.
+  const { plan, handles, events } = harness();
+  plan.start();
+  handles[0].apply();
+  handles[1].apply();
+  plan.openWindow(9n, [10n, 20n, 30n], NOW);
+  handles[2].apply();
+  await settle();
+  assert.equal(plan.refloor([10n, 20n, 30n, 40n], NOW), true);
+  events.length = 0;
+  // The drop and the replay, before the re-floor was applied.
+  handles[0].apply();
+  handles[2].apply();
+  handles[3].apply();
+  await settle();
+  assert.deepEqual(events, ["base", "log:window re-floored", "ready"]);
+  assert.equal(plan.floors!.mine, 20n);
+  assert.equal(handles[2].unsubscribes, 1, "the old window is dropped once the new one holds the rows");
+});
+
 test("a failed re-floor keeps the current window; a failed window or base asks for a resubscribe", async () => {
   const { plan, handles, events } = harness();
   plan.start();
