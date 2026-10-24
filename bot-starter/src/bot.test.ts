@@ -36,6 +36,14 @@ class FakeDisconnected extends Error {
   }
 }
 
+/** Shaped like the SDK's "connection lost before the call was acknowledged; it may or may not have run". */
+class FakeUnknownResult extends Error {
+  constructor() {
+    super("Connection lost before the call was acknowledged; it may or may not have run");
+    this.name = "UnknownCallResultError";
+  }
+}
+
 class FakeServer implements ConnLike {
   matchStates = new Map<bigint, MatchStateRow>();
   auctions = new Map<bigint, AuctionRow>();
@@ -49,6 +57,8 @@ class FakeServer implements ConnLike {
   bidRefusal: string | null = null;
   /** Transport failure for bids (never reaches the server). */
   bidTransportDown = false;
+  /** The next bid executes on the server but its acknowledgement is lost. */
+  bidUnknownOnce = false;
   refuseWords: string | null = null;
   wordTransportDown = false;
   throwOnRack = false;
@@ -73,6 +83,10 @@ class FakeServer implements ConnLike {
       if (this.bidTransportDown) throw new FakeDisconnected();
       if (this.bidRefusal) throw new Error(this.bidRefusal);
       this.bids.push(a);
+      if (this.bidUnknownOnce) {
+        this.bidUnknownOnce = false;
+        throw new FakeUnknownResult();
+      }
     },
     submitWord: (a: { matchId: bigint; word: string }): Promise<unknown> => {
       this.wordAttempts++;
@@ -313,6 +327,41 @@ test("a bid lost in transport is re-sent; a refused-as-late bid is not", async (
   late.bot.refresh(late.s, MATCH);
   await settle();
   assert.equal(late.s.bids.length, 0, "no pointless retry on a closed auction");
+});
+
+test("a bid whose acknowledgement was lost is re-sent as desired, even unchanged or a 0 withdrawal", async () => {
+  // Racks of a lone Q: no word exists, so the liquidity rule cannot change the rack.
+  // First positive bid executes but its ack is lost; then we no longer want the letter.
+  const a = setup("Q", 30, "S");
+  a.s.bidUnknownOnce = true;
+  a.bot.refresh(a.s, MATCH);
+  await settle();
+  assert.equal(a.s.bids.length, 1);
+  assert.ok(a.s.bids[0].amount > 0n, "the server holds this bid");
+  a.s.balance(ME, 0); // desired bid is now 0
+  a.bot.refresh(a.s, MATCH);
+  await settle();
+  assert.equal(a.s.bids.at(-1)!.amount, 0n, "withdrawal sent despite no confirmed bid");
+
+  // A confirmed bid X, then a replacement Y executes with its ack lost, then X is wanted again.
+  const b = setup("Q", 30, "S");
+  b.bot.refresh(b.s, MATCH);
+  await settle();
+  const x = b.s.bids.at(-1)!.amount;
+  b.s.balance(ME, 3);
+  b.s.bidUnknownOnce = true;
+  b.bot.refresh(b.s, MATCH);
+  await settle();
+  assert.equal(b.s.bids.at(-1)!.amount, 3n, "server now holds the replacement");
+  b.s.balance(ME, 100);
+  b.bot.refresh(b.s, MATCH);
+  await settle();
+  assert.equal(b.s.bids.at(-1)!.amount, x, "X re-sent although it was the last confirmed amount");
+  // Once acknowledged, normal dedupe resumes.
+  const n = b.s.bids.length;
+  b.bot.refresh(b.s, MATCH);
+  await settle();
+  assert.equal(b.s.bids.length, n);
 });
 
 test("transport errors never blacklist a word; it plays after the backoff", async () => {

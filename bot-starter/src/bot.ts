@@ -140,6 +140,10 @@ interface MatchModel {
   sentAny: Set<string>;
   /** Auctions the server has told us are closed (no more bids are sent). */
   closed: Set<string>;
+  /** Auctions where a send's outcome is unknown (UnknownCallResultError). */
+  uncertain: Set<string>;
+  /** Bid sends awaiting an answer, per auction. */
+  inflight: Map<string, number>;
   bidInfo: Map<string, { delta: number; bagTotal: number; reason: string; source: string }>;
   skipLogged: Set<string>;
   recvAt: Map<string, { wall: number; mono: number }>;
@@ -165,6 +169,8 @@ function newModel(): MatchModel {
     bidFailures: new Map(),
     sentAny: new Set(),
     closed: new Set(),
+    uncertain: new Set(),
+    inflight: new Map(),
     bidInfo: new Map(),
     skipLogged: new Set(),
     recvAt: new Map(),
@@ -728,13 +734,20 @@ export class SookraBot {
     const amount = Number.isFinite(decision.amount) ? Math.max(0, Math.floor(decision.amount)) : 0;
     model.bidInfo.set(key, { delta, bagTotal, reason: decision.reason, source });
     const prev = model.lastBid.get(key);
-    if (prev === amount) return;
-    if (prev === undefined && amount === 0) {
-      if (!model.skipLogged.has(key)) {
-        model.skipLogged.add(key);
-        this.log(`m${m.id} a${key} '${auction.letter}' bag ${bagTotal}: no bid (${decision.reason}, ${source})`);
+    if (model.uncertain.has(key)) {
+      // A send's outcome is unknown (ack lost): the server may hold any of our
+      // amounts, so send the desired one, even an unchanged amount or a 0
+      // withdrawal, unless an attempt is already in flight.
+      if ((model.inflight.get(key) ?? 0) > 0) return;
+    } else {
+      if (prev === amount) return;
+      if (prev === undefined && amount === 0) {
+        if (!model.skipLogged.has(key)) {
+          model.skipLogged.add(key);
+          this.log(`m${m.id} a${key} '${auction.letter}' bag ${bagTotal}: no bid (${decision.reason}, ${source})`);
+        }
+        return;
       }
-      return;
     }
     if (model.closed.has(key)) return;
     if ((model.bidFailures.get(key) ?? 0) >= MAX_BID_FAILURES) return;
@@ -752,6 +765,7 @@ export class SookraBot {
       this.warn(`bid on a${key}`, err);
       return;
     }
+    model.inflight.set(key, (model.inflight.get(key) ?? 0) + 1);
     // Timing, measured after the reducer call has been issued.
     const sendWall = this.now();
     const recv = model.recvAt.get(key);
@@ -772,26 +786,34 @@ export class SookraBot {
     );
     p.then(() => {
       model.confirmed.set(key, amount);
-    }).catch((err: unknown) => {
-      const late = isLateBidError(err);
-      if (late) {
-        // Count each auction once: a missed auction (no bid of ours live) or a late replacement.
-        if (!model.closed.has(key)) {
-          if (hadLive || (model.confirmed.get(key) ?? 0) > 0) model.lateReplace++;
-          else model.lateFirst++;
+      model.uncertain.delete(key);
+    })
+      .catch((err: unknown) => {
+        const late = isLateBidError(err);
+        if (late) {
+          // Count each auction once: a missed auction (no bid of ours live) or a late replacement.
+          if (!model.closed.has(key)) {
+            if (hadLive || (model.confirmed.get(key) ?? 0) > 0) model.lateReplace++;
+            else model.lateFirst++;
+          }
+          model.closed.add(key);
+        } else if (err instanceof Error && err.name === "UnknownCallResultError") {
+          // It may or may not have run: re-send the desired amount once reconnected.
+          model.uncertain.add(key);
+        } else if (model.lastBid.get(key) === amount) {
+          // Not live on the server: forget it so a later refresh re-sends.
+          const live = model.confirmed.get(key);
+          if (live === undefined) model.lastBid.delete(key);
+          else model.lastBid.set(key, live);
+          if (!isTransportError(err)) model.bidFailures.set(key, (model.bidFailures.get(key) ?? 0) + 1);
         }
-        model.closed.add(key);
-      } else if (model.lastBid.get(key) === amount) {
-        // Not live on the server: forget it so a later refresh re-sends.
-        const live = model.confirmed.get(key);
-        if (live === undefined) model.lastBid.delete(key);
-        else model.lastBid.set(key, live);
-        if (!isTransportError(err)) model.bidFailures.set(key, (model.bidFailures.get(key) ?? 0) + 1);
-      }
-      this.out.warn(
-        `[${this.name}] m${m.id} a${key}: bid ${amount} refused: ${errMsg(err)}` +
-          (late ? (hadLive ? " (earlier bid stands)" : " (auction missed)") : ""),
-      );
-    });
+        this.out.warn(
+          `[${this.name}] m${m.id} a${key}: bid ${amount} refused: ${errMsg(err)}` +
+            (late ? (hadLive ? " (earlier bid stands)" : " (auction missed)") : ""),
+        );
+      })
+      .finally(() => {
+        model.inflight.set(key, Math.max(0, (model.inflight.get(key) ?? 1) - 1));
+      });
   }
 }
