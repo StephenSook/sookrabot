@@ -335,6 +335,8 @@ export const MLOOK_SAMPLES = 16;
 export const MLOOK_ALPHA_SCALE = 1;
 export const MLOOK_TILT = 0;
 export const MLOOK_SCALE = 1;
+/** EARLY_RAMP 1: the early cut ramps linearly up to 1 over the window instead of a step (earlyScale). 0: step. */
+export const EARLY_RAMP = 0;
 /**
  * SPEND_FLOOR: every value bid (paced, Vickrey, at tables of at least
  * SPEND_FLOOR_MIN_REAL_RIVALS real rivals) is raised by
@@ -400,6 +402,7 @@ export interface Policy {
   readonly MLOOK_ALPHA_SCALE: number;
   readonly MLOOK_TILT: number;
   readonly MLOOK_SCALE: number;
+  readonly EARLY_RAMP: number;
   readonly SPEND_FLOOR: number;
   readonly SPEND_FLOOR_MIN_REAL_RIVALS: number;
 }
@@ -455,6 +458,7 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   MLOOK_ALPHA_SCALE,
   MLOOK_TILT,
   MLOOK_SCALE,
+  EARLY_RAMP,
   SPEND_FLOOR,
   SPEND_FLOOR_MIN_REAL_RIVALS,
 });
@@ -576,9 +580,13 @@ export function earlyScale(
   window = EARLY_AUCTIONS,
   scale = EARLY_KAPPA_SCALE,
   minRealRivals = EARLY_MIN_REAL_RIVALS,
+  ramp = 0,
 ): number {
   if (scale === 1 || realRivals < minRealRivals) return 1;
-  return auctions - 1 - bagTotal < window ? scale : 1;
+  const idx = auctions - 1 - bagTotal;
+  if (!(idx < window)) return 1;
+  // EARLY_RAMP: the cut eases linearly from `scale` at the first auction to 1 at the end of the window.
+  return ramp > 0 ? scale + ((1 - scale) * Math.max(0, idx)) / window : scale;
 }
 
 /** Kappa with budget pacing: PACED_KAPPA, doubled in the last ENDGAME_AUCTIONS auctions, times paceMultiplier. */
@@ -741,6 +749,7 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
         p.EARLY_AUCTIONS,
         p.EARLY_KAPPA_SCALE,
         p.EARLY_MIN_REAL_RIVALS,
+        p.EARLY_RAMP,
       )
     : kappaFor(input.bagTotal, undefined, p);
   const simsOnlyVickrey = simsOnly && input.auctionType === "Vickrey";
