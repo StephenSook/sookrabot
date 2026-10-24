@@ -379,22 +379,31 @@ class Server {
       else this.live.set(a.auctionId, a.amount);
       return Promise.resolve();
     },
+    // The module runs a play when the call reaches it, and its update and answer reach the bot together a
+    // turn later: until then the bot's cache still holds the letters (the bot reserves them meanwhile).
     submitWord: (a: { matchId: bigint; word: string }): Promise<unknown> => {
       this.calls.push(`word ${a.word}`);
       this.wordCalls++;
       if (this.flushing) this.flushWordCalls++;
-      if (this.match.status.tag !== "Running") return Promise.reject(new Error("Match not running"));
-      const need = curEngine.countsOf(a.word);
-      for (let i = 0; i < 26; i++) {
-        if ((this.rack.get(LETTERS[i]) ?? 0) < need[i]) return Promise.reject(new Error(`Not enough letters for ${a.word}`));
-      }
-      for (const c of a.word) this.rack.set(c, (this.rack.get(c) ?? 0) - 1);
-      const reward = BigInt(curEngine.wordReward(a.word));
-      this.me().balance += reward;
-      this.me().score += reward;
-      return Promise.resolve();
+      return new Promise((resolve, reject) =>
+        setImmediate(() => {
+          if (this.match.status.tag !== "Running") return reject(new Error("Match not running"));
+          const need = curEngine.countsOf(a.word);
+          for (let i = 0; i < 26; i++) {
+            if ((this.rack.get(LETTERS[i]) ?? 0) < need[i]) return reject(new Error(`Not enough letters for ${a.word}`));
+          }
+          for (const c of a.word) this.rack.set(c, (this.rack.get(c) ?? 0) - 1);
+          const reward = BigInt(curEngine.wordReward(a.word));
+          this.me().balance += reward;
+          this.me().score += reward;
+          this.onCacheChange?.(); // index.ts: rack and balance updates schedule a refresh
+          resolve(undefined);
+        }),
+      );
     },
   };
+  /** Called when the bot's own rows change outside a driver transaction (a word play landing). */
+  onCacheChange: (() => void) | null = null;
 
   me(): ParticipantRow {
     return this.participants.find((p) => p.botId === ME)!;
@@ -415,16 +424,21 @@ interface BotLike {
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
-/** Lets deferred work (refreshes, word acks, precomputes) run until neither server sees a new call for 8 turns. */
-async function settle(servers: Server[]) {
+/**
+ * Lets deferred work (refreshes, word plays landing a turn later, precomputes: chains of a few turns) run
+ * until neither server sees a new call for 20 turns. False when that never happened within 4000 turns.
+ */
+async function settle(servers: Server[]): Promise<boolean> {
   let quiet = 0;
   let last = servers.map((s) => s.calls.length).join(",");
-  for (let i = 0; i < 600 && quiet < 8; i++) {
+  for (let i = 0; i < 4000; i++) {
     await turn();
     const now = servers.map((s) => s.calls.length).join(",");
     quiet = now === last ? quiet + 1 : 0;
     last = now;
+    if (quiet >= 20) return true;
   }
+  return false;
 }
 
 interface MatchResult {
@@ -438,12 +452,15 @@ interface MatchResult {
 
 /**
  * One simulated match, the same for both bots: rivals, sims, bag, lags and tie-breaks come from `seed`
- * alone. As in the module, an auction closes at its close time and the next one opens in the same
- * transaction: the bots get the result and the next auction's open together (index.ts callbacks: result,
- * then the open with its bid from the precomputed table, then the refresh a rack or balance update
- * schedules), and only then run deferred work. A bot receives each open `lag` ms after it opened; a bid
- * sent at or after the close time is refused "Auction window expired", as after a stall. The two servers'
- * reducer calls are compared after every auction and after the match ends.
+ * alone. As in the module (game.ts closeAuction), an auction closes at its close time and in the same
+ * transaction the next one opens, or after the last one the match ends: the bots get the result and the
+ * open (or the end) together (index.ts callbacks: result, then the open with its bid from the
+ * precomputed table or onMatchEnded, then the refresh a rack or balance update schedules), and only then
+ * run deferred work. A bot receives each open `lag` ms after it opened; a bid sent at or after the close
+ * time is refused "Auction window expired", as after a stall. A word play lands a turn after it is sent.
+ * The two servers' reducer calls are compared after every auction (the last one's comparison covers the
+ * match end); a server that never goes quiet counts as a difference. Simulated time moves only between
+ * transactions, so this compares decisions, not how long the bots take to make them.
  */
 async function lockstepMatch(
   seed: number, ix: Indexes, refBot: BotModule, policy: Policy | undefined, trace: boolean,
@@ -463,6 +480,7 @@ async function lockstepMatch(
     new curBot.SookraBot(ix.curIdx, "SookraBot", quiet, now, policy) as unknown as BotLike,
   ];
   const servers = [new Server(auctionType, durationMs, now), new Server(auctionType, durationMs, now)];
+  servers.forEach((s, j) => (s.onCacheChange = () => bots[j].scheduleRefresh(s, MATCH)));
   // Rivals: real bots (random bidders, rich or frugal, that cash words now and then) and sims (the module's rule).
   const rivals = Array.from({ length: seats - 1 }, (_, i) => ({
     id: BigInt(20 + i), sim: r() < 0.3, strategy: pick(r, SIMS), style: r(),
@@ -583,27 +601,29 @@ async function lockstepMatch(
       `ref ${JSON.stringify(a.calls.slice(j, j + 4))}, now ${JSON.stringify(b.calls.slice(j, j + 4))}`;
   };
 
+  const step = async (where: string): Promise<string | null> =>
+    (await settle(servers)) ? compare(where) : `match seed ${seed}, ${where}: the bots never went quiet`;
+
   const first = openAuction(0);
   bots.forEach((b, j) => b.onAuctionOpen(servers[j], first[j]));
-  await settle(servers);
-  let differ = compare(`auction 0 (bag ${auctions - 1}, ${letters[0]})`);
+  let differ = await step(`auction 0 (bag ${auctions - 1}, ${letters[0]})`);
   if (differ) return { auctions: 1, differ, ...counts() };
   for (let i = 0; i < auctions; i++) {
     const results = closeAuction(i);
-    const opened = i + 1 < auctions ? openAuction(i + 1) : null;
+    const last = i + 1 === auctions;
+    const opened = last ? null : openAuction(i + 1);
+    if (last) for (const s of servers) s.match.status = { tag: "Ended" };
     bots.forEach((b, j) => {
       b.onAuctionResult(servers[j], results[j]);
       if (opened) b.onAuctionOpen(servers[j], opened[j]);
+      else b.onMatchEnded(servers[j], MATCH); // index.ts: the match state turning Ended
       b.scheduleRefresh(servers[j], MATCH); // index.ts: rack and balance updates schedule a refresh
     });
-    await settle(servers);
-    differ = compare(`after auction ${i} (${letters[i]})${opened ? `, auction ${i + 1} open (${letters[i + 1]})` : ""}`);
+    const where = opened ? `, auction ${i + 1} open (${letters[i + 1]})` : ", match ended";
+    differ = await step(`after auction ${i} (${letters[i]})${where}`);
     if (differ) return { auctions: i + 1, differ, ...counts() };
   }
-  for (const s of servers) s.match.status = { tag: "Ended" };
-  bots.forEach((b, j) => b.onMatchEnded(servers[j], MATCH));
-  await settle(servers);
-  return { auctions, differ: compare("match end"), ...counts() };
+  return { auctions, differ: null, ...counts() };
 }
 
 // ---- main ----
