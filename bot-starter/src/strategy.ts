@@ -23,10 +23,12 @@ export const KAPPA = 4.25;
 /**
  * Kappa is multiplied by ENDGAME_KAPPA_BOOST when fewer than this many auctions remain.
  * 8, not 12: with 12 the bot spent its last coins on letters worth only their leave
- * value (live m625: N, N, O at 19 to 21 each). Cloud self-play (seed 101, 400
+ * value (live m625, casual log of 2026-10-24: N, N, O, valued 1.8 to 2.2, bought
+ * for 19 to 21 each with 11 to 8 auctions to come). Cloud self-play (seed 101, 400
  * matches a field): +1.1 to +1.6 points in each of ar6-top, ar6-v4, ar4-top and
  * ar6-top-mixed (t 3.8 to 6.2), while 18 lost 0.6 to 4.8; in duels +0.0 to +0.5
- * (seed 404, 1200 a field), the 3-game final unchanged.
+ * (seed 404, 1200 a field), the 3-game final win share moving by at most 0.003
+ * (t 1.0 or less).
  */
 export const ENDGAME_AUCTIONS = 8;
 export const ENDGAME_KAPPA_BOOST = 2;
@@ -75,7 +77,7 @@ export const PACED_KAPPA = 4;
  * +10.3 against two SookraBot copies playing the old defaults (-2.2 at seed 606
  * when the copies cut too). Window 28 against 22 and 34 in the same run: 34
  * lost 1.1 to 1.2 points at 7 and 8 seats, 22 lost 5.4 at 4 seats, and
- * elsewhere the three were within 2.6 points. A cut in duels lost 31 to 63
+ * elsewhere each was within 2.6 points of 28. A cut in duels lost 31 to 63
  * points a game (round 1). Sims do not count: at six-seat tables of one real
  * rival and four sims the cut lost 28 and 44 points a match (pad-code and
  * pad-ls, seed 606, 400 matches, t -11.6 and -19.4) where ENDGAME_AUCTIONS 8
