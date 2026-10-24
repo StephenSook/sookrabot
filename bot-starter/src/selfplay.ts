@@ -962,6 +962,11 @@ const FIELDS: Record<string, { about: string; seats: (focal: SeatSpec, rnd: Rng)
   "duel-code-ar": { about: "2-bot duel vs code-ar", seats: (f) => [f, fitted("code-ar")] },
   "duel-bot-ar": { about: "2-bot duel vs bot-ar", seats: (f) => [f, fitted("bot-ar")] },
   "duel-tinytung-ar": { about: "2-bot duel vs tinytung-ar", seats: (f) => [f, fitted("tinytung-ar")] },
+  // Other all-real table sizes: bracket rounds shrink to 4 and 3 bots; a Swiss round with 10 or 11
+  // entrants at match size 6 is a single table (tournament.ts tableSizes), here the largest we can seat.
+  ar3: { about: "focal + 2 drawn -ar rivals (83 auctions)", seats: (f, r) => [f, ...drawRivals(r, 2)] },
+  ar4: { about: "focal + 3 drawn -ar rivals (78 auctions)", seats: (f, r) => [f, ...drawRivals(r, 3)] },
+  ar8: { about: "focal + all 7 -ar rivals (58 auctions)", seats: (f, r) => [f, ...drawRivals(r, 7)] },
 };
 
 /** Active all-real rivals and how many of the 44 live all-real tables (m147 to m190) each sat at. */
