@@ -1,16 +1,23 @@
 # Self-play compare runs in parallel shards (bot-starter/src/selfplay.ts compare).
 #
 # Every variant plays the same matches (common random numbers); match i always has
-# seed mix(seed, i), so the shards together are exactly the unsharded run. Each shard
-# job uploads its rows; the aggregate job merges them, refuses an incomplete or
-# inconsistent set, and writes the per-variant table with paired differences (t
-# values) to the run summary and to a result artifact.
+# seed mix(seed, i), so the shards together are exactly the unsharded run. One run
+# can take several fields (space-separated): each field gets its own shards. Each
+# shard job uploads its rows; the aggregate job merges them, refuses an incomplete
+# or inconsistent set, and writes the per-variant table with paired differences
+# (t values), one block per field, to the run summary and a result artifact.
 #
-# Dispatch from a branch that carries the harness (main only registers the workflow):
+# Dispatch from a branch that carries the harness (main only registers the workflow;
+# a dispatch runs this file as it is on the ref it names):
 #   gh workflow run selfplay.yml --repo StephenSook/sookrabot --ref harness-sync \
-#     -f field=ar6-top -f matches=400 -f seed=1 -f variants="head PACED_KAPPA=4.5" -f shards=16
+#     -f field="ar6-top ar6-v4" -f matches=400 -f seed=1 -f variants="head PACED_KAPPA=4.5" -f shards=8
 # Fields: npx tsx src/selfplay.ts list (in bot-starter). Variants: head, or strategy.ts
 # constants NAME=value joined by +.
+#
+# Measured on ubuntu-24.04 runners (2026-10-24): a 6-seat match play takes about
+# 0.2 s (ar6-top: mean 196 ms, p90 276 ms), a duel about 0.11 s, and each shard job
+# adds about 10 to 15 s of setup. Jobs are billed in whole minutes each, so a few
+# fat shards cost fewer minutes than many thin ones.
 name: selfplay
 run-name: "selfplay ${{ inputs.field }} x${{ inputs.matches }} seed ${{ inputs.seed }}: ${{ inputs.variants }}"
 
@@ -18,12 +25,12 @@ on:
   workflow_dispatch:
     inputs:
       field:
-        description: "Field, e.g. ar6-top, ar6-v4, ar4-top, duel-james-v4, ar6-v4@0.5,fp (selfplay.ts list)"
+        description: "Field(s), space-separated, e.g. ar6-top ar6-v4 ar4-top duel-james-v4 ar6-v4@0.5,fp (selfplay.ts list)"
         required: true
         default: ar6-top
         type: string
       matches:
-        description: "Matches; every variant plays all of them on the same deals"
+        description: "Matches per field; every variant plays all of them on the same deals"
         required: true
         default: "400"
         type: string
@@ -38,7 +45,7 @@ on:
         default: head
         type: string
       shards:
-        description: "Parallel jobs, 1 to 64 (at most one per match)"
+        description: "Parallel jobs per field, 1 to 64 (at most one per match)"
         required: true
         default: "16"
         type: string
@@ -47,32 +54,36 @@ permissions:
   contents: read
 
 env:
-  # A shard plays at most this many matches times variants (warm counts twice): the
-  # measured runner speed keeps such a shard well inside the 45 minute job limit.
+  # A shard plays at most this many matches times variants (warm counts twice):
+  # about 20 minutes at 0.2 s a play, inside the 45 minute job limit.
   MAX_PLAYS_PER_SHARD: "6000"
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      shards: ${{ steps.plan.outputs.shards }}
+      matrix: ${{ steps.plan.outputs.matrix }}
       count: ${{ steps.plan.outputs.count }}
-      tag: ${{ steps.plan.outputs.tag }}
+      jobs: ${{ steps.plan.outputs.jobs }}
       variants: ${{ steps.plan.outputs.variants }}
     steps:
       - name: Check the inputs and lay out the shards
         id: plan
         shell: bash
         env:
-          FIELD: ${{ inputs.field }}
+          FIELDS: ${{ inputs.field }}
           MATCHES: ${{ inputs.matches }}
           SEED: ${{ inputs.seed }}
           VARIANTS: ${{ inputs.variants }}
           SHARDS: ${{ inputs.shards }}
         run: |
           fail() { echo "::error::$1"; exit 1; }
-          [[ "$FIELD" =~ ^[A-Za-z0-9][A-Za-z0-9._@,=+-]{0,99}$ ]] || fail "field: letters, digits and . _ @ , = + - only, got '$FIELD'"
+          read -r -a F <<< "$FIELDS"
+          (( ${#F[@]} >= 1 && ${#F[@]} <= 12 )) || fail "field: name 1 to 12 fields"
+          for f in "${F[@]}"; do
+            [[ "$f" =~ ^[A-Za-z0-9][A-Za-z0-9._@,=+-]*$ ]] && (( ${#f} <= 100 )) || fail "field '$f': letters, digits and . _ @ , = + - only"
+          done
           [[ "$MATCHES" =~ ^[1-9][0-9]{0,6}$ ]] || fail "matches: a whole number from 1 to 9999999, got '$MATCHES'"
           [[ "$SEED" =~ ^[0-9]{1,9}$ ]] || fail "seed: a whole number from 0 to 999999999, got '$SEED'"
           [[ "$SHARDS" =~ ^[1-9][0-9]?$ ]] && (( SHARDS <= 64 )) || fail "shards: 1 to 64, got '$SHARDS'"
@@ -84,28 +95,36 @@ jobs:
           done
           count=$(( SHARDS < MATCHES ? SHARDS : MATCHES ))
           per=$(( (MATCHES + count - 1) / count ))
-          plays=$(( per * ${#V[@]} ))
-          [[ ",$FIELD," == *",warm,"* ]] && plays=$(( plays * 2 ))
-          (( plays <= MAX_PLAYS_PER_SHARD )) || fail "a shard would play $plays matches (cap $MAX_PLAYS_PER_SHARD): raise shards, or split the variants over runs"
-          tag=$(printf '%s' "$FIELD" | tr -c 'A-Za-z0-9._-' '_')
+          for f in "${F[@]}"; do
+            plays=$(( per * ${#V[@]} ))
+            [[ ",$f," == *",warm,"* ]] && plays=$(( plays * 2 ))
+            (( plays <= MAX_PLAYS_PER_SHARD )) || fail "$f: a shard would play $plays matches (cap $MAX_PLAYS_PER_SHARD): raise shards, or split the variants over runs"
+          done
+          jobs=$(( ${#F[@]} * count ))
+          (( jobs <= 256 )) || fail "$jobs shard jobs (fields x shards); a run takes at most 256"
+          fields=$(printf '%s\n' "${F[@]}" | jq -R . | jq -cs .)
+          matrix=$(jq -cn --argjson fields "$fields" --argjson n "$count" \
+            '[$fields[] as $f | range($n) as $s | {field: $f, tag: ($f | gsub("[^A-Za-z0-9._-]"; "_")), shard: $s}]')
+          tags=$(jq -r '[.[].tag] | unique | length' <<< "$matrix")
+          (( tags == ${#F[@]} )) || fail "two fields share an artifact tag (or a field is listed twice): ${F[*]}"
           {
-            echo "shards=$(jq -cn --argjson n "$count" '[range($n)]')"
+            echo "matrix=$matrix"
             echo "count=$count"
-            echo "tag=$tag"
+            echo "jobs=$jobs"
             echo "variants=${V[*]}"
           } >> "$GITHUB_OUTPUT"
-          echo "field $FIELD, $MATCHES matches, seed $SEED, ${#V[@]} variant(s): ${V[*]}"
-          echo "$count shard(s) of up to $per matches, up to $plays match plays each"
+          echo "field(s) ${F[*]}; $MATCHES matches, seed $SEED, ${#V[@]} variant(s): ${V[*]}"
+          echo "$count shard(s) per field of up to $per matches ($jobs shard jobs)"
 
   shard:
     needs: plan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
-    name: shard ${{ matrix.shard }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: ${{ matrix.field }} shard ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -129,13 +148,13 @@ jobs:
         working-directory: bot-starter
         shell: bash
         env:
-          FIELD: ${{ inputs.field }}
+          FIELD: ${{ matrix.field }}
+          TAG: ${{ matrix.tag }}
+          SHARD: ${{ matrix.shard }}
+          COUNT: ${{ needs.plan.outputs.count }}
           MATCHES: ${{ inputs.matches }}
           SEED: ${{ inputs.seed }}
           VARIANTS: ${{ needs.plan.outputs.variants }}
-          SHARD: ${{ matrix.shard }}
-          COUNT: ${{ needs.plan.outputs.count }}
-          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           read -r -a V <<< "$VARIANTS"
           mkdir -p "$RUNNER_TEMP/rows"
@@ -148,19 +167,19 @@ jobs:
           hi=$(( (SHARD + 1) * MATCHES / COUNT ))
           want=$(( (hi - lo) * ${#V[@]} ))
           got=$(wc -l < "$out")
-          echo "shard $SHARD of $COUNT: matches $lo to $((hi - 1)), $got rows (want $want) in $secs s"
-          echo "shard $SHARD: matches $lo to $((hi - 1)), $got rows in $secs s" >> "$GITHUB_STEP_SUMMARY"
-          (( got == want )) || { echo "::error::shard $SHARD wrote $got rows, want $want"; exit 1; }
+          echo "$FIELD shard $SHARD of $COUNT: matches $lo to $((hi - 1)), $got rows (want $want) in $secs s"
+          echo "$FIELD shard $SHARD: matches $lo to $((hi - 1)), $got rows in $secs s" >> "$GITHUB_STEP_SUMMARY"
+          (( got == want )) || { echo "::error::$FIELD shard $SHARD wrote $got rows, want $want"; exit 1; }
       - uses: actions/upload-artifact@v7
         with:
-          name: rows-${{ github.run_id }}-${{ needs.plan.outputs.tag }}-shard-${{ matrix.shard }}
+          name: rows-${{ github.run_id }}-${{ matrix.tag }}-shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/rows/
           if-no-files-found: error
           retention-days: 30
 
   aggregate:
     needs: [plan, shard]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -169,17 +188,17 @@ jobs:
           sparse-checkout: bot-starter/scripts
       - uses: actions/download-artifact@v8
         with:
-          pattern: rows-${{ github.run_id }}-${{ needs.plan.outputs.tag }}-shard-*
+          pattern: rows-${{ github.run_id }}-*
           path: rows
           merge-multiple: true
       - name: Merge the shards
         shell: bash
         env:
           MATCHES: ${{ inputs.matches }}
-          COUNT: ${{ needs.plan.outputs.count }}
+          JOBS: ${{ needs.plan.outputs.jobs }}
         run: |
           files=$(find rows -name '*.jsonl' | wc -l)
-          (( files == COUNT )) || { echo "::error::found $files shard files, want $COUNT"; exit 1; }
+          (( files == JOBS )) || { echo "::error::found $files shard files, want $JOBS"; exit 1; }
           mkdir -p result
           agg=bot-starter/scripts/selfplay_aggregate.py
           python3 "$agg" rows --expect="$MATCHES" > result/result.txt
@@ -190,7 +209,7 @@ jobs:
           cat result/result.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
-          name: result-${{ github.run_id }}-${{ needs.plan.outputs.tag }}
+          name: result-${{ github.run_id }}
           path: result/
           if-no-files-found: error
           retention-days: 30
