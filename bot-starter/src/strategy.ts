@@ -345,6 +345,9 @@ function valueBid(input: BidInput, rivalCap: number, balance: number): BidDecisi
 export const MAX_FLUSH_LEAD_MS = 12000;
 /** How many of the most recent auction receive lags the flush lead looks at. */
 export const FLUSH_LAG_WINDOW = 20;
+/** Receive lags the baseline is taken from, and the percentile used (robust to one outlier). */
+export const FLUSH_BASELINE_WINDOW = 40;
+export const FLUSH_BASELINE_PERCENTILE = 0.1;
 
 /**
  * Word-flush lead for the current match: FLUSH_LEAD_MS normally, longer after a stall.
@@ -358,9 +361,12 @@ export const FLUSH_LAG_WINDOW = 20;
  * valuation alpha keeps the fixed rule, so precomputed bid tables stay valid.
  */
 export function flushLeadMs(lagsMs: readonly number[]): number {
-  let baseline = Infinity;
-  for (const lag of lagsMs) if (Number.isFinite(lag) && lag < baseline) baseline = lag;
-  if (baseline === Infinity) return FLUSH_LEAD_MS;
+  // Baseline: a low percentile of the recent lags, so one early outlier (a clock
+  // correction mid-match) expires instead of making every later lag look stalled.
+  const recent = lagsMs.filter((lag) => Number.isFinite(lag)).slice(-FLUSH_BASELINE_WINDOW);
+  if (recent.length === 0) return FLUSH_LEAD_MS;
+  const sorted = [...recent].sort((a, b) => a - b);
+  const baseline = sorted[Math.floor(FLUSH_BASELINE_PERCENTILE * (sorted.length - 1))];
   let stall = 0;
   for (const lag of lagsMs.slice(-FLUSH_LAG_WINDOW)) {
     if (Number.isFinite(lag) && lag - baseline > stall) stall = lag - baseline;

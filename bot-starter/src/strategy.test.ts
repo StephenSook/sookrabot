@@ -510,6 +510,9 @@ test("flushLeadMs: unchanged under normal jitter, longer after a stall, skew-pro
   assert.equal(flushLeadMs([9000, ...Array.from({ length: 20 }, () => 50)]), FLUSH_LEAD_MS);
   assert.equal(flushLeadMs([Number.NaN, Number.POSITIVE_INFINITY, 100]), FLUSH_LEAD_MS);
   assert.equal(flushLeadMs([0, 60000]), MAX_FLUSH_LEAD_MS);
+  // One early outlier (a clock correction from 6 s behind) does not poison the baseline.
+  assert.equal(flushLeadMs([-5950, ...Array.from({ length: 30 }, () => 50)]), FLUSH_LEAD_MS);
+  assert.equal(flushLeadMs([-5950, ...Array.from({ length: 60 }, () => 50)]), FLUSH_LEAD_MS);
 });
 
 test("chooseWords: hoards short words, cashes 7+, flushes everything at the end", () => {
