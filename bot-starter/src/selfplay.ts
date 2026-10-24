@@ -59,8 +59,11 @@ import {
   type Valuation,
   LETTER_VALUE,
   WordIndex,
+  countsKey,
   countsOf,
+  letterIndex,
   packValue,
+  valuate,
   wordReward,
 } from "./engine.js";
 import {
@@ -158,6 +161,56 @@ interface RivalModel {
   bid: SurvivalBid | LognormalBid;
   /** Robustness option: clock blocks by auction index (1-50, 51-58, 59-63, 64+) instead of auctions left. */
   blocksByIndex?: boolean;
+  /**
+   * Rack awareness, 0..1 (0 or absent: rack-blind, exactly the fitted model). The survival
+   * draw u becomes 1 - Phi(rho x zq + sqrt(1 - rho^2) x e), e = PhiInv(1 - u), where zq is
+   * the normal score of the letter's rank, by marginal value to the rival's own rack
+   * (engine valuation, alpha LEAVE_ALPHA), among the letters of its value class weighted by
+   * bag counts. The marginal bid distribution is kept; the rival bids high on the letters it needs.
+   */
+  rho?: number;
+}
+
+/** Standard normal CDF (erfc via Numerical Recipes' Chebyshev fit, |error| < 1.2e-7). */
+function normCdf(z: number): number {
+  const x = Math.abs(z) / Math.SQRT2;
+  const t = 1 / (1 + 0.5 * x);
+  const r =
+    t *
+    Math.exp(
+      -x * x - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 +
+        t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))),
+    );
+  return z >= 0 ? 1 - 0.5 * r : 0.5 * r;
+}
+
+/** Inverse standard normal CDF (Acklam's rational approximation, relative error < 1.2e-9), p clamped to (1e-9, 1 - 1e-9). */
+function normInv(p: number): number {
+  const q0 = Math.min(1 - 1e-9, Math.max(1e-9, p));
+  const a = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.357751867269, -30.66479806614716, 2.506628277459239];
+  const b = [-54.47609879822406, 161.5858368580409, -155.6989798598866, 66.80131188771972, -13.28068155288572];
+  const c = [-0.007784894002430293, -0.3223964580411365, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
+  const d = [0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416];
+  const lo = 0.02425;
+  if (q0 < lo) {
+    const q = Math.sqrt(-2 * Math.log(q0));
+    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  if (q0 > 1 - lo) {
+    const q = Math.sqrt(-2 * Math.log(1 - q0));
+    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  const q = q0 - 0.5;
+  const r = q * q;
+  return ((((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q) / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+}
+
+/** Letters of each value class (VCLASS keys), for the rack-aware rank. */
+const CLASS_LETTERS: Record<string, string[]> = {};
+for (const c of Object.keys(LETTER_VALUE)) (CLASS_LETTERS[VCLASSOF(c)] ??= []).push(c);
+function VCLASSOF(c: string): string {
+  const v = LETTER_VALUE[c];
+  return v === 1 ? "v1" : v === 2 ? "v2" : v === 3 ? "v3" : v === 4 ? "v4" : "v5+";
 }
 
 const RIVALS: Record<string, RivalModel> = JSON.parse(
@@ -172,7 +225,9 @@ function blockOf(bagLeft: number): number {
 }
 
 /** A fitted rival's bid. Always draws three numbers so its noise stream stays aligned across variants. */
-function rivalBid(m: RivalModel, rng: Rng, letter: string, bagLeft: number, balance: number, auctions = 0): number {
+function rivalBid(
+  m: RivalModel, rng: Rng, letter: string, bagLeft: number, balance: number, auctions = 0, rankQ = 0.5,
+): number {
   const u1 = rng();
   const u2 = rng();
   const u3 = rng();
@@ -182,9 +237,15 @@ function rivalBid(m: RivalModel, rng: Rng, letter: string, bagLeft: number, bala
   const blk = m.blocksByIndex ? (idx <= 50 ? 0 : idx <= 58 ? 1 : idx <= 63 ? 2 : 3) : blockOf(bagLeft);
   const b = m.bid;
   if (b.kind === "survival") {
+    let u = u1;
+    const rho = m.rho ?? 0;
+    if (rho > 0) {
+      const z = rho * normInv(Math.min(0.98, Math.max(0.02, rankQ))) + Math.sqrt(1 - rho * rho) * normInv(1 - u1);
+      u = 1 - normCdf(z);
+    }
     let x = 200;
     for (const [rx, s] of b.cells[`${VCLASS[v]}|${blk}`]) {
-      if (s < u1) {
+      if (s < u) {
         x = rx;
         break;
       }
@@ -224,6 +285,35 @@ interface Seat {
   bidRng: Rng;
   wordRng: Rng;
   bot?: SookraBot;
+  /** Rack-aware fitted rivals: marginal values per rack key, this match only. */
+  valCache?: Map<string, Float64Array>;
+}
+
+/**
+ * Mid-rank of the letter among its value class, by marginal value to this seat's rack,
+ * each letter weighted by its bag count (0..1; 0.5 when every letter in the class is worth the same).
+ */
+function rackRank(index: WordIndex, seat: Seat, letter: string): number {
+  const counts = countsOf(seat.rack);
+  const key = countsKey(counts);
+  seat.valCache ??= new Map();
+  let delta = seat.valCache.get(key);
+  if (!delta) {
+    delta = valuate(index, counts, LEAVE_ALPHA).delta;
+    seat.valCache.set(key, delta);
+  }
+  const d = delta[letterIndex(letter)];
+  let below = 0;
+  let equal = 0;
+  let total = 0;
+  for (const c of CLASS_LETTERS[VCLASSOF(letter)]) {
+    const w = BAG[c];
+    const dc = delta[letterIndex(c)];
+    total += w;
+    if (dc < d - 1e-9) below += w;
+    else if (dc <= d + 1e-9) equal += w;
+  }
+  return (below + 0.5 * equal) / total;
 }
 
 interface PublicStats {
@@ -467,7 +557,8 @@ async function playMatch(index: WordIndex, specs: SeatSpec[], matchSeed: number)
         const want = (s.rack.get(letter) ?? 0) === 0 ? value + 2 : Math.max(1, value);
         amounts.set(s, Math.min(want, Math.max(0, s.balance)));
       } else if (spec.kind === "fitted") {
-        amounts.set(s, rivalBid(spec.model, s.bidRng, letter, bagLeft, s.balance, auctions));
+        const q = (spec.model.rho ?? 0) > 0 && bagLeft > 0 ? rackRank(index, s, letter) : 0.5;
+        amounts.set(s, rivalBid(spec.model, s.bidRng, letter, bagLeft, s.balance, auctions, q));
       }
     }
     const open = table.auction;
@@ -553,11 +644,15 @@ interface WordCfg {
   minLens: number[];
   /** Value-of-money extra cashing. */
   vom?: { l0: number; ah: number; maxExtra: number };
+  /** Cash every word of at least this many letters as soon as it forms (HEAD: CASH_MIN_LEN). */
+  cashMin?: number;
 }
 export interface Variant {
   name: string;
   /** Absolute kappa for this auction; the bid hook scales the marginal value by kappa / kappaFor(bagTotal). */
   kappa?: (c: BidCtx) => number;
+  /** Multipliers applied on top of kappa (HEAD kappa when kappa is absent). */
+  kmul?: ((c: BidCtx) => number)[];
   words?: WordCfg;
 }
 
@@ -593,14 +688,14 @@ function makeBot(index: WordIndex, table: Table, seat: Seat, variant: Variant): 
   const hooks = bot as unknown as BotHooks;
   const proto = SookraBot.prototype as unknown as BotHooks;
   const seatsN = table.seats.length;
-  const kappa = variant.kappa;
+  const muls = variant.kmul ?? [];
+  const kappa = variant.kappa ?? (muls.length ? headKappa : undefined);
   if (kappa) {
     hooks.placeBid = (conn, model, m, auction, balance, delta, bagTotal, source, opponents) => {
       const simsOnly = opponents.length > 0 && opponents.every((o) => o.isSim);
+      const ctx: BidCtx = { bagTotal, balance, seats: seatsN, auctions: table.auctions };
       const scale =
-        simsOnly || bagTotal <= 0
-          ? 1
-          : kappa({ bagTotal, balance, seats: seatsN, auctions: table.auctions }) / kappaFor(bagTotal);
+        simsOnly || bagTotal <= 0 ? 1 : (kappa(ctx) * muls.reduce((p, f) => p * f(ctx), 1)) / kappaFor(bagTotal);
       proto.placeBid.call(hooks, conn, model, m, auction, balance, delta * scale, bagTotal, source, opponents);
     };
   }
@@ -685,7 +780,7 @@ function variantWords(index: WordIndex, input: WordInput, cfg: WordCfg, ctx: Wor
     index.consume(rem, k);
   };
   for (;;) {
-    const k = index.bestKey(input.cands, rem, CASH_MIN_LEN);
+    const k = index.bestKey(input.cands, rem, cfg.cashMin ?? CASH_MIN_LEN);
     if (k < 0) break;
     take(k);
   }
@@ -743,6 +838,9 @@ const boosted = (k: number) => (c: BidCtx) => (c.bagTotal < ENDGAME_AUCTIONS ? E
  *   liqp:Q[:CAP]           floor max(15, min(CAP, Q x mean price so far x expected share x auctions left)),
  *                          share = max(1/seats, own wins / closed auctions); defaults 1, 80
  *   vom:L0[:AH[:MAX]]      value-of-money extra cashing (variantWords); defaults AH 0.7, MAX 2
+ *   early:F:A              kappa x F in auctions 1..A of the match (composes with kappa and pace)
+ *   cashlen:L              cash words of L+ letters as soon as they form (HEAD: CASH_MIN_LEN = 7;
+ *                          99 = hold everything until the flush, liquidity words aside)
  */
 export function parseVariant(name: string): Variant {
   const v: Variant = { name };
@@ -761,6 +859,11 @@ export function parseVariant(name: string): Variant {
     } else if (kind === "pace") {
       const [g, lo = 0.5, hi = 3, k0 = KAPPA, boost = ENDGAME_KAPPA_BOOST] = a;
       v.kappa = (c) => (c.bagTotal < ENDGAME_AUCTIONS ? boost : 1) * k0 * clamp(paceRatio(c) ** g, lo, hi);
+    } else if (kind === "early") {
+      const [f, upto] = a;
+      (v.kmul ??= []).push((c) => (c.auctions - c.bagTotal <= upto ? f : 1));
+    } else if (kind === "cashlen") {
+      wordsCfg().cashMin = a[0];
     } else if (kind === "liq") {
       const [c, cap = 60, minLen = LIQUIDITY_MIN_LEN, fb = LIQUIDITY_FALLBACK_MIN_LEN] = a;
       const w = wordsCfg();
@@ -843,7 +946,43 @@ const FIELDS: Record<string, { about: string; seats: (focal: SeatSpec, rnd: Rng)
     about: "2-bot duel vs LetterShark with clock blocks by auction index",
     seats: (f) => [f, { kind: "fitted", name: "LetterShark", model: { ...RIVALS.LetterShark, blocksByIndex: true } }],
   },
+  // All-real tables, the tournament shape (no sims). Rivals refitted on the live all-real 6-bot
+  // matches m147 to m190 (suffix -ar). ar6 draws 5 of the 7 active rivals per match, weighted by
+  // how often each sat at those tables; ar6-top is the five most frequent.
+  ar6: { about: "focal + 5 of 7 active real rivals (-ar fits), drawn by live table frequency", seats: (f, r) => [f, ...drawRivals(r, 5)] },
+  "ar6-top": {
+    about: "focal, Yezi-ar, code-ar, bot-ar, tinytung-ar, dev-voices-ar",
+    seats: (f) => [f, ...["Yezi-ar", "code-ar", "bot-ar", "tinytung-ar", "dev-voices-ar"].map(fitted)],
+  },
+  "ar6-head": {
+    about: "focal, a HEAD SookraBot + 4 drawn -ar rivals (one value-bidding rival)",
+    seats: (f, r) => [f, sookra("SookraHead", HEAD), ...drawRivals(r, 4)],
+  },
+  "duel-yezi-ar": { about: "2-bot duel vs Yezi-ar", seats: (f) => [f, fitted("Yezi-ar")] },
+  "duel-code-ar": { about: "2-bot duel vs code-ar", seats: (f) => [f, fitted("code-ar")] },
+  "duel-bot-ar": { about: "2-bot duel vs bot-ar", seats: (f) => [f, fitted("bot-ar")] },
+  "duel-tinytung-ar": { about: "2-bot duel vs tinytung-ar", seats: (f) => [f, fitted("tinytung-ar")] },
 };
+
+/** Active all-real rivals and how many of the 44 live all-real tables (m147 to m190) each sat at. */
+const AR_POOL: [string, number][] = [
+  ["Yezi-ar", 38], ["code-ar", 40], ["bot-ar", 24], ["tinytung-ar", 35],
+  ["dev-voices-ar", 33], ["slow-n-dumb-ar", 32], ["podzemski-ar", 13],
+];
+
+/** k distinct rivals from AR_POOL, each draw proportional to the remaining weights. */
+function drawRivals(rnd: Rng, k: number): SeatSpec[] {
+  const pool = [...AR_POOL];
+  const out: SeatSpec[] = [];
+  for (let i = 0; i < k; i++) {
+    const total = pool.reduce((s, [, w]) => s + w, 0);
+    let u = rnd() * total;
+    let j = 0;
+    while (j < pool.length - 1 && u >= pool[j][1]) u -= pool[j++][1];
+    out.push(fitted(pool.splice(j, 1)[0][0]));
+  }
+  return out;
+}
 
 // ---- statistics ----
 
@@ -936,9 +1075,13 @@ async function legacy(field: "sims" | "starters", n: number, seed: number) {
   );
 }
 
+/** "<field>" or "<field>@<rho>": the suffix gives every fitted rival in the field that rack awareness. */
 async function compare(field: string, n: number, seed: number, names: string[], rowsPath?: string) {
-  const f = FIELDS[field];
-  if (!f) throw new Error(`unknown field ${field} (try: list)`);
+  const [base, rhoText] = field.split("@");
+  const f = FIELDS[base];
+  if (!f) throw new Error(`unknown field ${base} (try: list)`);
+  const rho = rhoText === undefined ? undefined : Number(rhoText);
+  if (rho !== undefined && !(rho >= 0 && rho < 1)) throw new Error(`rho must be in [0, 1): ${rhoText}`);
   if (names.length === 0) throw new Error("name at least one variant");
   const variants = names.map(parseVariant);
   const index = loadIndex();
@@ -946,10 +1089,11 @@ async function compare(field: string, n: number, seed: number, names: string[], 
   /** Per variant, per rival seat name: summed score, letters won, coins paid, end and mid balance, matches. */
   const others: Map<string, number[]>[] = variants.map(() => new Map());
   const t0 = performance.now();
+  const withRho = (s: SeatSpec): SeatSpec => (rho !== undefined && s.kind === "fitted" ? { ...s, model: { ...s.model, rho } } : s);
   for (let i = 0; i < n; i++) {
     const ms = mix(seed, i);
     for (let v = 0; v < variants.length; v++) {
-      const specs = f.seats(sookra("SookraBot", variants[v]), mulberry32(mix(ms, STREAM.field)));
+      const specs = f.seats(sookra("SookraBot", variants[v]), mulberry32(mix(ms, STREAM.field))).map(withRho);
       const res = await playMatch(index, specs, ms);
       rows[v].push(focalRow(i, res));
       for (const r of res.slice(1)) {
