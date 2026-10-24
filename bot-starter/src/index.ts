@@ -350,7 +350,8 @@ function main() {
     )
     .onDisconnect((_ctx: ErrorContext, err?: Error, nextAttempt?: number) => {
       // The cache is stale until a replay is applied: make no decisions on it.
-      supervisor.onDisconnect(id);
+      // A scheduled retry gets a deadline covering its handshake and replay.
+      supervisor.onDisconnect(id, nextAttempt !== undefined);
       console.log(
         `[${BOT_NAME}] disconnected${err ? `: ${err.message}` : ""} (connection ${id})` +
           (nextAttempt !== undefined ? ` (reconnect attempt ${nextAttempt})` : ""),

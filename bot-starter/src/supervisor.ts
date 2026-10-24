@@ -6,11 +6,12 @@
 // the id of the DbConnection that raised it) and it answers with hooks:
 // pause or resume the bot, recreate the subscription, or replace the
 // connection. Every subscription attempt (first, retry, replay) has a
-// deadline, so the bot is never left offline with nothing armed to recover
-// it. Timers are bound to the connection id and to an epoch that changes on
-// every readiness transition, so a timer armed for an earlier outage or an
-// earlier connection can never act later, and no timer ever marks the bot
-// ready.
+// deadline, and so does every drop the SDK retries (from the disconnect
+// through the handshake to the replay), so the bot is never left offline
+// with nothing armed to recover it. Timers are bound to the connection id and
+// to an epoch that changes on every readiness transition, so a timer armed
+// for an earlier outage or an earlier connection can never act later, and no
+// timer ever marks the bot ready.
 
 export interface Scheduler {
   setTimeout(fn: () => void, ms: number): unknown;
@@ -31,14 +32,18 @@ export interface SupervisorHooks {
 /**
  * Every subscription attempt must be applied or refused within this long, or
  * the connection is replaced: the first one on a new connection (connecting
- * included), each retry after a subscription error, and the SDK's replay
- * after an automatic reconnect. Each expiry in a row doubles the deadline, up
- * to SUBSCRIBE_TIMEOUT_MAX_MS, so a snapshot that is merely slow (the tables
- * grow all night) still gets through; an applied subscription resets it.
+ * included), each retry after a subscription error, and, after a drop the SDK
+ * retries, the reconnect, its handshake and the subscription replay together.
+ * Each expiry in a row doubles the deadline, up to SUBSCRIBE_TIMEOUT_MAX_MS,
+ * so a snapshot that is merely slow (the tables grow all night) still gets
+ * through; an applied subscription resets it.
  */
 export const SUBSCRIBE_TIMEOUT_MS = 10_000;
 export const SUBSCRIBE_TIMEOUT_MAX_MS = 120_000;
-/** After an automatic reconnect, wait this long for the subscription replay before replacing the connection. */
+/**
+ * After a drop the SDK retries, the replay must be applied within this long of
+ * the disconnect (not of the handshake) or the connection is replaced.
+ */
 export const REPLAY_TIMEOUT_MS = SUBSCRIBE_TIMEOUT_MS;
 /** Subscription retry backoff: base, doubling, capped. */
 export const RESUBSCRIBE_BASE_MS = 1000;
@@ -67,6 +72,8 @@ export class Supervisor {
   ready = false;
   lastAuctionAt = 0;
   private timer: unknown = null;
+  /** The armed timer is a subscription deadline (not a resubscribe retry). */
+  private deadlineArmed = false;
   private resubAttempts = 0;
   /** Subscription deadlines that expired in a row (each doubles the next one). */
   private expiries = 0;
@@ -95,14 +102,31 @@ export class Supervisor {
     this.transition(true);
   }
 
-  onDisconnect(conn: number) {
+  /**
+   * The connection dropped. With no retry scheduled the SDK has given up and
+   * index.ts builds a new connection itself. With a retry scheduled, the
+   * outage must end within a deadline armed here: the SDK has no handshake
+   * timeout and announces a reconnect only once the handshake completes, so a
+   * retry socket that opens and never answers would otherwise leave nothing
+   * armed. The deadline covers the reconnect, its handshake and the
+   * subscription replay. One already running is kept, so further drops and
+   * handshakes never push it back.
+   */
+  onDisconnect(conn: number, retryScheduled: boolean) {
     if (conn !== this.conn) return;
+    if (retryScheduled && !this.ready && this.deadlineArmed) return;
     this.transition(false);
+    if (retryScheduled) this.armSubscribeDeadline("a disconnect (reconnect, then subscription replay)");
   }
 
-  /** The SDK reconnected; its subscription replay must confirm before the bot acts. */
+  /**
+   * The SDK reconnected; its subscription replay must confirm before the bot
+   * acts, within the deadline armed at the disconnect (a handshake never
+   * extends it). Arms one only if none is running.
+   */
   onAutomaticReconnect(conn: number) {
     if (conn !== this.conn) return;
+    if (!this.ready && this.deadlineArmed) return;
     this.transition(false);
     this.armSubscribeDeadline("reconnect (subscription replay)");
   }
@@ -119,7 +143,7 @@ export class Supervisor {
     const delay = Math.min(RESUBSCRIBE_MAX_MS, RESUBSCRIBE_BASE_MS * 2 ** (this.resubAttempts - 1));
     this.hooks.log(`subscription error (${msg}); resubscribing in ${delay} ms`);
     const epoch = this.epoch;
-    this.arm(delay, () => {
+    this.arm(delay, false, () => {
       if (conn !== this.conn || epoch !== this.epoch || this.ready) return;
       // Deadline first: if resubscribing fails at once, the transition it causes cancels it.
       this.armSubscribeDeadline("resubscribing");
@@ -162,7 +186,7 @@ export class Supervisor {
     const conn = this.conn;
     const epoch = this.epoch;
     const ms = Math.min(SUBSCRIBE_TIMEOUT_MAX_MS, SUBSCRIBE_TIMEOUT_MS * 2 ** Math.min(this.expiries, 10));
-    this.arm(ms, () => {
+    this.arm(ms, true, () => {
       if (conn !== this.conn || epoch !== this.epoch || this.ready) return;
       this.expiries++;
       this.hooks.reconnect(`no subscription applied ${ms} ms after ${after}`);
@@ -181,15 +205,20 @@ export class Supervisor {
       this.sched.clearTimeout(this.timer);
       this.timer = null;
     }
+    this.deadlineArmed = false;
   }
 
-  private arm(ms: number, fn: () => void) {
+  private arm(ms: number, deadline: boolean, fn: () => void) {
     this.clearTimer();
     const handle: unknown = this.sched.setTimeout(() => {
       // A stale timer must not forget the current one, which a later transition still has to clear.
-      if (this.timer === handle) this.timer = null;
+      if (this.timer === handle) {
+        this.timer = null;
+        this.deadlineArmed = false;
+      }
       fn();
     }, ms);
     this.timer = handle;
+    this.deadlineArmed = deadline;
   }
 }

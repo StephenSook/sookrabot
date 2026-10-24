@@ -92,30 +92,111 @@ test("Codex repro: an old reconnect timer cannot resume during a later outage", 
   const { sup, sched, calls } = make();
   const c = sup.newConnection();
   sup.onApplied(c);
-  sup.onDisconnect(c);
-  sup.onAutomaticReconnect(c); // arms the replay timeout
+  sup.onDisconnect(c, true); // the SDK scheduled a retry: arms the outage deadline
+  sup.onAutomaticReconnect(c);
   sched.advance(1000);
   sup.onApplied(c); // replay confirmed: timer must be cancelled
   sched.advance(REPLAY_TIMEOUT_MS - 1100);
-  sup.onDisconnect(c); // second outage
+  sup.onDisconnect(c, false); // second outage; the SDK gave up, so index.ts builds a new connection itself
   sched.advance(10 * REPLAY_TIMEOUT_MS);
   assert.equal(sup.ready, false);
   assert.equal(calls.online.at(-1), false);
   assert.deepEqual(calls.reconnect, [], "no stale timer acted");
   // No timer ever sets online=true: every true came from onApplied (2 here: initial and replay).
   assert.equal(calls.online.filter(Boolean).length, 2);
+  // With a retry scheduled, the later outage has its own deadline, counted from its own disconnect.
+  const b = make();
+  const cb = b.sup.newConnection();
+  b.sup.onApplied(cb);
+  b.sup.onDisconnect(cb, true);
+  b.sup.onAutomaticReconnect(cb);
+  b.sched.advance(1000);
+  b.sup.onApplied(cb);
+  b.sched.advance(REPLAY_TIMEOUT_MS - 1100); // t = 9,900
+  b.sup.onDisconnect(cb, true);
+  b.sched.advance(REPLAY_TIMEOUT_MS - 1); // past t = 10,000, when the cancelled deadline was due
+  assert.deepEqual(b.calls.reconnect, []);
+  b.sched.advance(1);
+  assert.equal(b.calls.reconnect.length, 1);
+  assert.equal(b.calls.online.filter(Boolean).length, 2);
 });
 
 test("replay that never confirms leads to a fresh connection, never to readiness on a stale cache", () => {
   const { sup, sched, calls } = make();
   const c = sup.newConnection();
   sup.onApplied(c);
-  sup.onDisconnect(c);
+  sup.onDisconnect(c, true);
   sup.onAutomaticReconnect(c);
   sched.advance(REPLAY_TIMEOUT_MS + 1);
   assert.equal(sup.ready, false);
   assert.equal(calls.reconnect.length, 1);
   assert.match(calls.reconnect[0], /replay/);
+});
+
+test("Codex repro: a reconnect whose handshake never completes replaces the connection (held an hour)", () => {
+  const { sup, sched, calls } = make();
+  const c = sup.newConnection();
+  sup.onApplied(c);
+  // A ready socket drops and the SDK schedules a retry. The retry socket opens but the
+  // handshake never completes, so the SDK never announces a reconnect: no onAutomaticReconnect.
+  sup.onDisconnect(c, true);
+  assert.equal(sup.ready, false);
+  assert.equal(sched.pending(), 1, "a deadline is armed at the disconnect");
+  sched.advance(SUBSCRIBE_TIMEOUT_MS - 1);
+  assert.deepEqual(calls.reconnect, []);
+  sched.advance(1);
+  assert.equal(calls.reconnect.length, 1);
+  assert.match(calls.reconnect[0], /disconnect/);
+  sched.advance(3_603_000);
+  assert.equal(calls.reconnect.length, 1, "one replacement requested, nothing else fires");
+  assert.equal(sup.ready, false);
+  assert.equal(calls.online.filter(Boolean).length, 1, "only the applied subscription made the bot ready");
+});
+
+test("the deadline from the disconnect also covers the replay: a late handshake never extends it", () => {
+  const { sup, sched, calls } = make();
+  const c = sup.newConnection();
+  sup.onApplied(c);
+  sup.onDisconnect(c, true); // t = 0
+  sched.advance(SUBSCRIBE_TIMEOUT_MS - 1000);
+  sup.onAutomaticReconnect(c); // the handshake completes 1 s before the deadline
+  sched.advance(999);
+  assert.deepEqual(calls.reconnect, []);
+  sched.advance(1);
+  assert.equal(calls.reconnect.length, 1, "replaced one deadline after the disconnect, not after the handshake");
+  assert.equal(sup.ready, false);
+  // A replay that applies in time makes the bot ready and leaves nothing armed.
+  const b = make();
+  const cb = b.sup.newConnection();
+  b.sup.onApplied(cb);
+  b.sup.onDisconnect(cb, true);
+  b.sched.advance(1500);
+  b.sup.onAutomaticReconnect(cb);
+  b.sched.advance(2000);
+  b.sup.onApplied(cb);
+  assert.equal(b.sup.ready, true);
+  assert.equal(b.sched.pending(), 0);
+  b.sched.advance(10 * SUBSCRIBE_TIMEOUT_MAX_MS);
+  assert.deepEqual(b.calls.reconnect, []);
+});
+
+test("a connection that keeps dropping before its replay applies is replaced one deadline after the first drop", () => {
+  const { sup, sched, calls } = make();
+  const c = sup.newConnection();
+  sup.onApplied(c);
+  sup.onDisconnect(c, true); // t = 0: first drop
+  for (let i = 0; i < 4; i++) {
+    sched.advance(1500);
+    sup.onAutomaticReconnect(c); // handshake completes...
+    sched.advance(500);
+    sup.onDisconnect(c, true); // ...and the socket drops again before the replay applies
+  }
+  sched.advance(SUBSCRIBE_TIMEOUT_MS - 8000 - 1); // t = 9,999
+  assert.deepEqual(calls.reconnect, []);
+  sched.advance(1);
+  assert.equal(calls.reconnect.length, 1, "drops and handshakes never push the deadline back");
+  assert.equal(sup.ready, false);
+  assert.equal(calls.online.filter(Boolean).length, 1);
 });
 
 test("a failed subscription is recreated with backoff, then the connection is replaced", () => {
@@ -174,7 +255,7 @@ test("an initial subscription that is never answered replaces the connection; th
   const c = sup.newConnection();
   sup.onApplied(c);
   assert.equal(calls.online.filter(Boolean).length, 1);
-  sup.onDisconnect(c);
+  sup.onDisconnect(c, true);
   sup.onAutomaticReconnect(c);
   sched.advance(SUBSCRIBE_TIMEOUT_MS);
   assert.equal(calls.reconnect.length, 15);
@@ -184,7 +265,7 @@ test("Codex repro: a retried subscription that is never answered replaces the co
   const { sup, sched, calls } = make();
   const c = sup.newConnection();
   sup.onApplied(c);
-  sup.onDisconnect(c);
+  sup.onDisconnect(c, true);
   sup.onAutomaticReconnect(c);
   sup.onSubscriptionError(c, new Error("replay failed"));
   sched.advance(RESUBSCRIBE_BASE_MS);
@@ -207,8 +288,8 @@ test("old-epoch timers that fire after a newer connection exists do nothing", ()
   const c1 = sup.newConnection(); // t=0: c1's subscription deadline
   sup.onApplied(c1);
   sup.onSubscriptionError(c1, new Error("x")); // c1's retry, due at 1 s
-  sup.onDisconnect(c1);
-  sup.onAutomaticReconnect(c1); // c1's replay deadline
+  sup.onDisconnect(c1, true); // c1's outage deadline (it also covers the replay)
+  sup.onAutomaticReconnect(c1);
   sched.advance(SUBSCRIBE_TIMEOUT_MS / 2);
   const c2 = sup.newConnection(); // replaces c1; c2's own deadline
   // c1's deadlines fire while c2's subscription is still outstanding (the bot is not ready).
@@ -218,7 +299,7 @@ test("old-epoch timers that fire after a newer connection exists do nothing", ()
   assert.equal(sup.ready, false);
   sup.onApplied(c2);
   sched.advance(10 * SUBSCRIBE_TIMEOUT_MAX_MS); // c2's own (now stale) deadline fires too
-  assert.equal(sched.staleFired, 4, "c1 deadline, c1 retry, c1 replay deadline, c2 deadline");
+  assert.equal(sched.staleFired, 4, "c1 deadline, c1 retry, c1 outage deadline, c2 deadline");
   assert.deepEqual(calls.reconnect, []);
   assert.equal(calls.resubscribe, 0);
   assert.equal(sup.ready, true);
@@ -272,14 +353,26 @@ test("a stuck call reported on the ready connection replaces it; early or stale 
   assert.equal(calls.reconnect.length, 1, "one replacement per outage");
 });
 
-test("disconnect cancels pending timers; nothing fires afterwards", () => {
+test("disconnect cancels pending timers; with an SDK retry scheduled only the outage deadline remains", () => {
   const { sup, sched, calls } = make();
   const c = sup.newConnection();
   sup.onApplied(c);
   sup.onSubscriptionError(c, new Error("x"));
   assert.equal(sched.pending(), 1);
-  sup.onDisconnect(c);
+  sup.onDisconnect(c, false); // no retry: index.ts builds the next connection itself
   assert.equal(sched.pending(), 0);
   sched.advance(60_000);
   assert.equal(calls.resubscribe, 0);
+  assert.deepEqual(calls.reconnect, []);
+  // With a retry scheduled, the resubscribe retry is cancelled (the socket is gone) and the
+  // outage deadline takes its place.
+  const b = make();
+  const cb = b.sup.newConnection();
+  b.sup.onApplied(cb);
+  b.sup.onSubscriptionError(cb, new Error("x"));
+  b.sup.onDisconnect(cb, true);
+  assert.equal(b.sched.pending(), 1);
+  b.sched.advance(60_000);
+  assert.equal(b.calls.resubscribe, 0);
+  assert.equal(b.calls.reconnect.length, 1);
 });
