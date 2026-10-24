@@ -1,20 +1,27 @@
-# Rival-model calibration (bot-starter/src/selfplay.ts validate4): the v4 rivals play
-# each other six to a table, drawn as at the live m300 to m390 tables, once per rack
-# awareness rho; the table job sets each rival's simulated score and place beside its
-# live numbers, one column per rho, so the rho whose rivals match live can be picked
-# (then use it as field@rho in selfplay.yml).
+# Rival-model calibration. One job per configuration; the table job sets each rival's
+# simulated numbers beside its live ones, one column per configuration.
+#
+# entries v4c or v4 (bot-starter/src/selfplay.ts validate4): the v4 rivals play each other
+# six to a table, drawn as at the live m300 to m390 tables, once per rack awareness rho.
+#
+# entries v5c, v5 or v5k (validate5): the live all-real tables from m1000 on are replayed
+# with the v5 fits (each rival meets the opponents it met live); v5k is v5c with the
+# calibration in selfplay.ts V5_CALIBRATION. A configuration is a rho ("-" keeps each
+# entry's fitted rho), optionally followed by ":" and rival model modifiers joined by "+"
+# (selfplay.ts RIVAL_MODS, e.g. "0.7:shark" or "-:minlen=7+bidx=1.1").
 #
 #   gh workflow run calibrate.yml --repo StephenSook/sookrabot --ref harness-sync \
 #     -f matches=400 -f seed=1 -f rhos="- 0.5 0.7 0.9" -f entries=v4c
-# "-" keeps each entry's own fitted rho.
+#   gh workflow run calibrate.yml --repo StephenSook/sookrabot --ref round2-harness \
+#     -f matches=864 -f seed=1 -f rhos="- 0.7 -:shark" -f entries=v5c
 name: calibrate
-run-name: "calibrate ${{ inputs.entries }} x${{ inputs.matches }} seed ${{ inputs.seed }}: rho ${{ inputs.rhos }}"
+run-name: "calibrate ${{ inputs.entries }} x${{ inputs.matches }} seed ${{ inputs.seed }}: ${{ inputs.rhos }}"
 
 on:
   workflow_dispatch:
     inputs:
       matches:
-        description: "Matches per rho"
+        description: "Matches per configuration"
         required: true
         default: "400"
         type: string
@@ -24,16 +31,15 @@ on:
         default: "1"
         type: string
       rhos:
-        description: "Rack awareness values, space-separated; - keeps each entry's fitted rho"
+        description: "Configurations, space-separated: a rho (- keeps each entry's fitted rho), for v5 entries optionally :mod+mod"
         required: true
         default: "- 0.5 0.7 0.9"
         type: string
       entries:
-        description: "Fixture entries: v4c (complete7 bids, fitted word policies) or v4"
+        description: "Fixture entries: v4c or v4 (validate4), v5c, v5 or v5k (validate5)"
         required: true
         default: v4c
-        type: choice
-        options: [v4c, v4]
+        type: string
 
 permissions:
   contents: read
@@ -44,6 +50,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       rhos: ${{ steps.plan.outputs.rhos }}
+      mode: ${{ steps.plan.outputs.mode }}
     steps:
       - name: Check the inputs
         id: plan
@@ -52,16 +59,28 @@ jobs:
           MATCHES: ${{ inputs.matches }}
           SEED: ${{ inputs.seed }}
           RHOS: ${{ inputs.rhos }}
+          ENTRIES: ${{ inputs.entries }}
         run: |
           fail() { echo "::error::$1"; exit 1; }
           [[ "$MATCHES" =~ ^[1-9][0-9]{0,4}$ ]] && (( MATCHES <= 20000 )) || fail "matches: 1 to 20000, got '$MATCHES'"
           [[ "$SEED" =~ ^[0-9]{1,9}$ ]] || fail "seed: a whole number from 0 to 999999999, got '$SEED'"
+          case "$ENTRIES" in
+            v4c|v4) mode=validate4 ;;
+            v5c|v5|v5k) mode=validate5 ;;
+            *) fail "entries: v4c, v4, v5c, v5 or v5k, got '$ENTRIES'" ;;
+          esac
           read -r -a R <<< "$RHOS"
-          (( ${#R[@]} >= 1 && ${#R[@]} <= 12 )) || fail "rhos: 1 to 12 values"
+          (( ${#R[@]} >= 1 && ${#R[@]} <= 12 )) || fail "rhos: 1 to 12 configurations"
           for r in "${R[@]}"; do
-            [[ "$r" == "-" || "$r" =~ ^0(\.[0-9]{1,4})?$ ]] || fail "rho '$r': - or a number in [0, 1)"
+            if [[ "$mode" == validate5 ]]; then
+              [[ "$r" =~ ^(-|0(\.[0-9]{1,4})?)(:[a-z0-9]+(=[0-9]+(\.[0-9]+)?)?(\+[a-z0-9]+(=[0-9]+(\.[0-9]+)?)?)*)?$ ]] \
+                || fail "configuration '$r': a rho (- or a number in [0, 1)), optionally :mod+mod"
+            else
+              [[ "$r" == "-" || "$r" =~ ^0(\.[0-9]{1,4})?$ ]] || fail "rho '$r': - or a number in [0, 1)"
+            fi
           done
           echo "rhos=$(printf '%s\n' "${R[@]}" | jq -R . | jq -cs 'unique')" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
   rho:
     needs: plan
@@ -76,11 +95,13 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Check this ref carries validate4
+      - name: Check this ref carries the validation mode
         shell: bash
+        env:
+          MODE: ${{ needs.plan.outputs.mode }}
         run: |
-          if ! grep -q 'export async function validate4' bot-starter/src/selfplay.ts 2>/dev/null; then
-            echo "::error::$GITHUB_REF_NAME has no validate4; dispatch with --ref harness-sync or a branch that contains it"
+          if ! grep -q "export async function $MODE" bot-starter/src/selfplay.ts 2>/dev/null; then
+            echo "::error::$GITHUB_REF_NAME has no $MODE; dispatch with --ref harness-sync (validate4) or round2-harness (validate5)"
             exit 1
           fi
       - uses: actions/setup-node@v7
@@ -98,21 +119,30 @@ jobs:
         env:
           MATCHES: ${{ inputs.matches }}
           SEED: ${{ inputs.seed }}
-          RHO: ${{ matrix.rho }}
+          CONFIG: ${{ matrix.rho }}
           ENTRIES: ${{ inputs.entries }}
+          MODE: ${{ needs.plan.outputs.mode }}
         run: |
-          label=$([[ "$RHO" == "-" ]] && echo fitted || echo "$RHO")
+          rho=${CONFIG%%:*}
+          mods=""
+          [[ "$CONFIG" == *:* ]] && mods=${CONFIG#*:}
+          label=$([[ "$rho" == "-" ]] && echo fitted || echo "$rho")
+          [[ -n "$mods" ]] && label="$label-$(echo "$mods" | tr -c 'A-Za-z0-9.\n' '_')"
           mkdir -p "$RUNNER_TEMP/calib"
-          out="$RUNNER_TEMP/calib/validate4-$GITHUB_RUN_ID-$ENTRIES-rho-$label.jsonl"
+          out="$RUNNER_TEMP/calib/$MODE-$GITHUB_RUN_ID-$ENTRIES-rho-$label.jsonl"
           start=$(date +%s)
-          npx tsx src/selfplay.ts validate4 "$MATCHES" "$SEED" "$RHO" "$ENTRIES" > "$out"
-          echo "rho $label: $(wc -l < "$out") rivals, $MATCHES matches in $(( $(date +%s) - start )) s"
+          if [[ "$MODE" == validate5 ]]; then
+            npx tsx src/selfplay.ts validate5 "$MATCHES" "$SEED" "$rho" "$ENTRIES" "$mods" > "$out"
+          else
+            npx tsx src/selfplay.ts validate4 "$MATCHES" "$SEED" "$rho" "$ENTRIES" > "$out"
+          fi
+          echo "configuration $CONFIG: $(wc -l < "$out") rivals, $MATCHES matches in $(( $(date +%s) - start )) s"
           cat "$out"
-          [ -s "$out" ] || { echo "::error::validate4 wrote nothing"; exit 1; }
+          [ -s "$out" ] || { echo "::error::$MODE wrote nothing"; exit 1; }
           echo "label=$label" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
-          name: validate4-${{ github.run_id }}-${{ inputs.entries }}-rho-${{ steps.play.outputs.label }}
+          name: validate-${{ github.run_id }}-${{ inputs.entries }}-rho-${{ steps.play.outputs.label }}
           path: ${{ runner.temp }}/calib/
           if-no-files-found: error
           retention-days: 30
@@ -128,7 +158,7 @@ jobs:
           sparse-checkout: bot-starter/scripts
       - uses: actions/download-artifact@v8
         with:
-          pattern: validate4-${{ github.run_id }}-*
+          pattern: validate-${{ github.run_id }}-*
           path: calib
           merge-multiple: true
       - name: Table

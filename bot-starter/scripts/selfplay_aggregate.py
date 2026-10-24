@@ -25,6 +25,9 @@ placement, win, last and margin: mean, standard error and t = mean / se over mat
 
 validate4 lines (selfplay.ts validate4, one line per rival): grouped by entries, seed
 and matches, one column per rho, simulated score and place beside the live numbers.
+validate5 lines (selfplay.ts validate5): the same, one column per configuration (rho and
+rival modifiers), with letters won, 7+ words, the pack value of the letters won and coins
+paid too, and the mean and largest absolute error over the top rivals (marked *).
 
 Exit status: 0 on success, 1 when the rows are incomplete, inconsistent or missing
 (no rows at all is an error, not an empty result), 2 on a usage error.
@@ -101,7 +104,7 @@ def read_lines(files):
                     raise InputError(f"{f}:{ln}: not JSON (a truncated last line means the run was cut off)")
                 if not isinstance(r, dict):
                     raise InputError(f"{f}:{ln}: not a JSON object")
-                if r.get("kind") == "validate4":
+                if r.get("kind") in ("validate4", "validate5"):
                     validate_rows.append(r)
                     continue
                 missing = [k for k in COMPARE_KEYS if k not in r]
@@ -279,35 +282,56 @@ def render_compare_markdown(summaries):
 def validate_groups(rows):
     groups = {}
     for r in rows:
-        key = (r.get("entries"), r.get("seed"), r.get("matches"))
-        label = "fitted" if r.get("rhoFitted") else f"rho {r.get('rho')}"
-        groups.setdefault(key, {}).setdefault(label, {})[r["rival"]] = r
+        key = (r.get("kind"), r.get("entries"), r.get("seed"), r.get("matches"))
+        if r.get("kind") == "validate5":
+            label = r.get("label") or "fitted"
+        else:
+            label = "fitted" if r.get("rhoFitted") else f"rho {r.get('rho')}"
+        # validate5 names rivals by stem, so columns of different entries (v5, v5c, v5k) line up
+        name = r.get("stem", r["rival"])
+        groups.setdefault(key, {}).setdefault(label, {})[name] = r
     return groups
+
+
+# validate5 tables: (metric, digits); the mean absolute error is printed for the top rivals and for all.
+V5_METRICS = (("score", 1), ("place", 2), ("won", 1), ("sevens", 2), ("pack_won", 1), ("paid", 1))
 
 
 def render_validate(rows, markdown):
     out = []
-    for (entries, seed, matches), by_rho in sorted(validate_groups(rows).items(), key=lambda kv: str(kv[0])):
+    for (kind, entries, seed, matches), by_rho in sorted(validate_groups(rows).items(), key=lambda kv: str(kv[0])):
         labels = sorted(by_rho, key=lambda l: (l != "fitted", l))
         rivals = sorted({name for g in by_rho.values() for name in g},
                         key=lambda n: next((g[n]["live"] or {}).get("place", 9) for g in by_rho.values() if n in g))
-        title = f"validate4 {entries} entries, seed {seed}, {matches} matches (rivals only, six to a table)"
-        for metric, digits in (("score", 1), ("place", 2)):
+        v5 = kind == "validate5"
+        top = {n for g in by_rho.values() for n, r in g.items() if r.get("top")}
+        if v5:
+            title = f"validate5 {entries} entries, seed {seed}, {matches} matches (live all-real tables m1000 on replayed)"
+        else:
+            title = f"validate4 {entries} entries, seed {seed}, {matches} matches (rivals only, six to a table)"
+        for metric, digits in (V5_METRICS if v5 else (("score", 1), ("place", 2))):
             head = ["rival", f"live {metric}"] + [f"sim {metric} ({l})" for l in labels]
             table = []
             err = {l: [] for l in labels}
+            err_top = {l: [] for l in labels}
             for name in rivals:
                 live = next((g[name]["live"] for g in by_rho.values() if name in g and g[name]["live"]), None)
-                row = [name, fmt(live[metric], digits) if live else "-"]
+                row = [name + (" *" if name in top else ""), fmt(live.get(metric), digits) if live else "-"]
                 for l in labels:
                     r = by_rho[l].get(name)
                     if r is None:
                         row.append("-")
                         continue
                     row.append(fmt(r["sim"][metric], digits))
-                    if live:
+                    if live and live.get(metric) is not None:
                         err[l].append(abs(r["sim"][metric] - live[metric]))
+                        if name in top:
+                            err_top[l].append(abs(r["sim"][metric] - live[metric]))
                 table.append(row)
+            if top:
+                table.append(["mean abs(sim - live), top *", ""] +
+                             [fmt(sum(e) / len(e), digits) if e else "-" for e in err_top.values()])
+                table.append(["max abs(sim - live), top *", ""] + [fmt(max(e), digits) if e else "-" for e in err_top.values()])
             table.append(["mean abs(sim - live)", ""] + [fmt(sum(e) / len(e), digits) if e else "-" for e in err.values()])
             if markdown:
                 out += [f"### {title}: {metric}", "", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
@@ -352,7 +376,7 @@ def main(argv):
         blocks.append(render_validate(validate_rows, fmt_name == "markdown"))
     print("\n\n".join(blocks))
     sys.stderr.write(f"selfplay_aggregate: {len(files)} file(s), {len(compare_rows)} compare rows, "
-                     f"{len(validate_rows)} validate4 lines\n")
+                     f"{len(validate_rows)} validate lines\n")
     return 0
 
 

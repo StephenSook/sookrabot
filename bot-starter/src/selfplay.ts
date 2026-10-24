@@ -8,10 +8,11 @@
 //   npx tsx src/selfplay.ts [sims|starters] [matches] [seed]
 //   npx tsx src/selfplay.ts validate [matches] [seed]
 //   npx tsx src/selfplay.ts validate4 [matches] [seed] [rho|-] [v4c|v4]
+//   npx tsx src/selfplay.ts validate5 [matches] [seed] [rho|-] [v5k|v5c|v5] [mod+mod...]
 //   npx tsx src/selfplay.ts list
 //
 // GitHub Actions runs compare in parallel shards (.github/workflows/selfplay.yml)
-// and validate4 once per rho (.github/workflows/calibrate.yml);
+// and validate4 or validate5 once per rho (.github/workflows/calibrate.yml);
 // bot-starter/scripts/selfplay_aggregate.py merges and summarizes their output.
 //
 // Variants. "head" is the live bot: DEFAULT_POLICY. Any other variant names
@@ -346,6 +347,12 @@ interface Seat {
   valCache?: Map<string, Float64Array>;
   /** Fitted rivals with complete7: sevenCompleters per rack key, this match only. */
   c7Cache?: Map<string, number>;
+  /** The five starting tiles, sorted (validate5 packing measures). */
+  startRack: string;
+  /** Letters won this match, per letter index (validate5 packing measures). */
+  wonLetters: Counts;
+  /** Words of 7+ letters played. */
+  sevens: number;
 }
 
 /**
@@ -474,6 +481,7 @@ class Table {
     seat.balance += r;
     seat.score += r;
     seat.words++;
+    if (word.length >= 7) seat.sevens++;
     if (seat.firstWord === null) seat.firstWord = this.closed;
     return true;
   }
@@ -555,6 +563,12 @@ export interface SeatResult {
   midBalance: number | null;
   /** Tiles left unplayed when the match ended (the final letter included). */
   endRack: number;
+  /** Words of 7+ letters played. */
+  sevens: number;
+  /** The five starting tiles, sorted. */
+  startRack: string;
+  /** Every letter won, sorted. */
+  wonLetters: string;
 }
 
 /** How a match is played: the auction rule and the fitted rivals' bid scale. */
@@ -636,6 +650,9 @@ export async function playMatch(
     wordCalls: 0,
     bidRng: mulberry32(mix(matchSeed, STREAM.rivalBid + i)),
     wordRng: mulberry32(mix(matchSeed, STREAM.rivalWord + i)),
+    startRack: "",
+    wonLetters: new Int32Array(26),
+    sevens: 0,
   }));
   const botRows = new Map<bigint, BotRow>();
   for (const s of seats) {
@@ -647,10 +664,13 @@ export async function playMatch(
     );
   }
   for (const s of seats) {
+    const start: string[] = [];
     for (let i = 0; i < RACK; i++) {
       const c = bag[next++];
       s.rack.set(c, (s.rack.get(c) ?? 0) + 1);
+      start.push(c);
     }
+    s.startRack = start.sort().join("");
   }
   const table = new Table(index, seats, botRows, auctions, env.auction);
   seats.forEach((s, i) => {
@@ -750,6 +770,7 @@ export async function playMatch(
         ws.balance -= paid;
         ws.paid += paid;
         ws.won++;
+        ws.wonLetters[letterIndex(letter)]++;
         ws.rack.set(letter, (ws.rack.get(letter) ?? 0) + 1);
         if (ws.spec.kind === "sim") {
           const word = longestWord(index, ws.rack, 3);
@@ -789,6 +810,9 @@ export async function playMatch(
       poor: s.poor,
       midBalance: s.midBalance,
       endRack: [...s.rack.values()].reduce((a, b) => a + b, 0),
+      sevens: s.sevens,
+      startRack: s.startRack,
+      wonLetters: [...s.wonLetters].map((k, i) => String.fromCharCode(65 + i).repeat(k)).join(""),
     })),
   };
 }
@@ -879,6 +903,93 @@ const V4_TABLES: [string, number][] = [
  * Dante 2.12, YeziShanYang 2.54, keanu_reeves 2.65, LetterShark 2.65, cashu 2.97, code 3.42; SookraBot 3.06).
  */
 const V4_STRONGEST = ["james", "Dante", "Yezi", "keanu", "LetterShark", "cashu", "code"];
+
+// ---- v5 rivals: refits on the 2026-10-24 10:52 UTC snapshot, and their calibration ----
+
+/**
+ * Rival model modifiers, by name (validate5 mods, and V5_CALIBRATION). Each maps a fitted model to a
+ * changed copy; "+" joins several, applied left to right.
+ */
+export const RIVAL_MODS: Record<string, { about: string; apply: (m: RivalModel, x: number) => RivalModel; arg?: boolean }> = {
+  shark: {
+    about: "every rival plays the shark word policy: each 7+ word cashed as it forms, the rack flushed when the final auction opens",
+    apply: (m) => ({ ...m, policy: "shark", minLen: undefined, sharkLen: undefined }),
+  },
+  minlen: {
+    about: "minlen=N: a hazard rival's hazard step only plays words of N+ letters (no shorter word before the flush)",
+    apply: (m, x) => (m.policy === "hazard" ? { ...m, minLen: Math.max(m.minLen ?? 2, x) } : m),
+    arg: true,
+  },
+  noc7: {
+    about: "no complete7 bids: every bid from the regular cells",
+    apply: (m) => ({ ...m, complete7: undefined }),
+  },
+  bidx: {
+    about: "bidx=s: every survival bid (cells and complete7) times s before the balance scaling",
+    apply: (m, x) => {
+      if (m.bid.kind !== "survival") return m;
+      const scale = (runs: [number, number][]): [number, number][] => runs.map(([rx, s]): [number, number] => [rx * x, s]);
+      const cells = Object.fromEntries(Object.entries(m.bid.cells).map(([k, runs]) => [k, scale(runs)]));
+      return { ...m, bid: { ...m.bid, cells }, ...(m.complete7 ? { complete7: scale(m.complete7) } : {}) };
+    },
+    arg: true,
+  },
+};
+
+/** "a+b=1.5+..." into its checked parts ("" or "-": none). */
+export function parseRivalMods(text: string): string[] {
+  if (text === "" || text === "-") return [];
+  const out: string[] = [];
+  for (const part of text.split("+")) {
+    const m = /^([a-z0-9]+)(?:=((?:\d+\.?\d*|\.\d+)))?$/.exec(part);
+    const mod = m ? RIVAL_MODS[m[1]] : undefined;
+    if (!m || !mod) throw new Error(`rival modifier "${part}": one of ${Object.keys(RIVAL_MODS).join(", ")} (name or name=value)`);
+    if (Boolean(mod.arg) !== (m[2] !== undefined)) throw new Error(`rival modifier "${part}": ${mod.about}`);
+    if (m[2] !== undefined && !(Number(m[2]) > 0)) throw new Error(`rival modifier "${part}": the value must be > 0`);
+    out.push(part);
+  }
+  return out;
+}
+
+export function applyRivalMods(model: RivalModel, mods: readonly string[]): RivalModel {
+  let m = model;
+  for (const part of mods) {
+    const [name, value] = part.split("=");
+    m = RIVAL_MODS[name].apply(m, value === undefined ? NaN : Number(value));
+  }
+  return m;
+}
+
+/**
+ * The current top bots with v5 fits, strongest first by live all-real place over each one's fitted range
+ * (postturing 2.34, guesser 2.46, Chinese Dante 2.54, Doppio 2.58, Nijello 2.59, Vickey 2.61,
+ * LetterSharkPro 2.72, Ally 2.76, atlas 2.79, marcellinus 2.95, Cashu 3.05; SookraBot 3.50).
+ */
+export const V5_TOP = [
+  "postturing", "guesser", "Dante", "Doppio", "Nijello", "Vickey", "LetterSharkPro", "Ally", "atlas", "marcellinus", "Cashu",
+];
+export type V5Entries = "v5" | "v5c" | "v5k";
+const V5_ENTRIES: readonly V5Entries[] = ["v5", "v5c", "v5k"];
+/**
+ * The calibration of the v5 rivals: what turns a -v5c entry into its -v5k model (validate5 with entries
+ * v5k, and the v5 fields). mods: RIVAL_MODS applied to every rival; rho: replaces each rival's fitted
+ * rack awareness (absent: keep it).
+ */
+export const V5_CALIBRATION: { mods: string; rho?: number } = { mods: "" };
+
+/** A v5 rival's model: its -v5 or -v5c fixture entry, or for v5k its -v5c entry calibrated (V5_CALIBRATION). */
+function v5Model(stem: string, entries: V5Entries): RivalModel {
+  const base = RIVALS[`${stem}-${entries === "v5k" ? "v5c" : entries}`];
+  if (!base) throw new Error(`no rival model ${stem}-${entries === "v5k" ? "v5c" : entries} in fixtures/rival-models.json`);
+  if (entries !== "v5k") return base;
+  const m = applyRivalMods(base, parseRivalMods(V5_CALIBRATION.mods));
+  return V5_CALIBRATION.rho === undefined ? m : { ...m, rho: V5_CALIBRATION.rho };
+}
+
+/** A calibrated v5 rival's seat (name <stem>-v5k). */
+function v5k(stem: string): SeatSpec {
+  return { kind: "fitted", name: `${stem}-v5k`, model: v5Model(stem, "v5k") };
+}
 
 const FIELDS: Record<string, { about: string; seats: (focal: SeatSpec, rnd: Rng) => SeatSpec[] }> = {
   sims: { about: "focal + 5 random sims", seats: (f, r) => [f, ...randomSims(r, 5)] },
@@ -1512,11 +1623,131 @@ export async function validate4(
   return out;
 }
 
+/** A v5 rival's live numbers over its fit's range (fixtures/rival-live-v5.json, rival_live_v5.py). */
+interface LiveV5 {
+  bot: number;
+  name: string;
+  range: [number, number];
+  matches: number;
+  score: number;
+  place: number;
+  win: number;
+  won: number;
+  paid: number;
+  final_balance: number;
+  n_words: number;
+  sevens: number;
+  eights: number;
+  used: number;
+  end_rack: number;
+  /** Greedy pack value of the letters won (every word that fits, best reward first). */
+  pack_won: number;
+  /** Greedy pack value of the starting rack plus the letters won (matches with a known starting rack). */
+  pack_all: number | null;
+  /** Letters won per match by face value: 1, 2, 3, 4, 5+ points. */
+  won_by_class: number[];
+}
+interface LiveV5File {
+  rivals: Record<string, LiveV5>;
+  /** Live all-real tables from m1000 on: [match id, stem x 6]. */
+  tables: (number | string)[][];
+}
+let liveV5Cache: LiveV5File | undefined;
+function liveV5(): LiveV5File {
+  liveV5Cache ??= JSON.parse(fs.readFileSync(new URL("./fixtures/rival-live-v5.json", import.meta.url), "utf8")) as LiveV5File;
+  return liveV5Cache;
+}
+
+/** Greedy pack value of a set of tiles (every word that fits, best reward first): rival_v5_metrics.py's measure. */
+function packValue(index: WordIndex, letters: string): number {
+  const counts = countsOf(letters);
+  return index.pack(index.scan(counts, false), counts, -1, 0).total;
+}
+
+/**
+ * The live tables of fixtures/rival-live-v5.json replayed with the v5 fits: match i seats the six bots of
+ * table i mod 288 (every all-real table from m1000 on whose bots all have fits; SookraBot's seat is its own
+ * fit, SookraBot-v5), so each rival meets the opponents it met live. Per rival, the simulated score, place,
+ * win rate, letters won, coins paid, final balance, words, 7+ words, tiles used and left, and the packing
+ * measures (greedy pack value of the letters won, and of the starting rack plus the letters won), beside
+ * its live numbers over its fitted range. `entries`: v5 (the existing format), v5c (complete7 bids and the
+ * likelihood-chosen word policies) or v5k (v5c with the calibration, V5_CALIBRATION). `rho` replaces every
+ * rival's rack awareness; `mods` are rival model modifiers (RIVAL_MODS) applied to every seat.
+ */
+export async function validate5(
+  n: number, seed: number, rho?: number, entries: V5Entries = "v5c", mods = "",
+): Promise<Record<string, unknown>[]> {
+  if (!(Number.isInteger(n) && n > 0)) throw new Error(`matches must be a whole number > 0, got ${n}`);
+  if (!Number.isInteger(seed)) throw new Error(`seed must be a whole number, got ${seed}`);
+  if (rho !== undefined && !(rho >= 0 && rho < 1)) throw new Error(`rho must be in [0, 1) or "-", got ${rho}`);
+  if (!V5_ENTRIES.includes(entries)) throw new Error(`entries must be one of ${V5_ENTRIES.join(", ")}, got ${entries}`);
+  const modList = parseRivalMods(mods);
+  const { rivals: live, tables } = liveV5();
+  const index = loadIndex();
+  const acc = new Map<string, number[]>();
+  const models = new Map<string, RivalModel>();
+  for (let i = 0; i < n; i++) {
+    const stems = tables[i % tables.length].slice(1) as string[];
+    const specs = stems.map((stem): SeatSpec => {
+      let model = models.get(stem);
+      if (!model) {
+        model = applyRivalMods(v5Model(stem, entries), modList);
+        if (rho !== undefined) model = { ...model, rho };
+        models.set(stem, model);
+      }
+      return { kind: "fitted", name: stem, model };
+    });
+    const seats = (await playMatch(index, specs, mix(seed, i, 5))).seats;
+    for (const r of seats) {
+      const ahead = seats.filter((o) => o.score > r.score).length;
+      const a = acc.get(r.name) ?? Array<number>(18).fill(0);
+      [
+        r.score, ahead + 1, ahead === 0 ? 1 : 0, r.won, r.paid, r.balance, r.words, r.sevens, RACK + r.won - r.endRack,
+        r.endRack, packValue(index, r.wonLetters), packValue(index, r.startRack + r.wonLetters), 1,
+      ].forEach((x, j) => (a[j] += x));
+      for (const c of r.wonLetters) a[13 + Math.min(LETTER_VALUE[c], 5) - 1]++;
+      acc.set(r.name, a);
+    }
+  }
+  const r1 = (x: number) => +x.toFixed(1);
+  const r2 = (x: number) => +x.toFixed(2);
+  const label = (rho === undefined ? "fitted" : `rho ${rho}`) + (modList.length ? ` ${modList.join("+")}` : "");
+  const out = [...acc].map(([stem, a]) => {
+    const m = a[12];
+    const obs = live[stem];
+    const sim = {
+      score: r1(a[0] / m), place: r2(a[1] / m), win: r2(a[2] / m), won: r1(a[3] / m), paid: r1(a[4] / m),
+      final_balance: r1(a[5] / m), words: r2(a[6] / m), sevens: r2(a[7] / m), used: r1(a[8] / m), end_rack: r1(a[9] / m),
+      pack_won: r1(a[10] / m), pack_all: r1(a[11] / m), score_over_pack_all: r2(a[0] / a[11]),
+      won_by_class: a.slice(13, 18).map((x) => r2(x / m)),
+    };
+    return {
+      kind: "validate5", rival: `${stem}-${entries}`, stem, entries, top: V5_TOP.includes(stem),
+      rho: rho ?? models.get(stem)!.rho ?? 0, rhoFitted: rho === undefined, mods: modList.join("+"), label,
+      matches: n, seed, seats: m, sim,
+      live: {
+        score: obs.score, place: obs.place, win: obs.win, won: obs.won, paid: obs.paid, final_balance: obs.final_balance,
+        words: obs.n_words, sevens: obs.sevens, used: obs.used, end_rack: obs.end_rack, pack_won: obs.pack_won,
+        pack_all: obs.pack_all, won_by_class: obs.won_by_class, matches: obs.matches,
+      },
+      simMinusLive: {
+        score: r1(sim.score - obs.score), place: r2(sim.place - obs.place), won: r1(sim.won - obs.won),
+        sevens: r2(sim.sevens - obs.sevens), pack_won: r1(sim.pack_won - obs.pack_won),
+      },
+    };
+  });
+  out.sort((x, y) => x.live.place - y.live.place || x.stem.localeCompare(y.stem));
+  return out;
+}
+
 function list() {
   for (const [k, f] of Object.entries(FIELDS)) console.log(`${k.padEnd(16)} ${f.about}`);
   console.log("field modifiers: <field>[@<rho>][,fp][,vickrey][,shade=<s>][,warm]   e.g. ar6@0.9,fp,shade=0.8,warm");
   console.log("variants: head, or NAME=value joined by +, NAME one of (default):");
   for (const k of POLICY_KEYS) console.log(`  ${k.padEnd(28)} ${DEFAULT_POLICY[k]}${INTEGER_KEYS.has(k) ? "  (whole number)" : ""}`);
+  console.log("rival modifiers (validate5 [matches] [seed] [rho|-] [v5k|v5c|v5] [mod+mod...]):");
+  for (const [k, m] of Object.entries(RIVAL_MODS)) console.log(`  ${k.padEnd(10)} ${m.about}`);
+  console.log(`v5k calibration: ${JSON.stringify(V5_CALIBRATION)}`);
 }
 
 async function main() {
@@ -1551,6 +1782,12 @@ async function main() {
     const rho = pos[2] === undefined || pos[2] === "-" ? undefined : Number(pos[2]);
     const entries = (pos[3] ?? "v4c").replace(/^-/, "");
     for (const s of await validate4(Number(pos[0] ?? 200), Number(pos[1] ?? 1), rho, entries as "v4c" | "v4")) {
+      console.log(JSON.stringify(s));
+    }
+  } else if (mode === "validate5") {
+    const rho = pos[2] === undefined || pos[2] === "-" ? undefined : Number(pos[2]);
+    const entries = (pos[3] ?? "v5c").replace(/^-/, "") as V5Entries;
+    for (const s of await validate5(Number(pos[0] ?? 288), Number(pos[1] ?? 1), rho, entries, pos[4] ?? "")) {
       console.log(JSON.stringify(s));
     }
   } else if (mode === "list") {
