@@ -691,6 +691,14 @@ test("policy: word, flush and leave knobs set in the policy move chooseWords, fl
   assert.equal(alphaFor(false, withPolicy({ LEAVE_ALPHA: 0.5 })), 0.5);
   assert.equal(alphaFor(true, withPolicy({ LEAVE_ALPHA: 0.5 })), 0);
   assert.equal(alphaFor(false), LEAVE_ALPHA);
+  // Leave decay: below LEAVE_DECAY_BAG auctions to come, alpha x (bagTotal + 1) / LEAVE_DECAY_BAG.
+  const decay = withPolicy({ LEAVE_ALPHA: 0.4, LEAVE_DECAY_BAG: 20 });
+  assert.equal(alphaFor(false, decay, 30), 0.4);
+  assert.equal(alphaFor(false, decay, 19), 0.4);
+  assert.ok(Math.abs(alphaFor(false, decay, 9) - 0.2) < 1e-12);
+  assert.equal(alphaFor(true, decay, 9), 0);
+  assert.equal(alphaFor(false, decay), 0.4, "bag unknown: no decay");
+  assert.equal(alphaFor(false, DEFAULT_POLICY, 3), LEAVE_ALPHA, "off by default");
 });
 
 // ---- speed ----

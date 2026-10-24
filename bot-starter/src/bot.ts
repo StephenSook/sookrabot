@@ -496,7 +496,7 @@ export class SookraBot {
       const opensMs = microsToMs(a.opensAt);
       if (opensMs !== undefined) model.recvLags.push(recvWall - opensMs);
       const bagTotal = Number(m.bagTotal);
-      const alpha = alphaFor(this.flushAt(bagTotal, Number(m.auctionDurationMs)), this.policy);
+      const alpha = alphaFor(this.flushAt(bagTotal, Number(m.auctionDurationMs)), this.policy, bagTotal);
       const counts = this.effectiveCounts(model, this.rackCounts(conn, a.matchId));
       const { delta, source } = this.lookupDelta(a.matchId, counts, alpha, a.letter);
       this.placeBid(conn, model, m, a, Number(me.balance), delta, bagTotal, source, this.opponentsFrom(conn, rows));
@@ -525,7 +525,7 @@ export class SookraBot {
     const key = String(matchId);
     if (this.precomputeScheduled.has(key)) return;
     this.precomputeScheduled.add(key);
-    const nextAlpha = alphaFor(this.flushAt(bagTotal - 1, durationMs), this.policy);
+    const nextAlpha = alphaFor(this.flushAt(bagTotal - 1, durationMs), this.policy, bagTotal - 1);
     const step = (withLetter: boolean) => () =>
       this.guard(`precompute m${key}`, () => {
         if (!this.online) return;
@@ -732,7 +732,7 @@ export class SookraBot {
     const flush = open !== undefined && this.flushAt(bagTotal, durationMs);
     const flushWords =
       open !== undefined && (flush || shouldFlush(bagTotal, durationMs, flushLeadMs(model.recvLags, this.policy)));
-    const alpha = alphaFor(flush, this.policy);
+    const alpha = alphaFor(flush, this.policy, bagTotal);
     const balance = Number(me.balance);
 
     let counts = this.effectiveCounts(model, this.rackCounts(conn, matchId));

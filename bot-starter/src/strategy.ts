@@ -72,6 +72,12 @@ export const STARTING_BALANCE = 100;
 export const BAG_TILES = 98;
 /** Weight of the leave value of held tiles (sim: 0.35 best; 0 scored 107 vs 314). */
 export const LEAVE_ALPHA = 0.35;
+/**
+ * Leave decay: with fewer than LEAVE_DECAY_BAG auctions to come, the leave
+ * weight is LEAVE_ALPHA x (bagTotal + 1) / LEAVE_DECAY_BAG, since a held tile
+ * has fewer letters left to form a word with. 0 (default): no decay.
+ */
+export const LEAVE_DECAY_BAG = 0;
 /** Cash any word of at least this many letters as soon as it forms (multiplier saturates at 7). */
 export const CASH_MIN_LEN = 7;
 /**
@@ -160,6 +166,7 @@ export interface Policy {
   readonly EARLY_KAPPA_SCALE: number;
   readonly EARLY_MIN_RIVALS: number;
   readonly LEAVE_ALPHA: number;
+  readonly LEAVE_DECAY_BAG: number;
   readonly CASH_MIN_LEN: number;
   readonly HOLD_MIN_REAL_RIVALS: number;
   readonly HOLD_FROM_BAG: number;
@@ -193,6 +200,7 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   EARLY_KAPPA_SCALE,
   EARLY_MIN_RIVALS,
   LEAVE_ALPHA,
+  LEAVE_DECAY_BAG,
   CASH_MIN_LEN,
   HOLD_MIN_REAL_RIVALS,
   HOLD_FROM_BAG,
@@ -496,9 +504,16 @@ export function shouldFlush(bagTotal: number, auctionDurationMs: number, leadMs:
   return (bagTotal + 1) * ms <= leadMs;
 }
 
-/** Leave weight for the valuation: leftovers are worthless once flushing. */
-export function alphaFor(flush: boolean, p: Policy = DEFAULT_POLICY): number {
-  return flush ? 0 : p.LEAVE_ALPHA;
+/**
+ * Leave weight for the valuation: leftovers are worthless once flushing, and
+ * worth less near the end when LEAVE_DECAY_BAG is set (bagTotal: auctions to come).
+ */
+export function alphaFor(flush: boolean, p: Policy = DEFAULT_POLICY, bagTotal?: number): number {
+  if (flush) return 0;
+  if (p.LEAVE_DECAY_BAG > 0 && bagTotal !== undefined && bagTotal + 1 < p.LEAVE_DECAY_BAG) {
+    return (p.LEAVE_ALPHA * Math.max(0, bagTotal + 1)) / p.LEAVE_DECAY_BAG;
+  }
+  return p.LEAVE_ALPHA;
 }
 
 export interface WordInput {
