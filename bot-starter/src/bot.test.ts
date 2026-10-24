@@ -507,6 +507,20 @@ test("sims-only table bids up to the sim cap", async () => {
   assert.equal(s.bids[0].amount, 6n);
 });
 
+test("Codex repro: warning history and index verification stay bounded over a long night", () => {
+  const { s, bot } = setup("CAT", 30, "S");
+  const inner = bot as unknown as { lastWarn: Map<string, number>; indexVerified: Set<string> };
+  for (let i = 0; i < 2000; i++) bot.warn(`bid on a${i}`, new Error("Auction closed"));
+  assert.ok(inner.lastWarn.size <= 256, `lastWarn ${inner.lastWarn.size}`);
+  s.db.matchParticipant.mpByMatch = { filter: (id: bigint) => s.participants.filter((p) => p.matchId === id) };
+  for (let i = 0; i < 2000; i++) bot.seatRows(s, BigInt(1000 + i)); // foreign matches seen by auction callbacks
+  assert.ok(inner.indexVerified.size <= 256, `indexVerified ${inner.indexVerified.size}`);
+  bot.seatRows(s, MATCH);
+  assert.ok(inner.indexVerified.has(String(MATCH)));
+  bot.onMatchEnded(s, MATCH);
+  assert.ok(!inner.indexVerified.has(String(MATCH)), "match end retires its entry");
+});
+
 test("tick drops the model of a match whose end event was missed", async () => {
   const { s, bot, logs } = setup("CAT", 30, "S");
   bot.refresh(s, MATCH);

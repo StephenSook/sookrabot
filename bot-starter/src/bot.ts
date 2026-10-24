@@ -121,6 +121,9 @@ export const VAL_CACHE_MAX = 8;
  * The refined bid follows within milliseconds.
  */
 export const STATIC_DELTA_SCALE = 0.5;
+/** Process-lifetime bookkeeping caps (oldest entries are evicted first). */
+export const MAX_WARN_KEYS = 256;
+export const MAX_VERIFIED_MATCHES = 256;
 
 interface PendingWord {
   counts: Counts;
@@ -205,6 +208,15 @@ function microsToMs(t: Micros | undefined): number | undefined {
   return t === undefined ? undefined : Number(t.microsSinceUnixEpoch) / 1000;
 }
 
+/** Drop the oldest-inserted entries until the collection is within `max`. */
+function evictOldest(c: Map<string, unknown> | Set<string>, max: number) {
+  while (c.size > max) {
+    const oldest = c.keys().next().value;
+    if (oldest === undefined) break;
+    c.delete(oldest);
+  }
+}
+
 function median(xs: number[]): number | undefined {
   if (xs.length === 0) return undefined;
   const s = [...xs].sort((a, b) => a - b);
@@ -244,7 +256,9 @@ export class SookraBot {
     const key = `${label}|${msg}`;
     const t = this.now();
     if (t - (this.lastWarn.get(key) ?? -Infinity) < 10_000) return;
+    this.lastWarn.delete(key);
     this.lastWarn.set(key, t);
+    evictOldest(this.lastWarn, MAX_WARN_KEYS);
     this.out.warn(`[${this.name}] ${label}: ${msg}`);
   }
 
@@ -300,6 +314,7 @@ export class SookraBot {
         return scanned;
       }
       this.indexVerified.add(key);
+      evictOldest(this.indexVerified, MAX_VERIFIED_MATCHES);
     }
     return rows;
   }
@@ -574,6 +589,7 @@ export class SookraBot {
         );
       }
       this.models.delete(key);
+      this.indexVerified.delete(key);
     });
   }
 
