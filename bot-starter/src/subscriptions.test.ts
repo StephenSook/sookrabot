@@ -169,7 +169,10 @@ function harness(scope: BaseScope = SCOPE) {
   return { plan, handles, events };
 }
 
-test("base and seed both applied, then the window: ready, and the seed is dropped", () => {
+/** Let readiness (deferred to the end of the SDK message) run. */
+const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("base and seed both applied, then the window: ready, and the seed is dropped", async () => {
   const { plan, handles, events } = harness();
   plan.start();
   assert.equal(handles.length, 2);
@@ -187,28 +190,32 @@ test("base and seed both applied, then the window: ready, and the seed is droppe
   assert.deepEqual(win.queries, windowQueries(9n, plan.floors!));
   assert.equal(seed.unsubscribes, 0, "the seed stays until the window holds the seats");
   win.apply();
+  assert.deepEqual(events, ["base"], "ready waits for the rest of the SDK message");
+  await settle();
   assert.deepEqual(events, ["base", "ready"]);
   assert.equal(seed.unsubscribes, 1);
   assert.equal(base.unsubscribes, 0);
 });
 
-test("a reconnect replay re-reports base and ready without opening a second window", () => {
+test("a reconnect replay re-reports base and ready without opening a second window", async () => {
   const { plan, handles, events } = harness();
   plan.start();
   handles[0].apply();
   handles[1].apply();
   plan.openWindow(9n, [1n, 2n, 3n], NOW);
   handles[2].apply();
+  await settle();
   events.length = 0;
   // Replay: the SDK re-applies the retained handles (base and window; the seed was dropped).
   handles[0].apply();
   plan.openWindow(9n, [1n, 2n, 3n], NOW); // what index.ts does on the replayed base
   handles[2].apply();
+  await settle();
   assert.equal(handles.length, 3);
   assert.deepEqual(events, ["base", "ready"]);
 });
 
-test("re-floor: a new window replaces the old only once applied; small moves are skipped", () => {
+test("re-floor: a new window replaces the old only once applied; small moves are skipped", async () => {
   const { plan, handles, events } = harness();
   plan.start();
   handles[0].apply();
@@ -218,6 +225,7 @@ test("re-floor: a new window replaces the old only once applied; small moves are
   assert.equal(plan.refloor([10n, 20n, 30n, 40n], NOW), false, "window not applied yet");
   const old = handles[2];
   old.apply();
+  await settle();
   events.length = 0;
 
   // Same seats, game floor moved too little: nothing to do.
@@ -231,6 +239,7 @@ test("re-floor: a new window replaces the old only once applied; small moves are
   assert.equal(plan.floors!.mine, 10n, "the old window stays current until the new one is applied");
   assert.equal(plan.refloor([10n, 20n, 30n, 40n, 50n], t1 + REFLOOR_RETRY_MS), false, "one re-floor at a time");
   next.apply();
+  await settle();
   assert.equal(old.unsubscribes, 1);
   assert.equal(plan.floors!.mine, 20n);
   assert.deepEqual(events, ["log:window re-floored"], "a re-floor is not a new readiness");
@@ -243,13 +252,14 @@ test("re-floor: a new window replaces the old only once applied; small moves are
   assert.equal(handles[4].queries[0].includes("mp.match_id >= 20"), true);
 });
 
-test("a failed re-floor keeps the current window; a failed window or base asks for a resubscribe", () => {
+test("a failed re-floor keeps the current window; a failed window or base asks for a resubscribe", async () => {
   const { plan, handles, events } = harness();
   plan.start();
   handles[0].apply();
   handles[1].apply();
   plan.openWindow(9n, [10n, 20n, 30n], NOW);
   handles[2].apply();
+  await settle();
   events.length = 0;
   assert.equal(plan.refloor([10n, 20n, 30n, 40n], NOW), true);
   handles[3].fail(new Error("bad query"));
@@ -271,31 +281,36 @@ test("a failed re-floor keeps the current window; a failed window or base asks f
   assert.deepEqual(other.events, ["error:Error: base gone"]);
 });
 
-test("a plan whose base failed never reports ready again, even when its window replays", () => {
-  // Codex round 3: a replay where the base fails and the window survives
-  // reports the error; if a second drop cancels the resubscribe, the next
-  // replay holds only the window. It must not mark the bot ready without
-  // the base (credential, bot table, rack, lobby memberships).
+test("a replay that refuses the base reports no readiness, then or on any later replay", async () => {
+  // Codex rounds 3 and 4. SDK 2.12 replays every retained handle in one
+  // message: it reports the applied sets first, the refused ones after, and a
+  // handle stays active across the drop. A replay that refuses the base and
+  // re-applies the window must not mark the bot ready (not even for the rest
+  // of that message: bootstrap would join a lobby, bids would go out without
+  // the rack), and neither may a later replay of the window alone.
   const { plan, handles, events } = harness();
   plan.start();
   handles[0].apply();
   handles[1].apply();
   plan.openWindow(9n, [1n, 2n, 3n], NOW);
   handles[2].apply();
+  await settle();
   assert.deepEqual(events, ["base", "ready"]);
   events.length = 0;
-  // First replay: the SDK emits the window's apply, then the base's failure.
+  // First replay: the window's apply, then the base's refusal, in one message.
   handles[2].apply();
   handles[0].fail(new Error("base replay refused"));
-  assert.deepEqual(events, ["ready", "error:Error: base replay refused"]);
+  await settle();
+  assert.deepEqual(events, ["error:Error: base replay refused"]);
   events.length = 0;
-  // Second replay: only the window comes back.
+  // A second drop cancelled the resubscribe; the next replay holds only the window.
   handles[2].apply();
+  await settle();
   assert.deepEqual(events, [], "no readiness without the base");
   assert.equal(handles[2].unsubscribes, 0, "its rows stay for the resubscribe to overlap");
 });
 
-test("the window reports ready only while the base is applied", () => {
+test("the window reports ready only while the base is applied", async () => {
   const { plan, handles, events } = harness();
   plan.start();
   handles[0].apply();
@@ -303,10 +318,11 @@ test("the window reports ready only while the base is applied", () => {
   plan.openWindow(9n, [1n, 2n, 3n], NOW);
   handles[0].active = false; // the base dropped out underneath (no callback yet)
   handles[2].apply();
+  await settle();
   assert.deepEqual(events, ["base"]);
 });
 
-test("stop drops every applied handle; late applies retire themselves and report nothing", () => {
+test("stop drops every applied handle; late applies retire themselves and report nothing", async () => {
   const { plan, handles, events } = harness();
   plan.start();
   handles[0].apply();
@@ -318,23 +334,26 @@ test("stop drops every applied handle; late applies retire themselves and report
   assert.deepEqual(events, []);
   handles[1].fail(new Error("late"));
   plan.openWindow(9n, [1n], NOW);
+  await settle();
   assert.equal(handles.length, 2, "a stopped plan opens nothing");
   assert.deepEqual(events, []);
 });
 
-test("quiesce keeps applied handles (their rows) but reports nothing; stop then drops them", () => {
+test("quiesce keeps applied handles (their rows) but reports nothing; stop then drops them", async () => {
   const { plan, handles, events } = harness();
   plan.start();
   handles[0].apply();
   handles[1].apply();
   plan.openWindow(9n, [1n, 2n, 3n], NOW);
   handles[2].apply();
+  await settle();
   events.length = 0;
   plan.quiesce();
   assert.deepEqual(handles.map((h) => h.unsubscribes), [0, 1, 0], "only the seed was dropped (by the window)");
   // A reconnect replay of a quiesced plan: it stays subscribed and reports nothing.
   handles[0].apply();
   handles[2].apply();
+  await settle();
   assert.deepEqual(handles.map((h) => h.unsubscribes), [0, 1, 0]);
   handles[2].fail(new Error("gone"));
   assert.deepEqual(events, []);
@@ -347,13 +366,14 @@ test("quiesce keeps applied handles (their rows) but reports nothing; stop then 
   assert.deepEqual(handles.map((h) => h.unsubscribes), [1, 1, 0]);
 });
 
-test("a reconnect replay during a resubscribe keeps the old window until the new one is applied", () => {
+test("a reconnect replay during a resubscribe keeps the old window until the new one is applied", async () => {
   // Codex round 2: A's window applied, A's base failed, so B was started; the
   // connection dropped before B opened its window, and the replay re-applies
   // A's window next to B's base and seed. A's window must stay subscribed
   // until B's window is applied, or rows in both leave the cache and their
   // insert callbacks (fpHistory, auction log) fire again.
   const ops: string[] = [];
+  const hs: FakeHandle[] = [];
   const chain = new PlanChain();
   const make = (name: string) => {
     let n = 0;
@@ -367,6 +387,7 @@ test("a reconnect replay during a resubscribe keeps the old window until the new
           ops.push(`unsubscribe ${label}`);
           unsub();
         };
+        hs.push(h);
         return h;
       },
       SCOPE,
@@ -379,34 +400,25 @@ test("a reconnect replay during a resubscribe keeps the old window until the new
     );
     return plan;
   };
-  const hs: FakeHandle[] = [];
-  const capture = (plan: TargetedSubscription) => {
-    // Grab the handles the plan creates, in order.
-    const sub = (plan as unknown as { subscribe: (...a: unknown[]) => FakeHandle }).subscribe;
-    (plan as unknown as { subscribe: (...a: unknown[]) => FakeHandle }).subscribe = (...a: unknown[]) => {
-      const h = sub(...a);
-      hs.push(h);
-      return h;
-    };
-  };
   const a = make("A");
-  capture(a);
   chain.replace(a);
   a.start();
   hs[0].apply(); // A base
   hs[1].apply(); // A seed -> A window subscribed
   hs[2].apply(); // A window applied -> ready
+  await settle();
   hs[0].fail(new Error("base removed")); // index.ts resubscribes
   const b = make("B");
-  capture(b);
   chain.replace(b);
   b.start(); // B base, B seed
   // Disconnect, then the replay: A's window, B's base and seed.
   hs[2].apply();
   hs[3].apply();
   hs[4].apply(); // B opens its window
+  await settle();
   assert.ok(!ops.includes("unsubscribe A:window"), `A's window dropped early: ${ops.join(", ")}`);
   hs[5].apply(); // B's window applied: now A goes
+  await settle();
   const iDrop = ops.indexOf("unsubscribe A:window");
   assert.ok(iDrop > ops.indexOf("subscribe B:window"), ops.join(", "));
   assert.deepEqual(
@@ -416,20 +428,21 @@ test("a reconnect replay during a resubscribe keeps the old window until the new
   );
 });
 
-test("stop after quiesce drops the handles that were kept", () => {
+test("stop after quiesce drops the handles that were kept", async () => {
   const { plan, handles } = harness();
   plan.start();
   handles[0].apply();
   handles[1].apply();
   plan.openWindow(9n, [1n, 2n, 3n], NOW);
   handles[2].apply();
+  await settle();
   plan.quiesce();
   assert.deepEqual(handles.map((h) => h.unsubscribes), [0, 1, 0]);
   plan.stop();
   assert.deepEqual(handles.map((h) => h.unsubscribes), [1, 1, 1]);
 });
 
-test("resubscribe chain: attempts that fail in a row are all dropped once one succeeds", () => {
+test("resubscribe chain: attempts that fail in a row are all dropped once one succeeds", async () => {
   const handles: FakeHandle[] = [];
   const chain = new PlanChain();
   const errors: string[] = [];
@@ -463,6 +476,7 @@ test("resubscribe chain: attempts that fail in a row are all dropped once one su
   assert.equal(chain.retiredCount, 2);
   assert.equal(handles.filter((h) => h.active).length, 6, "A's and B's base and seed are still cached");
   win.apply();
+  await settle();
   assert.equal(chain.retiredCount, 0);
   const active = handles.filter((h) => h.active);
   assert.deepEqual(

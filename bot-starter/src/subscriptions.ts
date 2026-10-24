@@ -294,14 +294,24 @@ export class TargetedSubscription {
           );
           return;
         }
-        // Ready needs the base too (credential, bot table, rack, lobby memberships).
-        if (!this.base?.handle?.isActive()) return;
-        // The seed did its job; the window holds the seats from our floor on.
-        if (this.seed) {
-          drop(this.seed.handle);
-          this.seed = null;
-        }
-        this.hooks.onReady();
+        // Readiness waits for the rest of this message. A reconnect replay
+        // reports every applied set first and the refused ones after it (SDK
+        // 2.12 #applyReplayBatch), and a handle stays active across the drop,
+        // so a base refused in the same replay is known only once the message
+        // is done. The rows and their insert callbacks are already in place
+        // by then; index.ts's onReady runs bot.tick at once, which refreshes
+        // (and bids on) an auction that opened meanwhile.
+        queueMicrotask(() => {
+          if (this.stopped || this.quiesced || entry !== this.window) return;
+          // Ready needs the base too (credential, bot table, rack, lobby memberships).
+          if (!this.base?.handle?.isActive() || !entry.handle?.isActive()) return;
+          // The seed did its job; the window holds the seats from our floor on.
+          if (this.seed) {
+            drop(this.seed.handle);
+            this.seed = null;
+          }
+          this.hooks.onReady();
+        });
       },
       floors,
     );
