@@ -45,6 +45,8 @@ const AUCTION_LOG_PATH = path.join(process.cwd(), `sookra-${BOT_NAME}.auctions.l
 const TICK_MS = 250;
 /** Retry delay when the very first connection fails (the SDK only retries established ones). */
 const INITIAL_RETRY_MS = 5000;
+/** After an automatic reconnect, resume decisions this long later even without a replay confirmation. */
+const RESUME_FALLBACK_MS = 5000;
 
 function loadToken(): string | undefined {
   try {
@@ -122,7 +124,9 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   conn
     .subscriptionBuilder()
     .onApplied(() => {
+      // Fires on the first subscription and again after every reconnect replay.
       console.log(`[${BOT_NAME}] subscription applied`);
+      bot.online = true;
 
       // Resolve our bot id, possibly after claiming a nonce.
       bot.myBotId = resolveMyBotId(conn);
@@ -165,8 +169,9 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     .subscribeToAllTables();
 
   const c = asConn(conn);
+  // Latency-critical: bid synchronously from the precomputed table, defer the rest.
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
-    if (a.status.tag === "Open") bot.scheduleRefresh(c, a.matchId);
+    if (a.status.tag === "Open") bot.onAuctionOpen(c, a);
   });
   conn.db.myRack.onInsert((_ctx, h) => bot.scheduleRefresh(c, h.matchId));
   conn.db.myRack.onUpdate((_ctx, _old, h) => bot.scheduleRefresh(c, h.matchId));
@@ -257,7 +262,16 @@ function main() {
     .withToken(BOT_TOKEN ?? loadToken())
     .withAutomaticReconnect({ minDelayMs: 1000, maxDelayMs: 10_000 })
     .onConnect(onConnect)
-    .onAutomaticReconnect(() => console.log(`[${BOT_NAME}] reconnected`))
+    .onAutomaticReconnect(() => {
+      console.log(`[${BOT_NAME}] reconnected; waiting for subscription replay`);
+      // Replay re-fires onApplied, which resumes decisions. If it never does, resume anyway.
+      setTimeout(() => {
+        if (!bot.online) {
+          console.warn(`[${BOT_NAME}] no replay confirmation after reconnect; resuming`);
+          bot.online = true;
+        }
+      }, RESUME_FALLBACK_MS);
+    })
     .onConnectError(
       (_ctx: ErrorContext, err: Error, nextAttempt?: number, nextDelayMs?: number) => {
         console.error(
@@ -268,6 +282,8 @@ function main() {
       },
     )
     .onDisconnect((_ctx: ErrorContext, err?: Error, nextAttempt?: number) => {
+      // The cache is stale until replay: make no decisions on it.
+      bot.online = false;
       console.log(
         `[${BOT_NAME}] disconnected${err ? `: ${err.message}` : ""}` +
           (nextAttempt !== undefined ? ` (reconnect attempt ${nextAttempt})` : ""),
