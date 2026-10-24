@@ -66,9 +66,9 @@ export const PACED_KAPPA = 4;
 /**
  * Early bid cut while pacing: in the first EARLY_AUCTIONS auctions of a match
  * (auction index auctionsPerMatch - 1 - bagTotal), kappa is multiplied by
- * EARLY_KAPPA_SCALE, at tables with at least EARLY_MIN_RIVALS rivals
- * (2: duels are exempt). Coins not spent early raise the pacing factor
- * later. EARLY_KAPPA_SCALE 1: off.
+ * EARLY_KAPPA_SCALE, at tables with at least EARLY_MIN_REAL_RIVALS real
+ * (non-sim) rivals, so duels are exempt. Coins not spent early raise the
+ * pacing factor later. EARLY_KAPPA_SCALE 1: off.
  *
  * Live (builds B to E, rival-data-v4 findings): in auctions 1 to 22 SookraBot's
  * winning bid averaged 30.7 against 14.7 to 23.2 for the top six bots, and it
@@ -76,16 +76,21 @@ export const PACED_KAPPA = 4;
  * to 4.9 for james, Dante, LetterShark, cashu and keanu. Cloud self-play (round
  * 3, seed 404, 600 matches a field, with ENDGAME_AUCTIONS 8): +8.1 points and
  * -0.58 places at ar6-top (t 10.6), +8.4 at ar6-v4, +22.4 at ar4-top, +22.0 at
- * ar3-top, +10.3 against two SookraBot copies, +7.7 against rack-aware
- * shark-policy rivals, +1.2 at 8 seats. Window 28 against 22 and 34 in the same
- * run: 34 lost 1.1 to 1.2 points at 7 and 8 seats, 22 lost 5.4 at 4 seats, and
+ * ar3-top, +7.7 against rack-aware shark-policy rivals, +1.2 at 8 seats, and
+ * +10.3 against two SookraBot copies playing the old defaults (-2.2 at seed 606
+ * when the copies cut too). Window 28 against 22 and 34 in the same run: 34
+ * lost 1.1 to 1.2 points at 7 and 8 seats, 22 lost 5.4 at 4 seats, and
  * elsewhere the three were within 2.6 points. A cut in duels lost 31 to 63
- * points a game (round 1), hence EARLY_MIN_RIVALS 2. Rivals are counted as
- * seated opponents, sims included (tournament tables seat no sims).
+ * points a game (round 1). Sims do not count: at six-seat tables of one real
+ * rival and four sims the cut lost 28 and 44 points a match (pad-code and
+ * pad-ls, seed 606, 400 matches, t -11.6 and -19.4) where ENDGAME_AUCTIONS 8
+ * alone gained 1.0; with two real rivals and three sims the tuned rules gained
+ * 5.6 (pad-ls-code, t 3.0), 2.0 without the cut. A casual lobby can be padded
+ * with sims, and an admin can enter sims into a tournament (registerSimBots).
  */
 export const EARLY_AUCTIONS = 28;
 export const EARLY_KAPPA_SCALE = 0.4;
-export const EARLY_MIN_RIVALS = 2;
+export const EARLY_MIN_REAL_RIVALS = 2;
 /** Every bot starts a match with this balance (game.ts STARTING_BALANCE). */
 export const STARTING_BALANCE = 100;
 /** Tiles in the bag at the start of a match (letters.ts DEFAULT_BAG). */
@@ -181,7 +186,7 @@ export interface Policy {
   readonly PACED_KAPPA: number;
   readonly EARLY_AUCTIONS: number;
   readonly EARLY_KAPPA_SCALE: number;
-  readonly EARLY_MIN_RIVALS: number;
+  readonly EARLY_MIN_REAL_RIVALS: number;
   readonly LEAVE_ALPHA: number;
   readonly CASH_MIN_LEN: number;
   readonly HOLD_MIN_REAL_RIVALS: number;
@@ -213,7 +218,7 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   PACED_KAPPA,
   EARLY_AUCTIONS,
   EARLY_KAPPA_SCALE,
-  EARLY_MIN_RIVALS,
+  EARLY_MIN_REAL_RIVALS,
   LEAVE_ALPHA,
   CASH_MIN_LEN,
   HOLD_MIN_REAL_RIVALS,
@@ -327,19 +332,20 @@ export function paceMultiplier(
 
 /**
  * Early bid cut on the paced kappa (see EARLY_AUCTIONS): `scale` in the first
- * `window` auctions of a match (auction index auctions - 1 - bagTotal) at
- * tables with at least `minRivals` rivals, else 1. The parameters default to
- * EARLY_KAPPA_SCALE, EARLY_AUCTIONS and EARLY_MIN_RIVALS; scale 1 is off.
+ * `window` auctions of a match (auction index auctions - 1 - bagTotal) when
+ * `realRivals` (seated non-sim opponents) is at least `minRealRivals`, else 1.
+ * The parameters default to EARLY_AUCTIONS, EARLY_KAPPA_SCALE and
+ * EARLY_MIN_REAL_RIVALS; scale 1 is off.
  */
 export function earlyScale(
   bagTotal: number,
   auctions: number,
-  rivals: number,
+  realRivals: number,
   window = EARLY_AUCTIONS,
   scale = EARLY_KAPPA_SCALE,
-  minRivals = EARLY_MIN_RIVALS,
+  minRealRivals = EARLY_MIN_REAL_RIVALS,
 ): number {
-  if (scale === 1 || rivals < minRivals) return 1;
+  if (scale === 1 || realRivals < minRealRivals) return 1;
   return auctions - 1 - bagTotal < window ? scale : 1;
 }
 
@@ -384,7 +390,8 @@ export function duelReserve(opponentCount: number, bagTotal: number, p: Policy =
  *    ENDGAME_AUCTIONS (8) auctions and multiplied by the budget pacing
  *    factor (pacedKappa; its floor is PACE_MIN_DUEL in a duel, PACE_MIN
  *    otherwise), and by EARLY_KAPPA_SCALE in the first EARLY_AUCTIONS
- *    auctions at tables of EARLY_MIN_RIVALS or more rivals (earlyScale);
+ *    auctions at tables of EARLY_MIN_REAL_RIVALS or more real (non-sim)
+ *    rivals (earlyScale);
  *  - first price (you pay your own bid): shade to min(full bid, estimated
  *    price to win), where the estimate is max(max sim bid + 1, FP_QUANTILE
  *    of recent real-rival winning prices for letters of the same face value
@@ -443,16 +450,18 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
   const simsOnly = input.opponents.length > 0 && sims.length === input.opponents.length;
   const paced = pacingOn(simsOnly, input.auctionsPerMatch);
   const paceMin = input.opponents.length <= p.DUEL_MAX_OPPONENTS ? p.PACE_MIN_DUEL : p.PACE_MIN;
+  // The early cut counts real rivals only, as HOLD_MIN_REAL_RIVALS does (bot.ts).
+  const realRivals = input.opponents.filter((o) => !o.isSim).length;
   // paced implies auctionsPerMatch is a positive number (pacingOn).
   const kappaExact = paced
     ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin, p) *
       earlyScale(
         input.bagTotal,
         input.auctionsPerMatch!,
-        input.opponents.length,
+        realRivals,
         p.EARLY_AUCTIONS,
         p.EARLY_KAPPA_SCALE,
-        p.EARLY_MIN_RIVALS,
+        p.EARLY_MIN_REAL_RIVALS,
       )
     : kappaFor(input.bagTotal, undefined, p);
   const kappa = +kappaExact.toFixed(4); // for the reason strings
