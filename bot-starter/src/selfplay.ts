@@ -93,6 +93,31 @@
 // points below their live level (they turn fewer letters into 7+ words), so
 // levels are optimistic for SookraBot; trust paired differences, check a
 // result in ar6-top-mixed too, and calibrate rho with validate4.
+//
+// Entries named -v5* were refitted on the v5 snapshot (1318 matches,
+// 2026-10-24 10:52 UTC; all-real 6-seat matches only): the current top eleven
+// (V5_TOP), each over its latest stable range, SookraBot's 02:15 PDT build,
+// Heidi, and every other bot with 15+ seats at the all-real tables from m1000
+// on. -v5 is the existing format and -v5c adds the v4c extensions, as for v4.
+// validate5 replays the 288 live all-real tables from m1000 on with the fits
+// (each rival meets the opponents it met live) and sets each rival's numbers
+// beside its live ones (fixtures/rival-live-v5.json); calibrate.yml runs it.
+// There the -v5c top eleven score 4 to 29 points under live (mean 15), and
+// rho up to 0.9 recovers a third of it. The replays show why: the live top
+// bots bid by what a letter is worth to their rack, winning a dead letter
+// (one that adds nothing to the greedy pack value of the rack) about half as
+// often as a useful one and a useful one more often the more it adds, and
+// several bid lower in the opening than in the midgame, which the one 1-to-50
+// clock block of the fits averages away. -v5u splits the bids three ways
+// (complete7, useful, dead), -v5p adds an opening clock block (auctions
+// 1-22), and -v5g draws a useful letter's bid by its gain (gainCells). The
+// calibrated rivals, -v5k (V5_CALIBRATION), are the -v5g fits with every bid
+// lowered (the fits' bid level drains the simulated rivals' money by the
+// midgame: they can outbid the best competing bid in fewer auctions than live
+// and hold their words until the end) and per-rival scales for the top
+// eleven (calibrate5, update secant). The v5 fields (ar6-top5-v5,
+// ar6-field-v5, ar6-mixed-v5, ar4/ar3-top-v5, ar4/ar3-topdraw-v5,
+// duel-*-v5) seat the -v5k rivals.
 
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -1168,9 +1193,16 @@ const V5_ENTRIES: readonly V5Entries[] = ["v5", "v5c", "v5u", "v5p", "v5g", "v5k
  * dead runs) times this (absent: 1), as fitted by calibrate5.
  */
 export const V5_CALIBRATION: { base: "v5c" | "v5u" | "v5p" | "v5g"; mods: string; rho?: number; bidScale: Record<string, number> } = {
-  base: "v5c",
-  mods: "",
-  bidScale: {},
+  base: "v5g",
+  // Every rival's bids times 0.7: the best level of a grid of 0.6 to 1.1 (run 40093222909, seed 4: mean
+  // absolute score error over the top eleven 7.9 at 0.7, 10.0 at 0.9; 40092960695: 11.7 at 1.1).
+  mods: "bidx=0.7",
+  // The top eleven, on top of that: a least-squares line through each one's (scale, error) pairs over the six
+  // rounds of the secant fit (run 40093581785, 864 matches a round), solved for zero error, within [0.6, 1.6].
+  bidScale: {
+    postturing: 0.84, guesser: 1.53, Dante: 1.6, Doppio: 1.27, Nijello: 0.77, Vickey: 1.6, LetterSharkPro: 1.6,
+    Ally: 1.32, atlas: 1.09, marcellinus: 1.27, Cashu: 1.6,
+  },
 };
 
 /** A v5 rival's model: its -v5, -v5c or -v5u fixture entry, or for v5k its V5_CALIBRATION base entry calibrated. */
