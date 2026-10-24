@@ -23,8 +23,13 @@ import {
   DUEL_MAX_OPPONENTS,
   DUEL_RESERVE_PER_AUCTION,
   DUEL_RESERVE_WINDOW,
+  EARLY_AUCTIONS,
+  EARLY_KAPPA_SCALE,
+  ENDGAME_AUCTIONS,
   ENDGAME_KAPPA_BOOST,
   FLUSH_LEAD_MS,
+  FP_NO_HISTORY_SHADE,
+  FP_QUANTILE,
   KAPPA,
   LEAVE_ALPHA,
   LIQUIDITY_FALLBACK_MIN_LEN,
@@ -66,10 +71,13 @@ test("budget pacing: kappa scales with the balance left per remaining auction", 
   const bid = (myBalance: number, bagTotal: number) =>
     decideBid({ letter: "S", delta: 6, bagTotal, auctionType: "Vickrey", myBalance, opponents: real, auctionsPerMatch: 68 })
       .amount;
-  assert.equal(bid(100, 67), Math.floor(PACED_KAPPA * 6)); // even spend: the paced base kappa
-  assert.equal(bid(20, 40), Math.floor(PACED_KAPPA * paceMultiplier(20, 40, 68) * 6)); // ahead of even spend
+  // Even spend at the first auction: the paced base kappa, cut to EARLY_KAPPA_SCALE inside EARLY_AUCTIONS.
+  assert.equal(bid(100, 67), Math.floor(PACED_KAPPA * EARLY_KAPPA_SCALE * 6));
+  // Ahead of even spend (index 27, still early): less.
+  assert.equal(bid(20, 40), Math.floor(PACED_KAPPA * paceMultiplier(20, 40, 68) * EARLY_KAPPA_SCALE * 6));
   assert.ok(bid(20, 40) < Math.floor(PACED_KAPPA * 6));
-  assert.ok(bid(60, 20) > Math.floor(PACED_KAPPA * 6)); // behind even spend: bids more
+  assert.ok(bid(60, 20) > Math.floor(PACED_KAPPA * 6)); // behind even spend (past the early window): bids more
+  assert.equal(bid(60, 20), Math.floor(PACED_KAPPA * paceMultiplier(60, 20, 68) * 6));
   const endgame = decideBid({
     letter: "S", delta: 1, bagTotal: 5, auctionType: "Vickrey", myBalance: 30, opponents: real, auctionsPerMatch: 68,
   }).amount;
@@ -310,11 +318,13 @@ test("decideBid: final letter, no value, kappa, endgame boost, balance cap", () 
   assert.equal(decideBid({ ...base, bagTotal: 30, delta: -2 }).amount, 0);
   assert.equal(decideBid({ ...base, bagTotal: 30, delta: NaN }).amount, 0);
   assert.equal(decideBid({ ...base, bagTotal: 30 }).amount, Math.floor(KAPPA * 6)); // 25
-  assert.equal(kappaFor(12), KAPPA);
-  assert.equal(kappaFor(11), KAPPA * 2);
-  assert.equal(decideBid({ ...base, bagTotal: 11 }).amount, 51);
-  assert.equal(decideBid({ ...base, bagTotal: 11, myBalance: 20 }).amount, 20);
-  assert.equal(decideBid({ ...base, bagTotal: 11, myBalance: -5 }).amount, 0);
+  assert.equal(ENDGAME_AUCTIONS, 8);
+  assert.equal(kappaFor(ENDGAME_AUCTIONS), KAPPA);
+  assert.equal(kappaFor(ENDGAME_AUCTIONS - 1), KAPPA * 2);
+  const late = ENDGAME_AUCTIONS - 1;
+  assert.equal(decideBid({ ...base, bagTotal: late }).amount, 51);
+  assert.equal(decideBid({ ...base, bagTotal: late, myBalance: 20 }).amount, 20);
+  assert.equal(decideBid({ ...base, bagTotal: late, myBalance: -5 }).amount, 0);
 });
 
 test("budget pacing in a duel: the factor stops at PACE_MIN_DUEL, not PACE_MIN", () => {
@@ -328,7 +338,8 @@ test("budget pacing in a duel: the factor stops at PACE_MIN_DUEL, not PACE_MIN",
   assert.equal(paceMultiplier(50, 10, undefined, PACE_MIN_DUEL), 1); // match length unknown: pacing off
   // pacedKappa: PACED_KAPPA, doubled in the last ENDGAME_AUCTIONS auctions, times the factor.
   assert.equal(pacedKappa(30, 100, 68), PACED_KAPPA * paceMultiplier(100, 30, 68));
-  assert.equal(pacedKappa(11, 100, 68), PACED_KAPPA * ENDGAME_KAPPA_BOOST * paceMultiplier(100, 11, 68));
+  assert.equal(pacedKappa(7, 100, 68), PACED_KAPPA * ENDGAME_KAPPA_BOOST * paceMultiplier(100, 7, 68));
+  assert.equal(pacedKappa(8, 100, 68), PACED_KAPPA * paceMultiplier(100, 8, 68));
   assert.equal(pacedKappa(70, 40, 88, PACE_MIN_DUEL), PACED_KAPPA * PACE_MIN_DUEL);
   // 40 coins with 71 auctions to go: r = 40 / 71 / (100 / 88) = 0.496, sqrt(r) = 0.704.
   assert.equal(Math.floor(pacedKappa(70, 40, 88) * 6), 16); // what the PACE_MIN floor gives
@@ -336,10 +347,16 @@ test("budget pacing in a duel: the factor stops at PACE_MIN_DUEL, not PACE_MIN",
   const rival: Opponent[] = [{ isSim: false, balance: 100 }];
   // Duel (88 auctions): held at 0.75, kappa 4 x 0.75 = 3, so 18 (the duel reserve of 10 does not bind).
   assert.equal(decideBid({ ...spot, opponents: rival, auctionsPerMatch: 88 }).amount, 18);
-  // First price shades the same paced bid: floor(18 x 0.75) = 13 with no price history.
-  assert.equal(decideBid({ ...spot, auctionType: "FirstPrice", opponents: rival, auctionsPerMatch: 88 }).amount, 13);
-  // Two rivals (83 auctions) get no duel floor: 4 x sqrt(40 / 71 / (100 / 83)) = 2.74, so 16.
-  assert.equal(decideBid({ ...spot, opponents: [...rival, ...rival], auctionsPerMatch: 83 }).amount, 16);
+  // First price shades the same paced bid: floor(18 x FP_NO_HISTORY_SHADE 0.4) = 7 with no price history.
+  assert.equal(decideBid({ ...spot, auctionType: "FirstPrice", opponents: rival, auctionsPerMatch: 88 }).amount, 7);
+  // Two rivals (83 auctions) get no duel floor: 4 x sqrt(40 / 71 / (100 / 83)) = 2.74, so 16 past the
+  // early window; at index 12 the early cut applies (2.74 x 0.4 x 6 = 6.6), so 6. Duels are exempt (above).
+  assert.equal(EARLY_AUCTIONS > 12, true);
+  assert.equal(decideBid({ ...spot, opponents: [...rival, ...rival], auctionsPerMatch: 83 }).amount, 6);
+  assert.equal(
+    decideBid({ ...spot, opponents: [...rival, ...rival], auctionsPerMatch: 83, policy: { ...DEFAULT_POLICY, EARLY_KAPPA_SCALE: 1 } }).amount,
+    16,
+  );
   // Above the floor a duel is paced like any table: the first auction is 4 x 6 = 24.
   assert.equal(decideBid({ ...spot, bagTotal: 87, myBalance: 100, opponents: rival, auctionsPerMatch: 88 }).amount, 24);
   // A sims-only duel and a broke rival keep their own rules.
@@ -378,17 +395,21 @@ test("decideBid: sims-only table caps at the max sim bid + 1", () => {
 
 test("decideBid: first price shades toward the observed price", () => {
   const input = { letter: "T", delta: 6, bagTotal: 30, auctionType: "FirstPrice" as const, myBalance: 100, opponents: REAL };
-  // No history: 75% of the full bid (25 -> 18).
-  assert.equal(decideBid(input).amount, 18);
-  // History of 1-point letters selling for 4..8: q0.75 = 7, bid 8.
+  assert.equal(FP_NO_HISTORY_SHADE, 0.4);
+  assert.equal(FP_QUANTILE, 0.3);
+  // No history: FP_NO_HISTORY_SHADE of the full bid (25 -> 10).
+  assert.equal(decideBid(input).amount, 10);
+  // History of 1-point letters selling for 4..8 (sorted 4 5 5 6 6 7 8): q0.3 = 5, bid 6.
   const fpHistory = [4, 5, 6, 7, 8, 6, 5].map((paid) => ({ face: 1, paid }));
-  assert.equal(decideBid({ ...input, fpHistory }).amount, 8);
+  assert.equal(decideBid({ ...input, fpHistory }).amount, 6);
+  // The same history at quantile 0.75 (the default before 2026-10-24): q0.75 = 7, bid 8.
+  assert.equal(decideBid({ ...input, fpHistory, policy: { ...DEFAULT_POLICY, FP_QUANTILE: 0.75 } }).amount, 8);
   // Never above the full kappa bid.
   const pricey = [40, 41, 42, 43, 44].map((paid) => ({ face: 1, paid }));
   assert.equal(decideBid({ ...input, fpHistory: pricey }).amount, 25);
   // Other face values are ignored.
   const other = [4, 5, 6, 7, 8].map((paid) => ({ face: 3, paid }));
-  assert.equal(decideBid({ ...input, fpHistory: other }).amount, 18);
+  assert.equal(decideBid({ ...input, fpHistory: other }).amount, 10);
 });
 
 test("duel rule: broke rivals get the minimum winning bid", () => {
@@ -575,8 +596,11 @@ test("match 123: 10 coins, a 6-letter word in hand, 46 auctions left: cash it, t
     { isSim: true, strategy: "Aggressive", balance: 100 },
     { isSim: true, strategy: "Cheapskate", balance: 100 },
   ];
+  // Pacing as it was at m123, before the early bid cut (EARLY_KAPPA_SCALE 1); the cut is checked last.
+  const noCut: Policy = { ...DEFAULT_POLICY, EARLY_KAPPA_SCALE: 1 };
   const bid = (letter: string, delta: number, bagTotal: number, myBalance: number, opponents = table, auctions?: number) =>
-    decideBid({ letter, delta, bagTotal, auctionType: "Vickrey", myBalance, opponents, auctionsPerMatch: auctions }).amount;
+    decideBid({ letter, delta, bagTotal, auctionType: "Vickrey", myBalance, opponents, auctionsPerMatch: auctions, policy: noCut })
+      .amount;
   // Auction 22 (G): 16 coins for 47 auctions, 0.23 of the starting rate per auction. The live bid at
   // kappa 4.25 was 8; paced, the factor bottoms out at PACE_MIN (kappa 2): 3.
   assert.equal(bid("G", 1.943, 46, 16), 8);
@@ -584,6 +608,11 @@ test("match 123: 10 coins, a 6-letter word in hand, 46 auctions left: cash it, t
   // Auction 23 (K), after the cash: 45 coins for 46 auctions, kappa 4 x sqrt(0.665) = 3.26: 11, not 14.
   assert.equal(bid("K", 3.374, 45, 45), 14);
   assert.equal(bid("K", 3.374, 45, 45, table, 68), 11);
+  // The live policy cuts both (index 21 and 22 are inside EARLY_AUCTIONS): kappa x 0.4.
+  const live = (letter: string, delta: number, bagTotal: number, myBalance: number) =>
+    decideBid({ letter, delta, bagTotal, auctionType: "Vickrey", myBalance, opponents: table, auctionsPerMatch: 68 }).amount;
+  assert.equal(live("G", 1.943, 46, 16), 1);
+  assert.equal(live("K", 3.374, 45, 45), 4);
   // The same spot in a final (a duel vs LetterShark, 88 auctions): the factor, 0.547, is held at
   // PACE_MIN_DUEL (kappa 3), so 5 rather than 4, inside the duel cap of 16 - 10 reserved = 6.
   assert.equal(bid("G", 1.943, 46, 16, [table[0]], 88), 5);
@@ -604,14 +633,20 @@ test("policy: DEFAULT_POLICY holds each tuning constant under its own name, froz
 });
 
 test("policy: each bid knob set in the policy moves decideBid as its constant does", () => {
+  // The numbers below were worked out with the early cut off, ENDGAME_AUCTIONS 12 and first-price
+  // quantile and shade 0.75 (the defaults before the 2026-10-24 strategy search); each override applies on top.
+  const BASE: Partial<Policy> = { EARLY_KAPPA_SCALE: 1, ENDGAME_AUCTIONS: 12, FP_QUANTILE: 0.75, FP_NO_HISTORY_SHADE: 0.75 };
   const bid = (o: Partial<Policy>, x: Partial<Parameters<typeof decideBid>[0]> = {}) =>
     decideBid({
       letter: "S", delta: 5, bagTotal: 40, auctionType: "Vickrey", myBalance: 100, opponents: REAL,
-      auctionsPerMatch: 68, ...x, policy: withPolicy(o),
+      auctionsPerMatch: 68, ...x, policy: withPolicy({ ...BASE, ...o }),
     }).amount;
   // 100 coins for 41 auctions of 68: r = 68/41, pacing factor sqrt(r) = 1.2878.
   assert.equal(bid({}), 25);
-  assert.equal(bid({}), decideBid({ letter: "S", delta: 5, bagTotal: 40, auctionType: "Vickrey", myBalance: 100, opponents: REAL, auctionsPerMatch: 68 }).amount);
+  // No policy given: the live DEFAULT_POLICY, whose early cut applies at index 27: 5.1514 x 0.4 x 5 = 10.
+  const live = decideBid({ letter: "S", delta: 5, bagTotal: 40, auctionType: "Vickrey", myBalance: 100, opponents: REAL, auctionsPerMatch: 68 });
+  assert.equal(live.amount, 10);
+  assert.equal(live.amount, bid({ ...DEFAULT_POLICY }));
   assert.equal(bid({ PACED_KAPPA: 6 }), 38);
   assert.equal(bid({ PACE_EXPONENT: 1 }), 33);
   assert.equal(bid({ PACE_MAX: 1 }), 20);
@@ -660,9 +695,10 @@ test("policy: each bid knob set in the policy moves decideBid as its constant do
   assert.equal(bid({ EARLY_AUCTIONS: 27, EARLY_KAPPA_SCALE: 0.5 }), 25, "index 27 is past the first 27");
   assert.equal(bid({ EARLY_AUCTIONS: 28 }), 25, "scale 1: off");
   assert.equal(bid({ EARLY_AUCTIONS: 28, EARLY_KAPPA_SCALE: 0.5 }, { auctionsPerMatch: undefined }), Math.floor(KAPPA * 5), "unpaced: off");
-  // In a duel (index 27 of 88) unless EARLY_MIN_RIVALS exempts it: kappa 3 halved, 3 rather than 6.
-  assert.equal(bid({ EARLY_AUCTIONS: 30, EARLY_KAPPA_SCALE: 0.5 }, duel), 3);
+  // In a duel (index 27 of 88) only when EARLY_MIN_RIVALS allows it: kappa 3 halved, 3 rather than 6.
+  assert.equal(bid({ EARLY_AUCTIONS: 30, EARLY_KAPPA_SCALE: 0.5, EARLY_MIN_RIVALS: 1 }, duel), 3);
   assert.equal(bid({ EARLY_AUCTIONS: 30, EARLY_KAPPA_SCALE: 0.5, EARLY_MIN_RIVALS: 2 }, duel), 6);
+  assert.equal(bid({ ...DEFAULT_POLICY }, duel), 6, "the live policy exempts duels");
 });
 
 test("policy: word, flush and leave knobs set in the policy move chooseWords, flushLeadMs and alphaFor", () => {

@@ -25,8 +25,15 @@ export { LETTER_VALUE } from "./engine.js";
 
 /** Currency bid per point of marginal value against real bots (sim best response 4 to 4.5). */
 export const KAPPA = 4.25;
-/** Kappa is multiplied by ENDGAME_KAPPA_BOOST when fewer than this many auctions remain. */
-export const ENDGAME_AUCTIONS = 12;
+/**
+ * Kappa is multiplied by ENDGAME_KAPPA_BOOST when fewer than this many auctions remain.
+ * 8, not 12: with 12 the bot spent its last coins on letters worth only their leave
+ * value (live m625: N, N, O at 19 to 21 each). Cloud self-play (seed 101, 400
+ * matches a field): +1.1 to +1.6 points in each of ar6-top, ar6-v4, ar4-top and
+ * ar6-top-mixed (t 3.8 to 6.2), while 18 lost 0.6 to 4.8; in duels +0.0 to +0.5
+ * (seed 404, 1200 a field), the 3-game final unchanged.
+ */
+export const ENDGAME_AUCTIONS = 8;
 export const ENDGAME_KAPPA_BOOST = 2;
 /**
  * Budget pacing at tables with a real rival: kappa is multiplied by
@@ -61,11 +68,20 @@ export const PACED_KAPPA = 4;
  * (auction index auctionsPerMatch - 1 - bagTotal), kappa is multiplied by
  * EARLY_KAPPA_SCALE, at tables with at least EARLY_MIN_RIVALS rivals
  * (2: duels are exempt). Coins not spent early raise the pacing factor
- * later. EARLY_KAPPA_SCALE 1 (default): off.
+ * later. EARLY_KAPPA_SCALE 1: off.
+ *
+ * Live, SookraBot spent 66 coins on 3.9 letters in auctions 1 to 22 (winning bid
+ * 30.7 against 14.7 to 23.2 for the top six bots), then won 1.9 letters in
+ * auctions 23 to 45. Cloud self-play (round 3, seed 404, 600 matches a field, with
+ * ENDGAME_AUCTIONS 8): +8.1 points and -0.58 places at ar6-top (t 10.6), +8.4 at
+ * ar6-v4, +22.4 at ar4-top, +22.0 at ar3-top, +10.3 against two SookraBot
+ * copies, +7.7 against rack-aware shark-policy rivals, +1.2 at 8 seats; 28 is
+ * within 1 to 2 points of 22 and 34 in every field. A cut in duels lost 31 to
+ * 63 points a game (round 1), hence EARLY_MIN_RIVALS 2.
  */
-export const EARLY_AUCTIONS = 0;
-export const EARLY_KAPPA_SCALE = 1;
-export const EARLY_MIN_RIVALS = 1;
+export const EARLY_AUCTIONS = 28;
+export const EARLY_KAPPA_SCALE = 0.4;
+export const EARLY_MIN_RIVALS = 2;
 /** Every bot starts a match with this balance (game.ts STARTING_BALANCE). */
 export const STARTING_BALANCE = 100;
 /** Tiles in the bag at the start of a match (letters.ts DEFAULT_BAG). */
@@ -123,12 +139,22 @@ export const SIM_BID_JITTER = 2;
  * whole hoard while an early one only strands the last few letters.
  */
 export const FLUSH_LEAD_MS = 3000;
-/** First-price shading: recent rival prices kept, minimum sample, quantile. */
+/**
+ * First-price shading: recent rival prices kept, minimum sample, quantile.
+ * FP_QUANTILE 0.3 and FP_NO_HISTORY_SHADE 0.4 (from 0.75 and 0.75): in every
+ * first-price field the cloud search tried, shading harder won more. Round 1.5
+ * (seed 202, 400 matches): quantile and shade 0.6 gave +7 to +11 points at
+ * ar6-top,fp tables, 0.5 gave +11 to +18, 0.4 and 0.5 gave +15 to +20, also when
+ * the rivals shade their own bids by 25%. Round 3 (seed 404, 500 matches, with the
+ * early cut and ENDGAME_AUCTIONS 8): 0.3 and 0.4 gave +24 to +31 at 6-seat
+ * first-price tables against +19 to +25 for 0.4 and 0.5. Untested against live
+ * first-price rivals; casual matches are Vickrey.
+ */
 export const FP_HISTORY_MAX = 40;
 export const FP_MIN_OBS = 5;
-export const FP_QUANTILE = 0.75;
+export const FP_QUANTILE = 0.3;
 /** First-price shading with too little price history: bid this share of the full bid. */
-export const FP_NO_HISTORY_SHADE = 0.75;
+export const FP_NO_HISTORY_SHADE = 0.4;
 /**
  * Broke rivals: when no rival can bid more than this (public balances, sim
  * rules), bid exactly their max + 1 on any letter with value. NYC's final was
