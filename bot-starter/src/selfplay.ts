@@ -116,19 +116,26 @@
 // the simulated rivals run short of money by the midgame: they can outbid the
 // best competing bid in about 10 auctions a match fewer than live and hold
 // their words until the end) and those bids scaled further for each of the
-// top eleven (calibrate5, update secant). On fresh
-// deals (validate5 v5k, seed 31, 1728 matches) ten of the top eleven score
-// within 10 points of live (mean absolute error 5.7, against 14.6 for -v5c on
-// the same deals). Known gap: Chinese Dante-v5k scores about 23 under live
-// (69 against 92): it gets about two chances a match to buy a letter that
-// completes a 7+ word against 3.5 live and makes 1.4 such words against 1.75,
-// and neither its bid level nor any model above moved that, so a field with
-// Dante (ar6-top5-v5, ar4-top-v5, the topdraw fields, duel-dante-v5) is still
-// easier than live; the rest of the field is mixed (mid-table bots mostly 5
-// to 15 under live, a few weak bots over: SkyScrabble 71 against 55). The v5
-// fields (ar6-top5-v5, ar6-field-v5, ar6-mixed-v5, ar4/ar3-top-v5,
-// ar4/ar3-topdraw-v5, duel-*-v5) seat the -v5k rivals. Trust paired
-// differences over levels, as before.
+// top eleven (calibrate5, update secant). On fresh deals (validate5 v5k,
+// seed 31, 1728 matches, run 40096010361) ten of the top eleven score within
+// 10 points of live (mean absolute error 5.6, against 14.6 for -v5c on the
+// same deals). Known gaps: (1) Chinese Dante-v5k scores about 23 under live
+// (69 against 92): it gets 2.4 chances a match to buy a letter that completes
+// a 7+ word against 3.5 live and makes 1.4 such words against 1.75, and
+// neither its bid level nor any model above moved that, so a field with Dante
+// (ar6-top5-v5, ar4-top-v5, the topdraw fields, duel-dante-v5) is still easier
+// than live; the rest of the field is mixed (mid-table bots mostly 5 to 15
+// under live, a few weak bots over: SkyScrabble 71 against 55). (2) The
+// harness SookraBot itself plays far better at these tables than the live
+// bot does: with "real" in its seats (run 40096010361) it scores 108.6, place
+// 1.57, wins 65% (live 77.0, 3.50, 13%), and 110.8 with the early bid cut of
+// the live build (strategy-search 621b583 merged, run 40096035725), winning 16.3 letters at
+// 12 a letter against 11.4 at 14 live, while its fit (SookraBot-v5) scores
+// 80.8 and the rivals' scores barely move. So the remaining optimism of the
+// sim for SookraBot is in how the bot plays here, not in the rivals: trust
+// paired differences over levels, as before. The v5 fields (ar6-top5-v5,
+// ar6-field-v5, ar6-mixed-v5, ar4/ar3-top-v5, ar4/ar3-topdraw-v5,
+// duel-*-v5) seat the -v5k rivals.
 
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
