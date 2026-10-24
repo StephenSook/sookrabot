@@ -40,6 +40,7 @@ import {
   shouldFlush,
 } from "./strategy.js";
 import {
+  BAG_COUNTS,
   PoolTracker,
   hashSeed,
   lookaheadDelta,
@@ -902,7 +903,7 @@ export class SookraBot {
     let d: number;
     try {
       d = multiLookDelta(
-        this.index, counts, li, model.pool.unseen(), m, p.MLOOK_SAMPLES,
+        this.index, counts, li, p.LOOKAHEAD_POOL > 0 ? model.pool.unseen() : BAG_COUNTS, m, p.MLOOK_SAMPLES,
         alpha * p.MLOOK_ALPHA_SCALE, mulberry32(hashSeed(key)), tilt,
       );
     } catch (err) {

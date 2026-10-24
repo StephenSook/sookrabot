@@ -313,7 +313,8 @@ export const EMP_DEAD_SCALE = 0;
  * won. MLOOK_TILT draws letter e with weight pool_e x (delta_R(e) / mean
  * delta_R)^MLOOK_TILT (0: as the pool), since we win the letters we bid high
  * on. Same gate as the one-step lookahead (LOOKAHEAD_WEIGHT,
- * LOOKAHEAD_MIN_REAL_RIVALS); where m < 2 the one-step lookahead applies. 0: off.
+ * LOOKAHEAD_MIN_REAL_RIVALS); where m < 2 the one-step lookahead applies; with
+ * LOOKAHEAD_POOL 0 the draws come from the full bag instead. 0: off.
  */
 export const MLOOK_M = 0;
 export const MLOOK_RATE = 0.2;
