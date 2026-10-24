@@ -20,8 +20,15 @@ export { LETTER_VALUE } from "./engine.js";
 
 /** Currency bid per point of marginal value against real bots (sim best response 4 to 4.5). */
 export const KAPPA = 4.25;
-/** Kappa is multiplied by ENDGAME_KAPPA_BOOST when fewer than this many auctions remain. */
-export const ENDGAME_AUCTIONS = 12;
+/**
+ * Kappa is multiplied by ENDGAME_KAPPA_BOOST when fewer than this many auctions remain.
+ * 8, not 12: with 12 the bot spent its last coins on letters worth only their leave
+ * value (live m625: N, N, O at 19 to 21 each). Cloud self-play (seed 101, 400
+ * matches a field): +1.1 to +1.6 points in each of ar6-top, ar6-v4, ar4-top and
+ * ar6-top-mixed (t 3.8 to 6.2), while 18 lost 0.6 to 4.8; in duels +0.0 to +0.5
+ * (seed 404, 1200 a field), the 3-game final unchanged.
+ */
+export const ENDGAME_AUCTIONS = 8;
 export const ENDGAME_KAPPA_BOOST = 2;
 /**
  * Budget pacing at tables with a real rival: kappa is multiplied by
@@ -51,6 +58,29 @@ export const PACE_MIN_DUEL = 0.75;
  * ENDGAME_AUCTIONS auctions.
  */
 export const PACED_KAPPA = 4;
+/**
+ * Early bid cut while pacing: in the first EARLY_AUCTIONS auctions of a match
+ * (auction index auctionsPerMatch - 1 - bagTotal), kappa is multiplied by
+ * EARLY_KAPPA_SCALE, at tables with at least EARLY_MIN_RIVALS rivals
+ * (2: duels are exempt). Coins not spent early raise the pacing factor
+ * later. EARLY_KAPPA_SCALE 1: off.
+ *
+ * Live (builds B to E, rival-data-v4 findings): in auctions 1 to 22 SookraBot's
+ * winning bid averaged 30.7 against 14.7 to 23.2 for the top six bots, and it
+ * spent 65.0 coins; in auctions 23 to 45 it won 2.26 letters a match against 4.4
+ * to 4.9 for james, Dante, LetterShark, cashu and keanu. Cloud self-play (round
+ * 3, seed 404, 600 matches a field, with ENDGAME_AUCTIONS 8): +8.1 points and
+ * -0.58 places at ar6-top (t 10.6), +8.4 at ar6-v4, +22.4 at ar4-top, +22.0 at
+ * ar3-top, +10.3 against two SookraBot copies, +7.7 against rack-aware
+ * shark-policy rivals, +1.2 at 8 seats. Window 28 against 22 and 34 in the same
+ * run: 34 lost 1.1 to 1.2 points at 7 and 8 seats, 22 lost 5.4 at 4 seats, and
+ * elsewhere the three were within 2.6 points. A cut in duels lost 31 to 63
+ * points a game (round 1), hence EARLY_MIN_RIVALS 2. Rivals are counted as
+ * seated opponents, sims included (tournament tables seat no sims).
+ */
+export const EARLY_AUCTIONS = 28;
+export const EARLY_KAPPA_SCALE = 0.4;
+export const EARLY_MIN_RIVALS = 2;
 /** Every bot starts a match with this balance (game.ts STARTING_BALANCE). */
 export const STARTING_BALANCE = 100;
 /** Tiles in the bag at the start of a match (letters.ts DEFAULT_BAG). */
@@ -95,12 +125,22 @@ export const SIM_BID_JITTER = 2;
  * whole hoard while an early one only strands the last few letters.
  */
 export const FLUSH_LEAD_MS = 3000;
-/** First-price shading: recent rival prices kept, minimum sample, quantile. */
+/**
+ * First-price shading: recent rival prices kept, minimum sample, quantile.
+ * FP_QUANTILE 0.3 and FP_NO_HISTORY_SHADE 0.4 (from 0.75 and 0.75): in every
+ * first-price field the cloud search tried, shading harder won more. Round 1.5
+ * (seed 202, 400 matches): quantile and shade 0.6 gave +7 to +11 points at
+ * ar6-top,fp tables, 0.5 gave +11 to +18, 0.4 and 0.5 gave +15 to +20, also when
+ * the rivals shade their own bids by 25%. Round 3 (seed 404, 500 matches, with the
+ * early cut and ENDGAME_AUCTIONS 8): 0.3 and 0.4 gave +24 to +31 at 6-seat
+ * first-price tables against +19 to +25 for 0.4 and 0.5. Untested against live
+ * first-price rivals; casual matches are Vickrey.
+ */
 export const FP_HISTORY_MAX = 40;
 export const FP_MIN_OBS = 5;
-export const FP_QUANTILE = 0.75;
+export const FP_QUANTILE = 0.3;
 /** First-price shading with too little price history: bid this share of the full bid. */
-export const FP_NO_HISTORY_SHADE = 0.75;
+export const FP_NO_HISTORY_SHADE = 0.4;
 /**
  * Broke rivals: when no rival can bid more than this (public balances, sim
  * rules), bid exactly their max + 1 on any letter with value. NYC's final was
@@ -207,6 +247,24 @@ export function paceMultiplier(
   return Math.min(PACE_MAX, Math.max(min, r ** PACE_EXPONENT));
 }
 
+/**
+ * Early bid cut on the paced kappa (see EARLY_AUCTIONS): `scale` in the first
+ * `window` auctions of a match (auction index auctions - 1 - bagTotal) at
+ * tables with at least `minRivals` rivals, else 1. The parameters default to
+ * EARLY_KAPPA_SCALE, EARLY_AUCTIONS and EARLY_MIN_RIVALS; scale 1 is off.
+ */
+export function earlyScale(
+  bagTotal: number,
+  auctions: number,
+  rivals: number,
+  window = EARLY_AUCTIONS,
+  scale = EARLY_KAPPA_SCALE,
+  minRivals = EARLY_MIN_RIVALS,
+): number {
+  if (scale === 1 || rivals < minRivals) return 1;
+  return auctions - 1 - bagTotal < window ? scale : 1;
+}
+
 /** Kappa with budget pacing: PACED_KAPPA, doubled in the last ENDGAME_AUCTIONS auctions, times paceMultiplier. */
 export function pacedKappa(bagTotal: number, balance: number, auctions: number | undefined, min = PACE_MIN): number {
   return kappaFor(bagTotal, PACED_KAPPA) * paceMultiplier(balance, bagTotal, auctions, min);
@@ -238,9 +296,11 @@ export function duelReserve(opponentCount: number, bagTotal: number): number {
  *  - every rival can bid at most BROKE_RIVAL_MAX_BID (public balances, sim
  *    rules): bid exactly their max + 1, the minimum that wins;
  *  - sims-only table (Vickrey): min(floor(SIM_ONLY_KAPPA * delta), max sim bid + 1);
- *  - otherwise floor(kappa * delta), kappa doubled in the last 12 auctions
- *    and multiplied by the budget pacing factor (pacedKappa; its floor is
- *    PACE_MIN_DUEL in a duel, PACE_MIN otherwise);
+ *  - otherwise floor(kappa * delta), kappa doubled in the last
+ *    ENDGAME_AUCTIONS (8) auctions and multiplied by the budget pacing
+ *    factor (pacedKappa; its floor is PACE_MIN_DUEL in a duel, PACE_MIN
+ *    otherwise), and by EARLY_KAPPA_SCALE in the first EARLY_AUCTIONS
+ *    auctions at tables of EARLY_MIN_RIVALS or more rivals (earlyScale);
  *  - first price (you pay your own bid): shade to min(full bid, estimated
  *    price to win), where the estimate is max(max sim bid + 1, FP_QUANTILE
  *    of recent real-rival winning prices for letters of the same face value
@@ -298,8 +358,10 @@ function valueBid(input: BidInput, rivalCap: number, balance: number): BidDecisi
   const simsOnly = input.opponents.length > 0 && sims.length === input.opponents.length;
   const paced = pacingOn(simsOnly, input.auctionsPerMatch);
   const paceMin = input.opponents.length <= DUEL_MAX_OPPONENTS ? PACE_MIN_DUEL : PACE_MIN;
+  // paced implies auctionsPerMatch is a positive number (pacingOn).
   const kappaExact = paced
-    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin)
+    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin) *
+      earlyScale(input.bagTotal, input.auctionsPerMatch!, input.opponents.length)
     : kappaFor(input.bagTotal);
   const kappa = +kappaExact.toFixed(4); // for the reason strings
   const full = Math.floor(kappaExact * input.delta);
