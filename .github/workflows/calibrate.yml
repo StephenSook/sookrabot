@@ -1,0 +1,148 @@
+# Rival-model calibration (bot-starter/src/selfplay.ts validate4): the v4 rivals play
+# each other six to a table, drawn as at the live m300 to m390 tables, once per rack
+# awareness rho; the table job sets each rival's simulated score and place beside its
+# live numbers, one column per rho, so the rho whose rivals match live can be picked
+# (then use it as field@rho in selfplay.yml).
+#
+#   gh workflow run calibrate.yml --repo StephenSook/sookrabot --ref harness-sync \
+#     -f matches=400 -f seed=1 -f rhos="- 0.5 0.7 0.9" -f entries=v4c
+# "-" keeps each entry's own fitted rho.
+name: calibrate
+run-name: "calibrate ${{ inputs.entries }} x${{ inputs.matches }} seed ${{ inputs.seed }}: rho ${{ inputs.rhos }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      matches:
+        description: "Matches per rho"
+        required: true
+        default: "400"
+        type: string
+      seed:
+        description: "Seed"
+        required: true
+        default: "1"
+        type: string
+      rhos:
+        description: "Rack awareness values, space-separated; - keeps each entry's fitted rho"
+        required: true
+        default: "- 0.5 0.7 0.9"
+        type: string
+      entries:
+        description: "Fixture entries: v4c (complete7 bids, fitted word policies) or v4"
+        required: true
+        default: v4c
+        type: choice
+        options: [v4c, v4]
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rhos: ${{ steps.plan.outputs.rhos }}
+    steps:
+      - name: Check the inputs
+        id: plan
+        shell: bash
+        env:
+          MATCHES: ${{ inputs.matches }}
+          SEED: ${{ inputs.seed }}
+          RHOS: ${{ inputs.rhos }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$MATCHES" =~ ^[1-9][0-9]{0,4}$ ]] && (( MATCHES <= 20000 )) || fail "matches: 1 to 20000, got '$MATCHES'"
+          [[ "$SEED" =~ ^[0-9]{1,9}$ ]] || fail "seed: a whole number from 0 to 999999999, got '$SEED'"
+          read -r -a R <<< "$RHOS"
+          (( ${#R[@]} >= 1 && ${#R[@]} <= 12 )) || fail "rhos: 1 to 12 values"
+          for r in "${R[@]}"; do
+            [[ "$r" == "-" || "$r" =~ ^0(\.[0-9]{1,4})?$ ]] || fail "rho '$r': - or a number in [0, 1)"
+          done
+          echo "rhos=$(printf '%s\n' "${R[@]}" | jq -R . | jq -cs 'unique')" >> "$GITHUB_OUTPUT"
+
+  rho:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        rho: ${{ fromJSON(needs.plan.outputs.rhos) }}
+    name: rho ${{ matrix.rho }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check this ref carries validate4
+        shell: bash
+        run: |
+          if ! grep -q 'export async function validate4' bot-starter/src/selfplay.ts 2>/dev/null; then
+            echo "::error::$GITHUB_REF_NAME has no validate4; dispatch with --ref harness-sync or a branch that contains it"
+            exit 1
+          fi
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bot-starter/package-lock.json
+      - name: Install
+        working-directory: bot-starter
+        run: npm ci --no-audit --no-fund
+      - name: Play
+        id: play
+        working-directory: bot-starter
+        shell: bash
+        env:
+          MATCHES: ${{ inputs.matches }}
+          SEED: ${{ inputs.seed }}
+          RHO: ${{ matrix.rho }}
+          ENTRIES: ${{ inputs.entries }}
+        run: |
+          label=$([[ "$RHO" == "-" ]] && echo fitted || echo "$RHO")
+          mkdir -p "$RUNNER_TEMP/calib"
+          out="$RUNNER_TEMP/calib/validate4-$GITHUB_RUN_ID-$ENTRIES-rho-$label.jsonl"
+          start=$(date +%s)
+          npx tsx src/selfplay.ts validate4 "$MATCHES" "$SEED" "$RHO" "$ENTRIES" > "$out"
+          echo "rho $label: $(wc -l < "$out") rivals, $MATCHES matches in $(( $(date +%s) - start )) s"
+          cat "$out"
+          [ -s "$out" ] || { echo "::error::validate4 wrote nothing"; exit 1; }
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: validate4-${{ github.run_id }}-${{ inputs.entries }}-rho-${{ steps.play.outputs.label }}
+          path: ${{ runner.temp }}/calib/
+          if-no-files-found: error
+          retention-days: 30
+
+  table:
+    needs: rho
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: bot-starter/scripts
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: validate4-${{ github.run_id }}-*
+          path: calib
+          merge-multiple: true
+      - name: Table
+        shell: bash
+        run: |
+          mkdir -p result
+          python3 bot-starter/scripts/selfplay_aggregate.py calib > result/result.txt
+          python3 bot-starter/scripts/selfplay_aggregate.py calib --format=markdown > result/result.md
+          cp calib/*.jsonl result/
+          cat result/result.txt
+          cat result/result.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: calibration-${{ github.run_id }}-${{ inputs.entries }}
+          path: result/
+          if-no-files-found: error
+          retention-days: 30
