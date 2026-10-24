@@ -23,6 +23,11 @@
 // through the SookraBot constructor, and bot.ts passes it to every strategy.ts
 // call, so a variant runs the live code with those constants changed and
 // nothing else; the harness never wraps or replaces a SookraBot method.
+// The round 2 levers are knobs like any other, off in head: COMPLETE7_PREMIUM
+// (1 or more) with COMPLETE7_CAP_SHARE (0 to 1], CASH_BROKE_BALANCE (coins)
+// and CASH_BROKE_AUCTIONS (auctions), DEAD_KAPPA_SCALE; for example
+// COMPLETE7_PREMIUM=2+COMPLETE7_CAP_SHARE=0.5, CASH_BROKE_BALANCE=30,
+// CASH_BROKE_AUCTIONS=12, DEAD_KAPPA_SCALE=0.5 (strategy.ts says what each does).
 //
 // Fields: <name>[@<rho>][,fp][,shade=<s>][,warm][,smart]. @rho gives every fitted rival
 // rack awareness rho (see RivalModel.rho); ,fp plays first-price auctions (the
@@ -1010,7 +1015,7 @@ const INTEGER_KEYS: ReadonlySet<PolicyKey> = new Set<PolicyKey>([
   "HOLD_FROM_BAG",
   "LIQUIDITY_MIN_LEN", "LIQUIDITY_FALLBACK_MIN_LEN",
   "LIQUIDITY_TOP_K", "FLUSH_LEAD_MS", "FP_HISTORY_MAX", "FP_MIN_OBS", "BROKE_RIVAL_MAX_BID", "DUEL_MAX_OPPONENTS",
-  "DUEL_RESERVE_WINDOW",
+  "DUEL_RESERVE_WINDOW", "CASH_BROKE_AUCTIONS",
 ]);
 
 export interface Variant {
@@ -1042,6 +1047,10 @@ export function parseVariant(name: string): Variant {
     if (!Number.isFinite(value) || value < 0) throw new Error(`${key} must be a finite number >= 0, got ${m[2]}`);
     if (INTEGER_KEYS.has(key) && !Number.isInteger(value)) throw new Error(`${key} counts whole units, got ${m[2]}`);
     if (key === "FP_QUANTILE" && !(value > 0 && value <= 1)) throw new Error(`FP_QUANTILE must be in (0, 1], got ${m[2]}`);
+    if (key === "COMPLETE7_PREMIUM" && !(value >= 1)) throw new Error(`COMPLETE7_PREMIUM raises bids: 1 (off) or more, got ${m[2]}`);
+    if (key === "COMPLETE7_CAP_SHARE" && !(value > 0 && value <= 1)) {
+      throw new Error(`COMPLETE7_CAP_SHARE is a share of the balance in (0, 1], got ${m[2]}`);
+    }
     overrides[key] = value;
   }
   return { name, overrides, policy: Object.freeze({ ...DEFAULT_POLICY, ...overrides }) };

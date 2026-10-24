@@ -47,6 +47,7 @@ import {
   chooseWords,
   decideBid,
   duelReserve,
+  isDeadLetter,
   kappaFor,
   maxPossibleBid,
   maxSimBid,
@@ -54,6 +55,7 @@ import {
   pacedKappa,
   flushLeadMs,
   MAX_FLUSH_LEAD_MS,
+  sevenCompleterMask,
   shouldFlush,
 } from "./strategy.js";
 import * as strategy from "./strategy.js";
@@ -796,6 +798,129 @@ test("policy: word, flush and leave knobs set in the policy move chooseWords, fl
   assert.equal(alphaFor(false, DEFAULT_POLICY, 3), LEAVE_ALPHA, "off by default");
 });
 
+// ---- round 2 levers: COMPLETE7_PREMIUM, CASH_WHEN_BROKE, DEAD_KAPPA_SCALE (all off by default) ----
+
+test("round 2 levers are off in DEFAULT_POLICY, and their inputs then change nothing", () => {
+  assert.equal(DEFAULT_POLICY.COMPLETE7_PREMIUM, 1);
+  assert.equal(DEFAULT_POLICY.COMPLETE7_CAP_SHARE, 1);
+  assert.equal(DEFAULT_POLICY.CASH_BROKE_BALANCE, 0);
+  assert.equal(DEFAULT_POLICY.CASH_BROKE_AUCTIONS, 0);
+  assert.equal(DEFAULT_POLICY.DEAD_KAPPA_SCALE, 1);
+  const spots = [
+    { letter: "S", delta: 5, bagTotal: 39, auctionsPerMatch: 68 },
+    { letter: "S", delta: 0.35 * LEAVE_W7.S, bagTotal: 39, auctionsPerMatch: 68 }, // a dead letter's value
+    { letter: "Q", delta: 12, bagTotal: 60, auctionsPerMatch: 68 }, // early window
+    { letter: "E", delta: 3, bagTotal: 5, auctionsPerMatch: 68 }, // endgame
+  ];
+  for (const spot of spots) {
+    for (const auctionType of ["Vickrey", "FirstPrice"] as const) {
+      const base = { ...spot, auctionType, myBalance: 100, opponents: REAL };
+      const plain = decideBid(base);
+      for (const extras of [{ completes7: true, leaveAlpha: 0.35 }, { completes7: false }, { leaveAlpha: 0 }]) {
+        assert.deepEqual(decideBid({ ...base, ...extras }), plain, `${JSON.stringify(spot)} ${auctionType}`);
+        assert.deepEqual(decideBid({ ...base, ...extras, policy: DEFAULT_POLICY }), plain);
+      }
+    }
+  }
+  const play = (rack: string, myBalance: number, bagTotal?: number) => {
+    const counts = countsOf(rack);
+    return chooseWords(INDEX, { counts, cands: INDEX.scan(counts, true), myBalance, flush: false, realRivals: 5, bagTotal });
+  };
+  for (const bag of [undefined, 0, 1, 19, 40]) assert.deepEqual(play("RETAINSQ", 20, bag), [], `bag ${bag}: held`);
+});
+
+test("COMPLETE7_PREMIUM: a letter that completes a 7+ word is bid at the factor, the raise capped by a share of the balance", () => {
+  // Six-seat all-real table, index 28 (past the early window): kappa 4 x sqrt(1.7) = 5.2154, delta 5: 26.
+  const bid = (o: Partial<Policy>, x: Partial<Parameters<typeof decideBid>[0]> = {}) =>
+    decideBid({
+      letter: "S", delta: 5, bagTotal: 39, auctionType: "Vickrey", myBalance: 100, opponents: REAL,
+      auctionsPerMatch: 68, ...x, policy: withPolicy(o),
+    });
+  assert.deepEqual(bid({}), { amount: 26, reason: "k5.2154" });
+  assert.deepEqual(bid({ COMPLETE7_PREMIUM: 2 }, { completes7: true }), { amount: 52, reason: "k5.2154 c7 x2" });
+  assert.equal(bid({ COMPLETE7_PREMIUM: 2 }, { completes7: false }).amount, 26);
+  assert.equal(bid({ COMPLETE7_PREMIUM: 2 }).amount, 26, "unknown: no premium");
+  assert.equal(bid({}, { completes7: true }).amount, 26, "premium 1: off");
+  // The raise stops at the cap (30% of 100), and never takes a bid below the plain one (10% of 100 = 10 < 26).
+  assert.deepEqual(bid({ COMPLETE7_PREMIUM: 2, COMPLETE7_CAP_SHARE: 0.3 }, { completes7: true }), { amount: 30, reason: "k5.2154 c7 x2" });
+  assert.deepEqual(bid({ COMPLETE7_PREMIUM: 2, COMPLETE7_CAP_SHARE: 0.1 }, { completes7: true }), { amount: 26, reason: "k5.2154" });
+  // First price shades the raised bid (no history: 40% of 52).
+  assert.equal(bid({}, { auctionType: "FirstPrice" }).amount, 10);
+  assert.equal(bid({ COMPLETE7_PREMIUM: 2 }, { auctionType: "FirstPrice", completes7: true }).amount, 20);
+  // The rival cap and the duel reserve still apply after it: 20 coins in a duel, 10 held back.
+  const duel = { opponents: [{ isSim: false, balance: 100 }], myBalance: 20, bagTotal: 60, auctionsPerMatch: 88, delta: 2, completes7: true };
+  assert.deepEqual(bid({ COMPLETE7_PREMIUM: 3 }, duel), { amount: 10, reason: "k3 c7 x3 duel-reserve 10" });
+  assert.equal(bid({ COMPLETE7_PREMIUM: 9 }, { completes7: true, opponents: Array.from({ length: 5 }, () => ({ isSim: false, balance: 40 })) }).amount, 41);
+  // A sims-only Vickrey table keeps its own rule.
+  const sims = { letter: "E", delta: 0.25, opponents: [{ isSim: true, strategy: "Aggressive" as const, balance: 100 }], completes7: true };
+  assert.deepEqual(bid({ COMPLETE7_PREMIUM: 3 }, sims), bid({}, sims));
+});
+
+test("sevenCompleterMask: letters that put a 7+ letter word into the rack's packing, a second one included", () => {
+  const mask = (rack: string) => {
+    const c = countsOf(rack);
+    return sevenCompleterMask(INDEX, INDEX.scan(c, true), c, LEAVE_ALPHA);
+  };
+  const letters = (m: number) => [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ"].filter((_, i) => ((m >>> i) & 1) === 1).join("");
+  assert.equal(letters(mask("RETAIN")), "CDEFGHIKLMNPRSTUW"); // RETAINS, CERTAIN, DETRAIN, ...
+  assert.ok(letters(mask("AEINST")).includes("R"));
+  assert.equal(mask("QUIZ"), 0, "no 7+ word within one tile");
+  assert.equal(mask("RETAINSQ"), 0, "QINTARS is already there and no letter adds a second");
+  // A rack whose packing holds MYXOMATA + COOTER: an S (or A, C, D, E, F, N, P, U, W) adds a second 7+ word.
+  assert.equal(letters(mask("MOOAYROTMECAXTR")), "ACDEFNPSUW");
+  const c = countsOf("MOOAYROTMECAXTR");
+  const cands = INDEX.scan(c, true);
+  const sevens = (extra: number) => INDEX.pack(cands, c, extra, LEAVE_ALPHA).keys.filter((k) => INDEX.len[k] >= 7).length;
+  assert.equal(sevens(-1), 1);
+  assert.equal(sevens(letterIndex("S")), 2);
+  assert.equal(sevens(letterIndex("B")), 1);
+});
+
+test("CASH_WHEN_BROKE: a table that holds words cashes 7+ words while broke, or all of them late in the match", () => {
+  const play = (rack: string, myBalance: number, o: Partial<Policy>, bagTotal?: number, realRivals = 5) => {
+    const counts = countsOf(rack);
+    return chooseWords(INDEX, {
+      counts, cands: INDEX.scan(counts, true), myBalance, flush: false, realRivals, bagTotal, policy: withPolicy(o),
+    });
+  };
+  // Balance: under CASH_BROKE_BALANCE the best 7+ word is cashed, one at a time until the balance is back.
+  assert.deepEqual(play("RETAINSQ", 20, {}, 40), []);
+  assert.deepEqual(play("RETAINSQ", 20, { CASH_BROKE_BALANCE: 30 }, 40), ["QINTARS"]);
+  assert.deepEqual(play("RETAINSQ", 30, { CASH_BROKE_BALANCE: 30 }, 40), [], "at the threshold: hold");
+  assert.deepEqual(play("QINTARSJUKEBOX", 20, { CASH_BROKE_BALANCE: 50 }, 40), ["JUKEBOX"], "81 coins after one");
+  assert.deepEqual(play("QINTARSJUKEBOX", 0, { CASH_BROKE_BALANCE: 200 }, 40), ["JUKEBOX", "QINTARS"]);
+  // Auctions: below CASH_BROKE_AUCTIONS to come every 7+ word is cashed; never with the bag unknown.
+  assert.deepEqual(play("QINTARSJUKEBOX", 100, { CASH_BROKE_AUCTIONS: 20 }, 19), ["JUKEBOX", "QINTARS"]);
+  assert.deepEqual(play("RETAINSQ", 100, { CASH_BROKE_AUCTIONS: 20 }, 20), []);
+  assert.deepEqual(play("RETAINSQ", 100, { CASH_BROKE_AUCTIONS: 20 }), []);
+  // Words under CASH_MIN_LEN stay held, and the liquidity word still comes after (JUTTED, 35 coins).
+  assert.deepEqual(play("JUTTEDVG", 20, { CASH_BROKE_BALANCE: 30 }, 40), []);
+  assert.deepEqual(play("JUTTEDVG", 10, { CASH_BROKE_BALANCE: 30 }, 40), ["JUTTED"]);
+  // Tables that do not hold cash 7+ words as they form anyway.
+  assert.deepEqual(play("RETAINSQ", 100, { CASH_BROKE_BALANCE: 30 }, 40, 1), ["QINTARS"]);
+  assert.deepEqual(play("RETAINSQ", 100, {}, 40, 1), ["QINTARS"]);
+});
+
+test("DEAD_KAPPA_SCALE: a letter worth no more than its leave value is bid at the scaled kappa", () => {
+  const dead = 0.35 * LEAVE_W7.S; // 2.38: what valuate gives a letter that joins no word
+  assert.ok(isDeadLetter("S", dead, 0.35));
+  assert.ok(isDeadLetter("S", dead + 1e-12, 0.35), "repacking noise");
+  assert.ok(!isDeadLetter("S", dead + 0.01, 0.35));
+  assert.ok(!isDeadLetter("S", 0.5, 0), "flushing: nothing with value is dead");
+  assert.ok(!isDeadLetter("?", 0, 0.35));
+  const bid = (o: Partial<Policy>, x: Partial<Parameters<typeof decideBid>[0]> = {}) =>
+    decideBid({
+      letter: "S", delta: dead, bagTotal: 39, auctionType: "Vickrey", myBalance: 100, opponents: REAL,
+      auctionsPerMatch: 68, ...x, policy: withPolicy(o),
+    });
+  assert.deepEqual(bid({}, { leaveAlpha: 0.35 }), { amount: 12, reason: "k5.2154" });
+  assert.deepEqual(bid({ DEAD_KAPPA_SCALE: 0.5 }, { leaveAlpha: 0.35 }), { amount: 6, reason: "k2.6077 dead x0.5" });
+  assert.deepEqual(bid({ DEAD_KAPPA_SCALE: 1.5 }, { leaveAlpha: 0.35 }), { amount: 18, reason: "k7.823 dead x1.5" });
+  assert.equal(bid({ DEAD_KAPPA_SCALE: 0.5 }).amount, 12, "no leave weight: not known to be dead");
+  assert.equal(bid({ DEAD_KAPPA_SCALE: 0.5 }, { leaveAlpha: 0.35, delta: 5 }).amount, 26, "a useful letter");
+  assert.equal(bid({ DEAD_KAPPA_SCALE: 0.5 }, { leaveAlpha: 0.35, auctionType: "FirstPrice" }).amount, 2, "40% of 6");
+});
+
 // ---- speed ----
 
 /**
@@ -820,6 +945,12 @@ test("valuation of a 20-tile rack stays well inside a 250 ms auction", (t) => {
     t.diagnostic(`${r}: ${best.toFixed(1)} ms of CPU`);
     assert.ok(best > 0, "the measurement saw the work");
     assert.ok(best < 120, `${r} took ${best.toFixed(1)} ms of CPU (best of 3)`);
+    // COMPLETE7_PREMIUM adds the 7+ completer mask to each table (bot.ts valuation), off the bid path too.
+    const v = valuate(INDEX, countsOf(r), 0.35);
+    let mask = Infinity;
+    for (let i = 0; i < 3; i++) mask = Math.min(mask, cpuMs(() => sevenCompleterMask(INDEX, v.cands, countsOf(r), 0.35)));
+    t.diagnostic(`${r}: 7+ completer mask ${mask.toFixed(1)} ms of CPU`);
+    assert.ok(mask < 120, `${r}: mask took ${mask.toFixed(1)} ms of CPU (best of 3)`);
   }
   const buildMs = cpuMs(() => WordIndex.fromWords(WORDLIST));
   t.diagnostic(`index build: ${buildMs.toFixed(0)} ms of CPU`);

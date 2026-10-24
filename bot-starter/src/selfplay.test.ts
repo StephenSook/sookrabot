@@ -35,7 +35,7 @@ import {
   validate4,
   validate5,
 } from "./selfplay.js";
-import { DEFAULT_POLICY } from "./strategy.js";
+import { DEFAULT_POLICY, sevenCompleterMask } from "./strategy.js";
 
 /** A row with what may differ between equal runs (wall time) or variants (the name) blanked. */
 const content = (r: Row) => JSON.stringify({ ...r, ms: 0, variant: "" });
@@ -64,6 +64,53 @@ test("variants: every policy knob can be named, and restating all of them is hea
   const all = parseVariant(POLICY_KEYS.map((k) => `${k}=${DEFAULT_POLICY[k]}`).join("+"));
   assert.deepEqual(all.policy, DEFAULT_POLICY);
   assert.equal(Object.keys(all.overrides).length, POLICY_KEYS.length);
+});
+
+test("variants: the round 2 levers by name, within their ranges", () => {
+  for (const k of ["COMPLETE7_PREMIUM", "COMPLETE7_CAP_SHARE", "CASH_BROKE_BALANCE", "CASH_BROKE_AUCTIONS", "DEAD_KAPPA_SCALE"]) {
+    assert.ok(POLICY_KEYS.includes(k as (typeof POLICY_KEYS)[number]), k);
+  }
+  assert.deepEqual(parseVariant("COMPLETE7_PREMIUM=2+complete7_cap_share=0.5").overrides, { COMPLETE7_PREMIUM: 2, COMPLETE7_CAP_SHARE: 0.5 });
+  assert.deepEqual(parseVariant("CASH_BROKE_BALANCE=30+CASH_BROKE_AUCTIONS=12").overrides, { CASH_BROKE_BALANCE: 30, CASH_BROKE_AUCTIONS: 12 });
+  assert.equal(parseVariant("CASH_BROKE_BALANCE=27.5").policy.CASH_BROKE_BALANCE, 27.5);
+  assert.equal(parseVariant("DEAD_KAPPA_SCALE=0.5").policy.DEAD_KAPPA_SCALE, 0.5);
+  assert.equal(parseVariant("DEAD_KAPPA_SCALE=1.5").policy.DEAD_KAPPA_SCALE, 1.5);
+  for (const bad of [
+    "COMPLETE7_PREMIUM=0.5", "COMPLETE7_PREMIUM=0", "COMPLETE7_CAP_SHARE=0", "COMPLETE7_CAP_SHARE=1.5",
+    "CASH_BROKE_AUCTIONS=1.5", "CASH_BROKE_BALANCE=-1", "DEAD_KAPPA_SCALE=-0.5",
+  ]) {
+    assert.throws(() => parseVariant(bad), Error, bad);
+  }
+});
+
+test("sevenCompleterMask (COMPLETE7_PREMIUM) against sevenCompleters (the calibration's complete7 regime)", () => {
+  const index = WordIndex.fromWords(fs.readFileSync(new URL("../../spacetimedb/wordlist.txt", import.meta.url), "utf8").split("\n"));
+  const bag = Object.entries(RULES.BAG).flatMap(([c, k]) => Array<string>(k).fill(c));
+  let seed = 4242;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296);
+  let without7 = 0;
+  let same = 0;
+  let second = 0;
+  for (let r = 0; r < 200; r++) {
+    const rack = Array.from({ length: 6 + Math.floor(rnd() * 10) }, () => bag[Math.floor(rnd() * bag.length)]).join("");
+    const counts = countsOf(rack);
+    const cands = index.scan(counts, true);
+    const mask = sevenCompleterMask(index, cands, counts, DEFAULT_POLICY.LEAVE_ALPHA);
+    let spells7 = false;
+    for (let i = 0; i < cands.n; i++) if (cands.extra[i] === -1 && index.len[cands.keys[i]] >= 7) spells7 = true;
+    if (spells7) {
+      // sevenCompleters counts no letter once the rack spells a 7+ word; the mask counts a second one.
+      assert.equal(sevenCompleters(index, counts), 0, rack);
+      if (mask !== 0) second++;
+      continue;
+    }
+    // Otherwise a subset: the mask leaves out a letter when the greedy packing would not use the 7+ word.
+    const h = sevenCompleters(index, counts);
+    without7++;
+    assert.equal(mask & ~h, 0, `${rack}: ${mask} not within ${h}`);
+    if (mask === h) same++;
+  }
+  assert.ok(without7 > 50 && same > without7 / 2 && second > 5, `${same} of ${without7} equal, ${second} with a second 7+ word`);
 });
 
 test("fields: rack awareness, the auction rule, rival shading and warm history are part of the field", () => {

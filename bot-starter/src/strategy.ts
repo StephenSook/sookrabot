@@ -13,6 +13,7 @@
 import {
   type Candidates,
   type Counts,
+  LEAVE_W7,
   LETTER_VALUE,
   WordIndex,
   letterIndex,
@@ -185,6 +186,45 @@ export const DUEL_MAX_OPPONENTS = 1;
 export const DUEL_RESERVE_PER_AUCTION = 1;
 export const DUEL_RESERVE_WINDOW = 10;
 
+// Round 2 levers. Each is off by default, so DEFAULT_POLICY plays exactly as
+// the live build 5318ca6 does; the self-play harness turns one on by name.
+
+/**
+ * COMPLETE7_PREMIUM: when winning the letter lets the bot spell a 7+ letter
+ * word it cannot spell now (sevenCompleterMask: a 7+ letter word needs exactly
+ * this letter, and the rack plus it packs into more 7+ letter words than the
+ * rack alone), the value bid is raised to COMPLETE7_PREMIUM x the bid, but
+ * the raise stops at COMPLETE7_CAP_SHARE x the balance (it never lowers a
+ * bid). 1: off. Live (rival-data-v4): Chinese Dante wins 61% of the auctions
+ * where the letter completes a 7-letter word, against 25% otherwise.
+ */
+export const COMPLETE7_PREMIUM = 1;
+export const COMPLETE7_CAP_SHARE = 1;
+/**
+ * CASH_WHEN_BROKE: at a table that holds words (HOLD_MIN_REAL_RIVALS), held
+ * words of CASH_MIN_LEN+ letters are cashed, best first, while the balance is
+ * under CASH_BROKE_BALANCE, and every one is cashed as it forms once fewer
+ * than CASH_BROKE_AUCTIONS auctions are to come. 0: off. Live (rival-data-v4,
+ * builds B to E): SookraBot held a playable 7+ letter word in 52% of auctions
+ * 1 to 60 and won 9% of those; james cashes at about 50 points or when broke.
+ */
+export const CASH_BROKE_BALANCE = 0;
+export const CASH_BROKE_AUCTIONS = 0;
+/**
+ * Dead letters: a letter worth no more to the rack than its own leave value
+ * (isDeadLetter: delta <= alpha x LEAVE_W7, alpha from the valuation the delta
+ * comes from) is bid at DEAD_KAPPA_SCALE x kappa. 1: off. Why this lever: in
+ * the v5 calibration (validate5 at the 288 live all-real tables from m1000 on,
+ * live side) SookraBot wins 11.4 letters a match against 13.2 for the top
+ * eleven, and the letter regimes split the 1.8 as 0.9 dead letters (it wins
+ * 8.6% of the dead letters it can afford, the top eleven 14.6%), 0.5 useful
+ * ones (25.3% against 26.8%) and 0.4 letters that complete a 7+ word (it wins
+ * 66.7% of those, more than any of them, but is offered 1.8 a match against
+ * 4.9). The harness counts a letter dead when the greedy packing gains nothing
+ * from it (selfplay.ts rackMasks), close to but not the same as this rule.
+ */
+export const DEAD_KAPPA_SCALE = 1;
+
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
  * (STARTING_BALANCE, BAG_TILES, SIM_BID_JITTER) and the network-stall bounds of
@@ -221,6 +261,11 @@ export interface Policy {
   readonly DUEL_MAX_OPPONENTS: number;
   readonly DUEL_RESERVE_PER_AUCTION: number;
   readonly DUEL_RESERVE_WINDOW: number;
+  readonly COMPLETE7_PREMIUM: number;
+  readonly COMPLETE7_CAP_SHARE: number;
+  readonly CASH_BROKE_BALANCE: number;
+  readonly CASH_BROKE_AUCTIONS: number;
+  readonly DEAD_KAPPA_SCALE: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -255,6 +300,11 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   DUEL_MAX_OPPONENTS,
   DUEL_RESERVE_PER_AUCTION,
   DUEL_RESERVE_WINDOW,
+  COMPLETE7_PREMIUM,
+  COMPLETE7_CAP_SHARE,
+  CASH_BROKE_BALANCE,
+  CASH_BROKE_AUCTIONS,
+  DEAD_KAPPA_SCALE,
 });
 
 // ---- Types ----
@@ -291,6 +341,17 @@ export interface BidInput {
   auctionsPerMatch?: number;
   /** Tuning constants (default DEFAULT_POLICY). */
   policy?: Policy;
+  /**
+   * Winning this letter lets the rack spell a 7+ letter word it cannot spell
+   * now (sevenCompleterMask of the valuation the delta comes from). Read only
+   * when COMPLETE7_PREMIUM is on; absent: unknown, no premium.
+   */
+  completes7?: boolean;
+  /**
+   * Leave weight of the valuation the delta comes from (Valuation.alpha), for
+   * isDeadLetter. Read only when DEAD_KAPPA_SCALE is on; absent: never dead.
+   */
+  leaveAlpha?: number;
 }
 
 export interface BidDecision {
@@ -396,6 +457,48 @@ export function duelReserve(opponentCount: number, bagTotal: number, p: Policy =
 }
 
 /**
+ * A dead letter for DEAD_KAPPA_SCALE: worth no more to the rack than its own
+ * leave value, delta <= alpha x LEAVE_W7 (valuate floors every delta there, so
+ * a dead letter's delta is exactly that), with alpha the leave weight of the
+ * valuation the delta comes from. At alpha 0 (flushing) no letter with value is dead.
+ */
+export function isDeadLetter(letter: string, delta: number, alpha: number): boolean {
+  const w = LEAVE_W7[letter];
+  return w !== undefined && delta <= alpha * w + 1e-9;
+}
+
+/**
+ * Letters that complete a 7+ letter word on this rack, for COMPLETE7_PREMIUM
+ * (bit i for letter i): some word of 7+ letters needs exactly that letter as
+ * its one extra tile (scan's tag), and the rack plus that letter packs into
+ * more words of 7+ letters than the rack alone (WordIndex.pack, keepWeight as
+ * the valuation packs; for a rack that already holds a 7+ word, a second one).
+ * `cands` is scan(counts, true), as in a Valuation. When the rack spells no 7+
+ * word this is a subset of selfplay.ts sevenCompleters (the calibration's
+ * complete7 regime): it leaves out a letter whose 7+ word the greedy packing
+ * would not use (equal on 111 of 159 random racks of 6 to 15 tiles).
+ */
+export function sevenCompleterMask(index: WordIndex, cands: Candidates, counts: Counts, keepWeight: number): number {
+  let needs = 0;
+  for (let i = 0; i < cands.n; i++) {
+    const e = cands.extra[i];
+    if (e >= 0 && index.len[cands.keys[i]] >= 7) needs |= 1 << e;
+  }
+  if (needs === 0) return 0;
+  const sevens = (keys: number[]) => {
+    let n = 0;
+    for (const k of keys) if (index.len[k] >= 7) n++;
+    return n;
+  };
+  const base = sevens(index.pack(cands, counts, -1, keepWeight).keys);
+  let mask = 0;
+  for (let i = 0; i < 26; i++) {
+    if (((needs >>> i) & 1) === 1 && sevens(index.pack(cands, counts, i, keepWeight).keys) > base) mask |= 1 << i;
+  }
+  return mask >>> 0;
+}
+
+/**
  * Bid rule, in order:
  *  - final letter (bagTotal 0): a real bot can never play it, but a sim that
  *    wins it plays a word before the match ends (game.ts closeAuction), and
@@ -411,6 +514,11 @@ export function duelReserve(opponentCount: number, bagTotal: number, p: Policy =
  *    otherwise), and by EARLY_KAPPA_SCALE in the first EARLY_AUCTIONS
  *    auctions at tables of EARLY_MIN_REAL_RIVALS or more real (non-sim)
  *    rivals (earlyScale);
+ *  - round 2 levers, off by default: kappa x DEAD_KAPPA_SCALE on a dead
+ *    letter (isDeadLetter), and on a letter that completes a 7+ word
+ *    (completes7) the bid raised to COMPLETE7_PREMIUM x itself, the raise
+ *    stopping at COMPLETE7_CAP_SHARE x the balance; neither applies at a
+ *    sims-only Vickrey table;
  *  - first price (you pay your own bid): shade to min(full bid, estimated
  *    price to win), where the estimate is max(max sim bid + 1, FP_QUANTILE
  *    of recent real-rival winning prices for letters of the same face value
@@ -472,7 +580,7 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
   // The early cut counts real rivals only, as HOLD_MIN_REAL_RIVALS does (bot.ts).
   const realRivals = input.opponents.filter((o) => !o.isSim).length;
   // paced implies auctionsPerMatch is a positive number (pacingOn).
-  const kappaExact = paced
+  const kappaRule = paced
     ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin, p) *
       earlyScale(
         input.bagTotal,
@@ -483,12 +591,31 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
         p.EARLY_MIN_REAL_RIVALS,
       )
     : kappaFor(input.bagTotal, undefined, p);
+  const simsOnlyVickrey = simsOnly && input.auctionType === "Vickrey";
+  // Round 2 levers (off by default: DEAD_KAPPA_SCALE 1, COMPLETE7_PREMIUM 1); tag marks them in the reason.
+  const dead =
+    p.DEAD_KAPPA_SCALE !== 1 &&
+    !simsOnlyVickrey &&
+    input.leaveAlpha !== undefined &&
+    isDeadLetter(input.letter, input.delta, input.leaveAlpha);
+  const kappaExact = dead ? kappaRule * p.DEAD_KAPPA_SCALE : kappaRule;
   const kappa = +kappaExact.toFixed(4); // for the reason strings
-  const full = Math.floor(kappaExact * input.delta);
+  let full = Math.floor(kappaExact * input.delta);
+  let tag = dead ? ` dead x${p.DEAD_KAPPA_SCALE}` : "";
+  if (p.COMPLETE7_PREMIUM !== 1 && input.completes7 === true && !simsOnlyVickrey) {
+    const raised = Math.min(
+      Math.floor(kappaExact * p.COMPLETE7_PREMIUM * input.delta),
+      Math.floor(p.COMPLETE7_CAP_SHARE * balance),
+    );
+    if (raised > full) {
+      full = raised;
+      tag += ` c7 x${p.COMPLETE7_PREMIUM}`;
+    }
+  }
 
   let amount: number;
   let reason: string;
-  if (simsOnly && input.auctionType === "Vickrey") {
+  if (simsOnlyVickrey) {
     amount = Math.min(Math.floor(p.SIM_ONLY_KAPPA * input.delta), simCap);
     reason = `sims-only cap ${simCap}`;
   } else if (input.auctionType === "FirstPrice" && simsOnly) {
@@ -513,6 +640,7 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
     amount = full;
     reason = `k${kappa}`;
   }
+  reason += tag;
 
   if (amount > rivalCap) {
     amount = rivalCap;
@@ -585,7 +713,10 @@ export interface WordInput {
   alpha?: number;
   /** Real (non-sim) rivals at the table; HOLD_MIN_REAL_RIVALS or more holds words for the flush. */
   realRivals?: number;
-  /** Auctions still to come (match_state.bag_total); holding starts below HOLD_FROM_BAG (always when absent). */
+  /**
+   * Auctions still to come (match_state.bag_total); holding starts below HOLD_FROM_BAG (always when
+   * absent), and CASH_BROKE_AUCTIONS cashes held words below it (never when absent).
+   */
   bagTotal?: number;
   /** Tuning constants (default DEFAULT_POLICY). */
   policy?: Policy;
@@ -635,8 +766,10 @@ export function liquidityWord(
 
 /**
  * Words to submit now, in order. Flush: the full greedy packing. Otherwise:
- * every 7+ letter word (best first), then one liquidity word if the balance
- * would still be under LIQUIDITY_FLOOR.
+ * every 7+ letter word (best first), at a table that holds words only those
+ * CASH_WHEN_BROKE releases (CASH_BROKE_BALANCE, CASH_BROKE_AUCTIONS; off by
+ * default), then one liquidity word if the balance would still be under
+ * LIQUIDITY_FLOOR.
  */
 export function chooseWords(index: WordIndex, input: WordInput): string[] {
   const p = input.policy ?? DEFAULT_POLICY;
@@ -648,7 +781,11 @@ export function chooseWords(index: WordIndex, input: WordInput): string[] {
   let balance = input.myBalance;
   const hold =
     (input.realRivals ?? 0) >= p.HOLD_MIN_REAL_RIVALS && (input.bagTotal === undefined || input.bagTotal < p.HOLD_FROM_BAG);
-  while (!hold) {
+  // CASH_WHEN_BROKE (0 and 0: off): late in the match every held CASH_MIN_LEN+ word is cashed, and
+  // while broke the best one at a time until the balance is back at CASH_BROKE_BALANCE.
+  const late = p.CASH_BROKE_AUCTIONS > 0 && input.bagTotal !== undefined && input.bagTotal < p.CASH_BROKE_AUCTIONS;
+  const broke = () => p.CASH_BROKE_BALANCE > 0 && balance < p.CASH_BROKE_BALANCE;
+  while (!hold || late || broke()) {
     const k = index.bestKey(input.cands, rem, p.CASH_MIN_LEN);
     if (k < 0) break;
     out.push(index.words[k]);

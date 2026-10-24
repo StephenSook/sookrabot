@@ -36,6 +36,7 @@ import {
   chooseWords,
   decideBid,
   flushLeadMs,
+  sevenCompleterMask,
   shouldFlush,
 } from "./strategy.js";
 
@@ -273,6 +274,12 @@ export class SookraBot {
    * long it had waited by then. Kept across connections: it measures the server.
    */
   private readonly wordLatencies: number[] = [];
+  /**
+   * Per valuation table, the letters that complete a 7+ word on its rack
+   * (sevenCompleterMask), set when the table is made and only while
+   * COMPLETE7_PREMIUM is on, so the bid on an auction's open stays a lookup.
+   */
+  private readonly sevenMasks = new WeakMap<Valuation, number>();
 
   /**
    * `policy` holds every tuning constant this bot plays with (strategy.ts);
@@ -450,6 +457,8 @@ export class SookraBot {
     if (v.ms > SLOW_VALUATION_MS) {
       this.log(`slow valuation: ${v.ms.toFixed(1)} ms for ${v.rackKey.length} tiles`);
     }
+    // valuate packs with keepWeight alpha (its "leave" mode), so the mask counts the same packing.
+    if (this.policy.COMPLETE7_PREMIUM !== 1) this.sevenMasks.set(v, sevenCompleterMask(this.index, v.cands, counts, v.alpha));
     model.vals.set(key, v);
     while (model.vals.size > VAL_CACHE_MAX) {
       const oldest = model.vals.keys().next().value;
@@ -460,16 +469,24 @@ export class SookraBot {
     return v;
   }
 
-  /** Table lookup only: never touches the dictionary. */
-  lookupDelta(matchId: bigint, counts: Counts, alpha: number, letter: string): { delta: number; source: string } {
+  /**
+   * Table lookup only: never touches the dictionary. `val` is the table the
+   * delta comes from when it values exactly this rack ("table", "table-alpha").
+   */
+  lookupDelta(
+    matchId: bigint,
+    counts: Counts,
+    alpha: number,
+    letter: string,
+  ): { delta: number; source: string; val?: Valuation } {
     const model = this.modelFor(matchId);
     const li = letterIndex(letter);
     if (li < 0) return { delta: 0, source: "bad-letter" };
     const rk = countsKey(counts);
     const exact = model.vals.get(`${rk}|${alpha}`);
-    if (exact) return { delta: exact.delta[li], source: "table" };
+    if (exact) return { delta: exact.delta[li], source: "table", val: exact };
     for (const v of model.vals.values()) {
-      if (v.rackKey === rk) return { delta: v.delta[li], source: "table-alpha" };
+      if (v.rackKey === rk) return { delta: v.delta[li], source: "table-alpha", val: v };
     }
     if (model.latest) return { delta: model.latest.delta[li], source: "stale" };
     return { delta: STATIC_DELTA_SCALE * (LEAVE_W7[letter] ?? 0), source: "static" };
@@ -498,8 +515,8 @@ export class SookraBot {
       const bagTotal = Number(m.bagTotal);
       const alpha = alphaFor(this.flushAt(bagTotal, Number(m.auctionDurationMs)), this.policy, bagTotal);
       const counts = this.effectiveCounts(model, this.rackCounts(conn, a.matchId));
-      const { delta, source } = this.lookupDelta(a.matchId, counts, alpha, a.letter);
-      this.placeBid(conn, model, m, a, Number(me.balance), delta, bagTotal, source, this.opponentsFrom(conn, rows));
+      const { delta, source, val } = this.lookupDelta(a.matchId, counts, alpha, a.letter);
+      this.placeBid(conn, model, m, a, Number(me.balance), delta, bagTotal, source, this.opponentsFrom(conn, rows), val);
     });
     this.scheduleRefresh(conn, a.matchId);
   }
@@ -767,7 +784,7 @@ export class SookraBot {
       const li = letterIndex(open.letter);
       this.placeBid(
         conn, model, m, open, balance, li >= 0 ? val.delta[li] : 0, bagTotal, "table",
-        this.opponentsFrom(conn, rows),
+        this.opponentsFrom(conn, rows), val,
       );
       this.schedulePrecompute(conn, matchId, open.letter, bagTotal, durationMs);
     }
@@ -849,8 +866,18 @@ export class SookraBot {
     bagTotal: number,
     source: string,
     opponents: Opponent[],
+    val?: Valuation,
   ) {
     const key = String(auction.id);
+    // What the round 2 levers read about this letter on this rack, only while they are on
+    // (`val`: the table of exactly this rack the delta comes from, else nothing is known).
+    const extras: { completes7?: boolean; leaveAlpha?: number } = {};
+    if (val !== undefined) {
+      const li = letterIndex(auction.letter);
+      const mask = this.policy.COMPLETE7_PREMIUM !== 1 ? this.sevenMasks.get(val) : undefined;
+      if (mask !== undefined && li >= 0) extras.completes7 = ((mask >>> li) & 1) === 1;
+      if (this.policy.DEAD_KAPPA_SCALE !== 1) extras.leaveAlpha = val.alpha;
+    }
     let decision: BidDecision;
     try {
       decision = decideBid({
@@ -863,6 +890,7 @@ export class SookraBot {
         fpHistory: this.fpHistory,
         auctionsPerMatch: auctionsPerMatch(opponents.length + 1, m.startingRackSize ?? DEFAULT_RACK_SIZE),
         policy: this.policy,
+        ...extras,
       });
     } catch (err) {
       this.warn("decideBid", err);

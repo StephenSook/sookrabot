@@ -21,7 +21,7 @@ import {
 } from "./bot.js";
 import { WordIndex, countsOf, letterIndex, valuate, wordReward } from "./engine.js";
 import { ConnectionLifecycle } from "./lifecycle.js";
-import { DEFAULT_POLICY, LEAVE_ALPHA, PACED_KAPPA, PACE_MIN_DUEL, type Policy, maxSimBid } from "./strategy.js";
+import { DEFAULT_POLICY, LEAVE_ALPHA, PACED_KAPPA, PACE_MIN_DUEL, type Policy, maxSimBid, pacedKappa } from "./strategy.js";
 import { Supervisor, type Scheduler } from "./supervisor.js";
 
 const INDEX = WordIndex.fromWords(
@@ -955,6 +955,60 @@ test("early bid cut: a six-bot all-real table bids 0.4 of the paced kappa for 28
   padded.bot.refresh(padded.s, MATCH);
   await settle();
   assert.equal(padded.s.bids.at(-1)!.amount, 24n);
+});
+
+test("round 2 levers reach the bot: a 7+ completer bid, a dead-letter bid and held words cashed when broke or late", async () => {
+  // Six seats (68 auctions), all real, so words are held for the flush.
+  const six = (rack: string, bagTotal: number, letter: string, o?: Partial<Policy>) => {
+    const t = setup(rack, bagTotal, letter, { withSim: false, policy: o ? { ...DEFAULT_POLICY, ...o } : undefined });
+    for (const id of [11n, 12n, 13n, 14n]) {
+      t.s.bots.set(id, { name: `Rival${id}`, isSimulated: false, strategy: { tag: "Human" } });
+      t.s.participants.push({ matchId: MATCH, botId: id, balance: 100n, score: 0n });
+    }
+    return t;
+  };
+  // AEINST + R spells RETAINS. Index 28 (39 to come): kappa 4 x sqrt(1.7) = 5.2154, x 6 = 31; COMPLETE7_PREMIUM 2
+  // doubles it, and a cap of 40% of the balance stops the raise at 40.
+  for (const [o, want] of [[undefined, 31n], [{ COMPLETE7_PREMIUM: 2 }, 62n], [{ COMPLETE7_PREMIUM: 2, COMPLETE7_CAP_SHARE: 0.4 }, 40n]] as const) {
+    const t = six("AEINST", 39, "R", o);
+    t.bot.refresh(t.s, MATCH);
+    await settle();
+    assert.equal(t.s.bids.at(-1)!.amount, want, JSON.stringify(o));
+    // The next auction's bid goes out from the table on open, before any deferred work, premium included
+    // (index 29: kappa 4 x sqrt(100 / 39 / (100 / 68)) = 5.2818, x 6 = 31; doubled 63; capped 40).
+    const k = pacedKappa(38, 100, 68);
+    const plain = Math.floor(k * 6);
+    const cap = Math.floor((o && "COMPLETE7_CAP_SHARE" in o ? o.COMPLETE7_CAP_SHARE : 1) * 100);
+    const onOpen = o ? Math.max(plain, Math.min(Math.floor(k * 2 * 6), cap)) : plain;
+    assert.deepEqual([plain, onOpen], o === undefined ? [31, 31] : "COMPLETE7_CAP_SHARE" in o ? [31, 40] : [31, 63]);
+    const before = t.s.bids.length;
+    t.bot.onAuctionOpen(t.s, t.s.nextAuction(AUCTION + 1n, "R", 38));
+    assert.equal(t.s.bids.length, before + 1, "bid on open");
+    assert.equal(t.s.bids.at(-1)!.amount, BigInt(onOpen), `on open ${JSON.stringify(o)}`);
+    await settle();
+  }
+  // VG + B: B joins no word, so its value is its leave value, 0.35 x 6.75 = 2.3625: 5.2154 x 2.3625 = 12, x 0.5 = 6.
+  for (const [o, want] of [[undefined, 12n], [{ DEAD_KAPPA_SCALE: 0.5 }, 6n], [{ DEAD_KAPPA_SCALE: 1.5 }, 18n]] as const) {
+    const t = six("VG", 39, "B", o);
+    t.bot.refresh(t.s, MATCH);
+    await settle();
+    assert.equal(t.s.bids.at(-1)!.amount, want, JSON.stringify(o));
+  }
+  // Holding QINTARS with 20 coins (above LIQUIDITY_FLOOR): held by default, cashed under CASH_BROKE_BALANCE 30.
+  for (const [o, want] of [[undefined, []], [{ CASH_BROKE_BALANCE: 30 }, ["QINTARS"]], [{ CASH_BROKE_BALANCE: 20 }, []]] as const) {
+    const t = six("RETAINSQ", 39, "E", o);
+    t.s.balance(ME, 20);
+    t.bot.refresh(t.s, MATCH);
+    await settle();
+    assert.deepEqual(t.s.words, want, JSON.stringify(o));
+  }
+  // With 100 coins: cashed once fewer than CASH_BROKE_AUCTIONS auctions are to come.
+  for (const [bag, want] of [[20, []], [19, ["QINTARS"]]] as const) {
+    const t = six("RETAINSQ", bag, "E", { CASH_BROKE_AUCTIONS: 20 });
+    t.bot.refresh(t.s, MATCH);
+    await settle();
+    assert.deepEqual(t.s.words, want, `bag ${bag}`);
+  }
 });
 
 test("sims-only table bids up to the sim cap", async () => {
