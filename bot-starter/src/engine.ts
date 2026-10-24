@@ -351,6 +351,11 @@ export interface Valuation {
  * value beats the word they would form. Sim (leave_sim.py, 400 deal-paired
  * matches, kappa 4.25): +18.5 points vs the forced packing in a mixed field,
  * +13.7 vs prototype hoarders, +34.7 vs sims.
+ * In "leave" mode the value of rack + L is also never below keeping the
+ * rack's own packing and adding L to the leave, so delta[L] >= alpha x
+ * LEAVE_W7[L] >= 0 (greedy repacking alone is not monotonic: Codex found
+ * ANPQT 16.2595 but ANPQT + C repacked to 15.3845). Sim: neutral (-1.4,
+ * SE 1.0, mixed field; +0.1, SE 0.5, vs hoarders).
  * mode "forced": the prototype's packing (every word that fits), kept so the
  * Python cross-check of sim.py stays exact.
  */
@@ -361,13 +366,15 @@ export function valuate(
   mode: "leave" | "forced" = "leave",
 ): Valuation {
   const t0 = performance.now();
-  const keep = mode === "leave" ? alpha : 0;
+  const leave = mode === "leave";
+  const keep = leave ? alpha : 0;
   const cands = index.scan(counts, true);
   const base = index.pack(cands, counts, -1, keep);
   const baseValue = packValue(base, alpha);
   const delta = new Float64Array(26);
   for (let i = 0; i < 26; i++) {
-    delta[i] = packValue(index.pack(cands, counts, i, keep), alpha) - baseValue;
+    const repacked = packValue(index.pack(cands, counts, i, keep), alpha) - baseValue;
+    delta[i] = leave ? Math.max(repacked, alpha * W7_BY_INDEX[i]) : repacked;
   }
   return {
     rackKey: countsKey(counts),

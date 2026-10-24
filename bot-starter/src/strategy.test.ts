@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import { test } from "node:test";
 import {
+  LEAVE_W7,
   WordIndex,
   countsKey,
   countsOf,
@@ -211,6 +212,42 @@ test("leave-aware valuation: adding a tile never forces a bad word (Codex O + S 
     const v = valuate(INDEX, countsOf(rack), 0.35);
     for (let i = 0; i < 26; i++) assert.ok(v.delta[i] >= -1e-9, `${rack}+${String.fromCharCode(65 + i)}`);
   }
+});
+
+test("valuation is monotonic: Codex ANPQT + C example", () => {
+  // Greedy repack of ANPQT+C plays PACT (15.3845) though QAT + leave (16.2595) was better;
+  // keeping the old packing and adding C to the leave is worth 16.2595 + 0.35 x 7.17 = 18.769.
+  const v = valuate(INDEX, countsOf("ANPQT"), 0.35);
+  assert.ok(Math.abs(v.baseValue - 16.2595) < 1e-9);
+  const C = letterIndex("C");
+  assert.ok(Math.abs(v.baseValue + v.delta[C] - 18.769) < 1e-9, `got ${v.baseValue + v.delta[C]}`);
+});
+
+test("valuation property: value(rack + L) >= value(rack) + its leave, 400 random racks x 26 letters", () => {
+  let seed = 20261023;
+  const rnd = () => {
+    seed = (seed + 0x6d2b79f5) >>> 0;
+    let t = seed;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const bag = "AAAAAAAAABBCCDDDDEEEEEEEEEEEEFFGGGHHIIIIIIIIIJKLLLLMMNNNNNNOOOOOOOOPPQRRRRRRSSSSTTTTTTUUUUVVWWXYYZ";
+  let violations = 0;
+  for (let n = 0; n < 400; n++) {
+    const tiles = bag.split("");
+    let rack = "";
+    const size = 1 + Math.floor(rnd() * 22);
+    for (let i = 0; i < size; i++) rack += tiles.splice(Math.floor(rnd() * tiles.length), 1)[0];
+    for (const alpha of [0.35, 0]) {
+      const v = valuate(INDEX, countsOf(rack), alpha);
+      for (let i = 0; i < 26; i++) {
+        const floor = alpha * LEAVE_W7[String.fromCharCode(65 + i)];
+        if (!(v.delta[i] >= floor - 1e-9)) violations++;
+      }
+    }
+  }
+  assert.equal(violations, 0);
 });
 
 // ---- bidding policy ----
