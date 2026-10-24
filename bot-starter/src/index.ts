@@ -18,9 +18,10 @@
 // itself can register, so this has to come from the bot's process.
 //
 // Strategy: src/strategy.ts (bids, word policy), src/engine.ts (valuation),
-// src/bot.ts (per-match loop). This file only connects and wires events.
-// Every auction this bot sees in its own matches is appended as one JSON
-// line to sookra-<BOT_NAME>.auctions.log (gitignored by *.log).
+// src/bot.ts (per-match loop), src/supervisor.ts (connection readiness).
+// This file only connects and wires events. Every auction this bot sees in
+// its own matches is appended as one JSON line to
+// sookra-<BOT_NAME>.auctions.log (gitignored by *.log).
 
 import {
   DbConnection,
@@ -32,6 +33,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { WordIndex } from "./engine.js";
 import { SookraBot, type ConnLike } from "./bot.js";
+import { Supervisor } from "./supervisor.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -41,12 +43,12 @@ const BOT_NONCE = process.env.BOT_NONCE; // from the CLI, first run only
 const TOURNAMENT_ID = process.env.TOURNAMENT_ID;
 const TOKEN_PATH = path.join(process.cwd(), `.token-${BOT_NAME}`);
 const AUCTION_LOG_PATH = path.join(process.cwd(), `sookra-${BOT_NAME}.auctions.log`);
-/** Re-check running matches this often, in case an event was missed. */
+/** Re-check running matches (and the watchdog) this often. */
 const TICK_MS = 250;
-/** Retry delay when the very first connection fails (the SDK only retries established ones). */
+/** Retry delay when a connection fails and the SDK will not retry it. */
 const INITIAL_RETRY_MS = 5000;
-/** After an automatic reconnect, resume decisions this long later even without a replay confirmation. */
-const RESUME_FALLBACK_MS = 5000;
+/** Delay before building a new connection after dropping one ourselves. */
+const REPLACE_DELAY_MS = 1000;
 
 function loadToken(): string | undefined {
   try {
@@ -82,6 +84,7 @@ if (INDEX.size === 0) {
 }
 
 const bot = new SookraBot(INDEX, BOT_NAME, console);
+bot.online = false; // until the first subscription is applied
 bot.onRecord = (rec) => {
   fs.appendFile(AUCTION_LOG_PATH, JSON.stringify(rec) + "\n", (err) => {
     if (err) bot.warn("auction log", err);
@@ -90,6 +93,22 @@ bot.onRecord = (rec) => {
 
 let myIdentity: Identity | null = null;
 let tickTimer: ReturnType<typeof setInterval> | null = null;
+/** The DbConnection being supervised (null while a replacement is pending). */
+let currentConn: DbConnection | null = null;
+/** Set once that connection's subscription is applied; used by the tick. */
+let activeConn: ConnLike | null = null;
+let restartPending = false;
+
+const supervisor = new Supervisor({
+  setOnline: (online) => {
+    bot.online = online;
+  },
+  resubscribe: () => {
+    if (currentConn) subscribe(currentConn, supervisor.conn);
+  },
+  reconnect: (why) => replaceConnection(why),
+  log: (msg) => console.log(`[${BOT_NAME}] ${msg}`),
+});
 
 // Keep the process alive through anything unexpected; log one line.
 process.on("uncaughtException", (err) => bot.warn("uncaught", err));
@@ -116,80 +135,130 @@ function asConn(conn: DbConnection): ConnLike {
   return conn;
 }
 
-function onConnect(conn: DbConnection, identity: Identity, token: string) {
-  myIdentity = identity;
-  saveToken(token);
-  console.log(`[${BOT_NAME}] connected as ${identity.toHexString()}`);
+/** Start a fresh connection after a delay (deduplicated). */
+function restartLater(why: string, delayMs = INITIAL_RETRY_MS) {
+  if (restartPending) return;
+  restartPending = true;
+  console.error(`[${BOT_NAME}] ${why}; new connection in ${delayMs} ms`);
+  setTimeout(() => {
+    restartPending = false;
+    main();
+  }, delayMs);
+}
 
+/** Drop the current connection (stopping its automatic reconnects) and build a new one. */
+function replaceConnection(why: string) {
+  const old = currentConn;
+  currentConn = null;
+  activeConn = null;
+  restartLater(`${why}; replacing the connection`, REPLACE_DELAY_MS);
+  try {
+    old?.disconnect();
+  } catch (err) {
+    bot.warn("disconnect", err);
+  }
+}
+
+/** Subscribe (again) on a connection; readiness comes only from onApplied. */
+function subscribe(conn: DbConnection, id: number) {
   conn
     .subscriptionBuilder()
-    .onApplied(() => {
-      // Fires on the first subscription and again after every reconnect replay.
-      console.log(`[${BOT_NAME}] subscription applied`);
-      bot.online = true;
+    .onApplied(() => onApplied(conn, id))
+    .onError((ctx) => {
+      const event = (ctx as { event?: unknown }).event;
+      console.error(`[${BOT_NAME}] subscription error: ${event instanceof Error ? event.message : String(event)}`);
+      supervisor.onSubscriptionError(id, event ?? new Error("subscription error"));
+    })
+    .subscribeToAllTables();
+}
 
-      // Resolve our bot id, possibly after claiming a nonce.
-      bot.myBotId = resolveMyBotId(conn);
-      if (bot.myBotId === null) {
-        if (BOT_NONCE) {
-          console.log(`[${BOT_NAME}] claiming credential with nonce…`);
-          conn.reducers
-            .claimCredential({ code: BOT_NONCE })
-            .catch(logFailure("claiming the credential"));
-          // Wait briefly for the credential to land; check again.
-          setTimeout(() => {
-            bot.myBotId = resolveMyBotId(conn);
-            if (bot.myBotId === null) {
-              console.error(
-                `[${BOT_NAME}] couldn't claim credential. Bad / expired nonce?`,
-              );
-              process.exit(1);
-            }
-            const row = conn.db.bot.id.find(bot.myBotId);
-            console.log(
-              `[${BOT_NAME}] claimed credential for bot '${row?.name ?? "?"}' (id ${bot.myBotId})`,
-            );
-            bootstrapActivity(conn);
-          }, 1000);
-          return;
-        } else {
+/** First subscription, a resubscribe, or a reconnect replay. */
+function onApplied(conn: DbConnection, id: number) {
+  if (id !== supervisor.conn) return; // a connection we already replaced
+  console.log(`[${BOT_NAME}] subscription applied (connection ${id})`);
+
+  // Resolve our bot id, possibly after claiming a nonce.
+  bot.myBotId = resolveMyBotId(conn);
+  if (bot.myBotId === null) {
+    if (BOT_NONCE) {
+      console.log(`[${BOT_NAME}] claiming credential with nonce…`);
+      conn.reducers
+        .claimCredential({ code: BOT_NONCE })
+        .catch(logFailure("claiming the credential"));
+      // Wait briefly for the credential to land; check again.
+      setTimeout(() => {
+        bot.myBotId = resolveMyBotId(conn);
+        if (bot.myBotId === null) {
           console.error(
-            `[${BOT_NAME}] no BotCredential for this token. Set BOT_TOKEN or BOT_NONCE and re-run.`,
+            `[${BOT_NAME}] couldn't claim credential. Bad / expired nonce?`,
           );
           process.exit(1);
         }
-      }
-
-      const row = conn.db.bot.id.find(bot.myBotId);
-      console.log(
-        `[${BOT_NAME}] acting as bot '${row?.name ?? "?"}' (id ${bot.myBotId})`,
+        const row = conn.db.bot.id.find(bot.myBotId);
+        console.log(
+          `[${BOT_NAME}] claimed credential for bot '${row?.name ?? "?"}' (id ${bot.myBotId})`,
+        );
+        supervisor.onApplied(id);
+        bootstrapActivity(conn);
+      }, 1000);
+      return;
+    } else {
+      console.error(
+        `[${BOT_NAME}] no BotCredential for this token. Set BOT_TOKEN or BOT_NONCE and re-run.`,
       );
-      bootstrapActivity(conn);
-    })
-    .subscribeToAllTables();
+      process.exit(1);
+    }
+  }
+
+  const row = conn.db.bot.id.find(bot.myBotId);
+  console.log(
+    `[${BOT_NAME}] acting as bot '${row?.name ?? "?"}' (id ${bot.myBotId})`,
+  );
+  supervisor.onApplied(id);
+  bootstrapActivity(conn);
+}
+
+function onConnect(conn: DbConnection, identity: Identity, token: string, id: number) {
+  if (id !== supervisor.conn) {
+    conn.disconnect(); // superseded while connecting
+    return;
+  }
+  currentConn = conn;
+  myIdentity = identity;
+  saveToken(token);
+  console.log(`[${BOT_NAME}] connected as ${identity.toHexString()} (connection ${id})`);
+
+  subscribe(conn, id);
 
   const c = asConn(conn);
+  const live = () => id === supervisor.conn;
   // Latency-critical: bid synchronously from the precomputed table, defer the rest.
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
+    if (!live()) return;
+    supervisor.noteAuctionEvent();
     if (a.status.tag === "Open") bot.onAuctionOpen(c, a);
   });
-  conn.db.myRack.onInsert((_ctx, h) => bot.scheduleRefresh(c, h.matchId));
-  conn.db.myRack.onUpdate((_ctx, _old, h) => bot.scheduleRefresh(c, h.matchId));
-  conn.db.myRack.onDelete((_ctx, h) => bot.scheduleRefresh(c, h.matchId));
+  conn.db.myRack.onInsert((_ctx, h) => live() && bot.scheduleRefresh(c, h.matchId));
+  conn.db.myRack.onUpdate((_ctx, _old, h) => live() && bot.scheduleRefresh(c, h.matchId));
+  conn.db.myRack.onDelete((_ctx, h) => live() && bot.scheduleRefresh(c, h.matchId));
   // Any balance change at our table can move a bid cap (ours or a rival's).
   conn.db.matchParticipant.onUpdate((_ctx, _old, p) => {
-    if (bot.myBotId !== null && bot.models.has(String(p.matchId))) {
+    if (live() && bot.myBotId !== null && bot.models.has(String(p.matchId))) {
       bot.scheduleRefresh(c, p.matchId);
     }
   });
   conn.db.botCredential.onInsert(() => {
-    if (bot.myBotId === null) bot.myBotId = resolveMyBotId(conn);
+    if (live() && bot.myBotId === null) bot.myBotId = resolveMyBotId(conn);
   });
-  conn.db.auctionResult.onInsert((_ctx, r) => bot.onAuctionResult(c, r));
+  conn.db.auctionResult.onInsert((_ctx, r) => {
+    if (!live()) return;
+    supervisor.noteAuctionEvent();
+    bot.onAuctionResult(c, r);
+  });
 
   // When a match this bot was in ends, report it and hop back into the lobby.
   conn.db.matchState.onUpdate((_ctx, old, neu) => {
-    if (bot.myBotId === null) return;
+    if (!live() || bot.myBotId === null) return;
     if (old.status.tag !== "Ended" && neu.status.tag === "Ended") {
       const wasIn = bot.myParticipant(c, neu.id) !== undefined;
       if (wasIn) {
@@ -235,42 +304,32 @@ function bootstrapActivity(conn: DbConnection) {
   bot.tick(activeConn);
   if (tickTimer === null) {
     tickTimer = setInterval(() => {
-      if (activeConn) bot.tick(activeConn);
+      const c = activeConn;
+      if (!c) return;
+      bot.tick(c);
+      try {
+        const running = bot.runningMatches(c);
+        const ms = running.length > 0 ? Number(c.db.matchState.id.find(running[0])?.auctionDurationMs ?? 1000) : 1000;
+        supervisor.watchdog(supervisor.conn, running.length > 0, ms);
+      } catch (err) {
+        bot.warn("watchdog", err);
+      }
     }, TICK_MS);
   }
 }
 
-let activeConn: ConnLike | null = null;
-let restartPending = false;
-
-/** Start a fresh connection when the SDK will not retry on its own. */
-function restartLater(why: string) {
-  if (restartPending) return;
-  restartPending = true;
-  console.error(`[${BOT_NAME}] ${why}; new connection in ${INITIAL_RETRY_MS} ms`);
-  setTimeout(() => {
-    restartPending = false;
-    main();
-  }, INITIAL_RETRY_MS);
-}
-
 function main() {
-  console.log(`[${BOT_NAME}] connecting to ${DB_NAME} at ${HOST}`);
+  const id = supervisor.newConnection(); // pauses the bot until this connection's subscription applies
+  console.log(`[${BOT_NAME}] connecting to ${DB_NAME} at ${HOST} (connection ${id})`);
   DbConnection.builder()
     .withUri(HOST)
     .withDatabaseName(DB_NAME)
     .withToken(BOT_TOKEN ?? loadToken())
     .withAutomaticReconnect({ minDelayMs: 1000, maxDelayMs: 10_000 })
-    .onConnect(onConnect)
+    .onConnect((conn, identity, token) => onConnect(conn, identity, token, id))
     .onAutomaticReconnect(() => {
-      console.log(`[${BOT_NAME}] reconnected; waiting for subscription replay`);
-      // Replay re-fires onApplied, which resumes decisions. If it never does, resume anyway.
-      setTimeout(() => {
-        if (!bot.online) {
-          console.warn(`[${BOT_NAME}] no replay confirmation after reconnect; resuming`);
-          bot.online = true;
-        }
-      }, RESUME_FALLBACK_MS);
+      console.log(`[${BOT_NAME}] reconnected (connection ${id}); waiting for subscription replay`);
+      supervisor.onAutomaticReconnect(id);
     })
     .onConnectError(
       (_ctx: ErrorContext, err: Error, nextAttempt?: number, nextDelayMs?: number) => {
@@ -278,17 +337,19 @@ function main() {
           `[${BOT_NAME}] connect error: ${err.message}` +
             (nextAttempt !== undefined ? ` (retry ${nextAttempt} in ${nextDelayMs} ms)` : ""),
         );
-        if (nextAttempt === undefined) restartLater("connection failed with no retry scheduled");
+        if (id === supervisor.conn && nextAttempt === undefined) {
+          restartLater("connection failed with no retry scheduled");
+        }
       },
     )
     .onDisconnect((_ctx: ErrorContext, err?: Error, nextAttempt?: number) => {
-      // The cache is stale until replay: make no decisions on it.
-      bot.online = false;
+      // The cache is stale until a replay is applied: make no decisions on it.
+      supervisor.onDisconnect(id);
       console.log(
-        `[${BOT_NAME}] disconnected${err ? `: ${err.message}` : ""}` +
+        `[${BOT_NAME}] disconnected${err ? `: ${err.message}` : ""} (connection ${id})` +
           (nextAttempt !== undefined ? ` (reconnect attempt ${nextAttempt})` : ""),
       );
-      if (nextAttempt === undefined) {
+      if (id === supervisor.conn && nextAttempt === undefined) {
         activeConn = null;
         restartLater("disconnected with no retry scheduled");
       }
