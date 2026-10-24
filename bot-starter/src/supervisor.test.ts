@@ -5,6 +5,7 @@
 
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
+import { setGlobalLogLevel } from "spacetimedb";
 import { DbConnection, type DbConnectionBuilder } from "./module_bindings/index.js";
 import {
   MAX_RESUBSCRIBE_ATTEMPTS,
@@ -528,6 +529,14 @@ test("when the SDK gives up and index.ts restarts on its own, the old object is 
 // spacetimedb package (the dist build the bot runs): a real DbConnection over
 // fake sockets, with mocked timers. Nothing touches the network: the socket
 // factory below never opens one.
+
+// The SDK logs every connection attempt with console.log ("INFO Connecting to
+// SpacetimeDB WS..."), and this process's stdout is the stream the test runner
+// reads its events from. With those lines on it the runner failed to parse
+// that stream in 2 of 8 runs of this file ("Unable to deserialize cloned
+// data"), turning the file red although no assertion had failed. Only SDK
+// errors are logged here.
+setGlobalLogLevel("error");
 
 class FakeSocket {
   readonly protocol = "v2.bsatn.spacetimedb";
