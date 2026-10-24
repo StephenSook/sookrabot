@@ -1,0 +1,234 @@
+# Verification of a strategy change: the test suite and type check, and the bot played against a
+# reference commit (bot-starter/scripts/equivalence.ts) in parallel jobs.
+#
+#  - tests: tsc --noEmit and node --test over strategy, bot and self-play tests. The supervisor
+#    test and index.ts need the generated module bindings (spacetime generate), which runners do
+#    not have, so they are left to a local run.
+#  - same: this ref's DEFAULT_POLICY (head) and each "same" variant must play exactly as the
+#    reference: decideBid, chooseWords and the flush rules on random inputs (one job), and whole
+#    matches in lockstep (sharded).
+#  - differ: each control variant must play differently from the reference somewhere (a check
+#    that can fail).
+# Every job exits by the check's own exit code and uploads its output.
+#
+#   gh workflow run verify.yml --repo StephenSook/sookrabot --ref round2-levers \
+#     -f reference=5318ca63479832d4744e4d656baa4338dbd63287 -f matches=400 -f shards=8
+name: verify
+run-name: "verify against ${{ inputs.reference }}: ${{ inputs.matches }} matches, controls ${{ inputs.controls }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      reference:
+        description: "Reference commit (its bot-starter/src engine.ts, strategy.ts and bot.ts)"
+        required: true
+        default: 5318ca63479832d4744e4d656baa4338dbd63287
+        type: string
+      matches:
+        description: "Lockstep matches for head"
+        required: true
+        default: "400"
+        type: string
+      shards:
+        description: "Parallel jobs for head's matches (1 to 16)"
+        required: true
+        default: "8"
+        type: string
+      seed:
+        description: "Seed"
+        required: true
+        default: "1"
+        type: string
+      bids:
+        description: "Random decideBid inputs for head (a tenth for each other variant)"
+        required: true
+        default: "200000"
+        type: string
+      words:
+        description: "Random chooseWords inputs for head (a tenth for each other variant)"
+        required: true
+        default: "20000"
+        type: string
+      same:
+        description: "Variants that must play as the reference (space-separated, may be empty)"
+        required: false
+        default: "COMPLETE7_PREMIUM=1+COMPLETE7_CAP_SHARE=1+CASH_BROKE_BALANCE=0+CASH_BROKE_AUCTIONS=0+DEAD_KAPPA_SCALE=1"
+        type: string
+      controls:
+        description: "Variants that must play differently (space-separated)"
+        required: false
+        default: "COMPLETE7_PREMIUM=2 DEAD_KAPPA_SCALE=0.5 CASH_BROKE_BALANCE=40 CASH_BROKE_AUCTIONS=20 PACED_KAPPA=4.5"
+        type: string
+      other_matches:
+        description: "Lockstep matches for each same and control variant"
+        required: true
+        default: "40"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Check the inputs and lay out the jobs
+        id: plan
+        shell: bash
+        env:
+          REFERENCE: ${{ inputs.reference }}
+          MATCHES: ${{ inputs.matches }}
+          SHARDS: ${{ inputs.shards }}
+          SEED: ${{ inputs.seed }}
+          BIDS: ${{ inputs.bids }}
+          WORDS: ${{ inputs.words }}
+          SAME: ${{ inputs.same }}
+          CONTROLS: ${{ inputs.controls }}
+          OTHER: ${{ inputs.other_matches }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$REFERENCE" =~ ^[0-9a-f]{7,40}$ ]] || fail "reference: a commit sha, got '$REFERENCE'"
+          [[ "$MATCHES" =~ ^[0-9]{1,5}$ ]] || fail "matches: 0 to 99999, got '$MATCHES'"
+          [[ "$SHARDS" =~ ^[1-9][0-9]?$ ]] && (( SHARDS <= 16 )) || fail "shards: 1 to 16, got '$SHARDS'"
+          [[ "$SEED" =~ ^[0-9]{1,9}$ ]] || fail "seed: a whole number, got '$SEED'"
+          [[ "$BIDS" =~ ^[0-9]{1,7}$ && "$WORDS" =~ ^[0-9]{1,6}$ && "$OTHER" =~ ^[0-9]{1,5}$ ]] || fail "bids, words, other_matches: whole numbers"
+          read -r -a S <<< "$SAME"
+          read -r -a C <<< "$CONTROLS"
+          for v in "${S[@]}" "${C[@]}"; do
+            [[ "$v" =~ ^[A-Za-z0-9_.=+-]+$ ]] && (( ${#v} <= 400 )) || fail "variant '$v': NAME=value parts joined by +"
+          done
+          (( ${#S[@]} + ${#C[@]} <= 12 )) || fail "at most 12 same and control variants"
+          rows=()
+          rows+=("$(jq -cn --arg s "$SEED" --arg b "$BIDS" --arg w "$WORDS" \
+            '{name: "head functions", policy: "head", expect: "same", matches: "0", shard: "0/1", bids: $b, words: $w, seed: $s}')")
+          for ((i = 0; i < SHARDS; i++)); do
+            rows+=("$(jq -cn --arg s "$SEED" --arg m "$MATCHES" --arg sh "$i/$SHARDS" \
+              '{name: ("head matches " + $sh), policy: "head", expect: "same", matches: $m, shard: $sh, bids: "0", words: "0", seed: $s}')")
+          done
+          for v in "${S[@]}"; do
+            rows+=("$(jq -cn --arg v "$v" --arg s "$SEED" --arg m "$OTHER" --arg b "$(( BIDS / 10 ))" --arg w "$(( WORDS / 10 ))" \
+              '{name: ("same " + $v), policy: $v, expect: "same", matches: $m, shard: "0/1", bids: $b, words: $w, seed: $s}')")
+          done
+          for v in "${C[@]}"; do
+            rows+=("$(jq -cn --arg v "$v" --arg s "$SEED" --arg m "$OTHER" --arg b "$(( BIDS / 10 ))" --arg w "$(( WORDS / 10 ))" \
+              '{name: ("control " + $v), policy: $v, expect: "differ", matches: $m, shard: "0/1", bids: $b, words: $w, seed: $s}')")
+          done
+          matrix=$(printf '%s\n' "${rows[@]}" | jq -cs 'to_entries | map(.value + {tag: ("j" + (.key | tostring))})')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "$matrix" | jq -r '.[] | "\(.tag): \(.name) (expect \(.expect))"'
+
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bot-starter/package-lock.json
+      - name: Install
+        working-directory: bot-starter
+        run: npm ci --no-audit --no-fund
+      - name: Type check (everything but index.ts and supervisor.test.ts, which need the bindings)
+        working-directory: bot-starter
+        shell: bash
+        run: |
+          set +e
+          files=$(ls src/*.ts scripts/*.ts | grep -v -e '^src/index.ts$' -e '^src/supervisor.test.ts$')
+          npx tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution Bundler --skipLibCheck \
+            --esModuleInterop --resolveJsonModule --allowSyntheticDefaultImports $files > "$RUNNER_TEMP/tsc.log" 2>&1
+          rc=$?
+          echo "tsc over $(echo $files | wc -w) files: exit $rc"
+          cat "$RUNNER_TEMP/tsc.log"
+          exit $rc
+      - name: Tests (strategy, bot, self-play)
+        working-directory: bot-starter
+        shell: bash
+        run: |
+          set +e
+          node --import tsx --test src/strategy.test.ts src/bot.test.ts src/selfplay.test.ts > "$RUNNER_TEMP/test.log" 2>&1
+          rc=$?
+          grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)' "$RUNNER_TEMP/test.log"
+          grep -E '^not ok' "$RUNNER_TEMP/test.log"
+          echo "node --test: exit $rc" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E '^# (tests|pass|fail)' "$RUNNER_TEMP/test.log" >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: tests-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/tsc.log
+            ${{ runner.temp }}/test.log
+          if-no-files-found: error
+          retention-days: 30
+
+  check:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bot-starter/package-lock.json
+      - name: Install
+        working-directory: bot-starter
+        run: npm ci --no-audit --no-fund
+      - name: Reference sources
+        shell: bash
+        env:
+          REFERENCE: ${{ inputs.reference }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ref"
+          for f in engine strategy bot; do
+            git show "$REFERENCE:bot-starter/src/$f.ts" > "$RUNNER_TEMP/ref/$f.ts"
+          done
+          sha256sum "$RUNNER_TEMP"/ref/*.ts
+      - name: Check
+        working-directory: bot-starter
+        shell: bash
+        env:
+          POLICY: ${{ matrix.policy }}
+          EXPECT: ${{ matrix.expect }}
+          MATCHES: ${{ matrix.matches }}
+          SHARD: ${{ matrix.shard }}
+          BIDS: ${{ matrix.bids }}
+          WORDS: ${{ matrix.words }}
+          SEED: ${{ matrix.seed }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          set +e
+          mkdir -p "$RUNNER_TEMP/out"
+          out="$RUNNER_TEMP/out/equivalence-$TAG.txt"
+          start=$(date +%s)
+          npx tsx scripts/equivalence.ts "$RUNNER_TEMP/ref" --policy="$POLICY" --expect="$EXPECT" --matches="$MATCHES" \
+            --shard="$SHARD" --bids="$BIDS" --words="$WORDS" --seed="$SEED" > "$out" 2>&1
+          rc=$?
+          echo "{\"tag\": \"$TAG\", \"policy\": \"$POLICY\", \"expect\": \"$EXPECT\", \"exit\": $rc, \"secs\": $(( $(date +%s) - start ))}" >> "$out"
+          cat "$out"
+          [ -s "$out" ] || { echo "::error::no output"; exit 1; }
+          exit $rc
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: equivalence-${{ github.run_id }}-${{ matrix.tag }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
