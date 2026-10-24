@@ -1,0 +1,247 @@
+{
+ "about": "Live numbers of each v4 fit over its fitted range (all-real 6-seat matches): mean score, letters won, coins paid, final balance, words and place per match, from the summary obs of rival_refit_v4.py. validate4 prints the simulated rivals beside them. Keys are the fixture entry names without -v4 or -v4c.",
+ "source": {
+  "file": "rival-data-v4/work/refit-v4.json",
+  "sha256": "c10e06b3cf7375e668518e6064336944dc58ee6ac05b05152c897e83105d948a"
+ },
+ "rivals": {
+  "Dante": {
+   "botId": 22,
+   "range": [
+    257,
+    1000000000
+   ],
+   "matches": 50,
+   "score": 97.5,
+   "won": 14.0,
+   "paid": 178.3,
+   "final_balance": 19.2,
+   "n_words": 3.1,
+   "place": 2.16
+  },
+  "james": {
+   "botId": 23,
+   "range": [
+    225,
+    1000000000
+   ],
+   "matches": 28,
+   "score": 90.9,
+   "won": 12.6,
+   "paid": 169.7,
+   "final_balance": 21.2,
+   "n_words": 3.0,
+   "place": 2.14
+  },
+  "Yezi": {
+   "botId": 13,
+   "range": [
+    272,
+    1000000000
+   ],
+   "matches": 53,
+   "score": 95.1,
+   "won": 13.8,
+   "paid": 167.1,
+   "final_balance": 28.0,
+   "n_words": 3.1,
+   "place": 2.32
+  },
+  "keanu": {
+   "botId": 21,
+   "range": [
+    279,
+    1000000000
+   ],
+   "matches": 47,
+   "score": 87.4,
+   "won": 10.5,
+   "paid": 155.6,
+   "final_balance": 31.8,
+   "n_words": 2.2,
+   "place": 2.51
+  },
+  "LetterShark": {
+   "botId": 8,
+   "range": [
+    279,
+    1000000000
+   ],
+   "matches": 54,
+   "score": 87.4,
+   "won": 12.4,
+   "paid": 157.8,
+   "final_balance": 29.6,
+   "n_words": 2.9,
+   "place": 2.56
+  },
+  "cashu": {
+   "botId": 37,
+   "range": [
+    311,
+    1000000000
+   ],
+   "matches": 34,
+   "score": 83.6,
+   "won": 13.9,
+   "paid": 165.7,
+   "final_balance": 17.9,
+   "n_words": 3.4,
+   "place": 2.97
+  },
+  "scrabbler": {
+   "botId": 30,
+   "range": [
+    331,
+    1000000000
+   ],
+   "matches": 24,
+   "score": 82.2,
+   "won": 13.1,
+   "paid": 163.9,
+   "final_balance": 18.3,
+   "n_words": 3.1,
+   "place": 3.04
+  },
+  "code": {
+   "botId": 11,
+   "range": [
+    262,
+    1000000000
+   ],
+   "matches": 48,
+   "score": 76.8,
+   "won": 14.7,
+   "paid": 169.6,
+   "final_balance": 7.2,
+   "n_words": 3.6,
+   "place": 3.17
+  },
+  "MagnusBot": {
+   "botId": 27,
+   "range": [
+    302,
+    1000000000
+   ],
+   "matches": 31,
+   "score": 70.8,
+   "won": 8.5,
+   "paid": 109.3,
+   "final_balance": 61.5,
+   "n_words": 2.1,
+   "place": 3.81
+  },
+  "LUCENT": {
+   "botId": 18,
+   "range": [
+    269,
+    1000000000
+   ],
+   "matches": 58,
+   "score": 67.3,
+   "won": 10.5,
+   "paid": 141.1,
+   "final_balance": 26.2,
+   "n_words": 2.5,
+   "place": 3.83
+  },
+  "podzemski": {
+   "botId": 15,
+   "range": [
+    222,
+    1000000000
+   ],
+   "matches": 75,
+   "score": 53.9,
+   "won": 8.3,
+   "paid": 93.2,
+   "final_balance": 60.7,
+   "n_words": 2.5,
+   "place": 4.63
+  },
+  "SkyScrabble": {
+   "botId": 36,
+   "range": [
+    317,
+    1000000000
+   ],
+   "matches": 25,
+   "score": 56.7,
+   "won": 12.0,
+   "paid": 124.5,
+   "final_balance": 32.2,
+   "n_words": 2.6,
+   "place": 4.84
+  },
+  "TileShark": {
+   "botId": 19,
+   "range": [
+    284,
+    1000000000
+   ],
+   "matches": 36,
+   "score": 48.9,
+   "won": 8.6,
+   "paid": 119.1,
+   "final_balance": 29.8,
+   "n_words": 2.6,
+   "place": 4.69
+  },
+  "tinytung": {
+   "botId": 14,
+   "range": [
+    210,
+    1000000000
+   ],
+   "matches": 50,
+   "score": 66.3,
+   "won": 13.6,
+   "paid": 137.7,
+   "final_balance": 28.6,
+   "n_words": 3.0,
+   "place": 3.84
+  },
+  "Doppio": {
+   "botId": 20,
+   "range": [
+    209,
+    1000000000
+   ],
+   "matches": 36,
+   "score": 97.3,
+   "won": 12.7,
+   "paid": 154.5,
+   "final_balance": 42.8,
+   "n_words": 2.7,
+   "place": 2.11
+  },
+  "slow-n-dumb": {
+   "botId": 12,
+   "range": [
+    234,
+    301
+   ],
+   "matches": 21,
+   "score": 73.3,
+   "won": 10.1,
+   "paid": 145.3,
+   "final_balance": 28.0,
+   "n_words": 2.6,
+   "place": 3.52
+  },
+  "bot": {
+   "botId": 7,
+   "range": [
+    207,
+    331
+   ],
+   "matches": 32,
+   "score": 69.0,
+   "won": 11.4,
+   "paid": 137.4,
+   "final_balance": 31.6,
+   "n_words": 3.2,
+   "place": 3.66
+  }
+ }
+}

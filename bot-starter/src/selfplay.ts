@@ -7,7 +7,12 @@
 //   npx tsx src/selfplay.ts merge <rows.jsonl>... [--expect=<matches>]
 //   npx tsx src/selfplay.ts [sims|starters] [matches] [seed]
 //   npx tsx src/selfplay.ts validate [matches] [seed]
+//   npx tsx src/selfplay.ts validate4 [matches] [seed] [rho|-] [v4c|v4]
 //   npx tsx src/selfplay.ts list
+//
+// GitHub Actions runs compare in parallel shards (.github/workflows/selfplay.yml)
+// and validate4 once per rho (.github/workflows/calibrate.yml);
+// bot-starter/scripts/selfplay_aggregate.py merges and summarizes their output.
 //
 // Variants. "head" is the live bot: DEFAULT_POLICY. Any other variant names
 // strategy.ts constants to override, NAME=value joined by "+", for example
@@ -72,6 +77,20 @@
 // the harness is optimistic for SookraBot (pad-code2: 153 vs code-v2 115; live
 // m127 and m129 to m132: 101 vs code 208), so trust paired differences more
 // than levels.
+//
+// Entries named -v4 and -v4c were refitted on the v4 snapshot (393 matches,
+// 2026-10-24 06:00 UTC; all-real 6-seat matches only, each rival over its
+// latest stable range, rival_refit_v4.py and rival_refit_v4b.py). Each carries
+// its bid-likelihood rack awareness as rho (0.1 to 0.4; field@rho overrides
+// it). -v4c entries add a separate survival curve for letters that complete a
+// 7+ word on the rival's rack (complete7) and the word policy with the best
+// likelihood (minLen: the hazard step only plays words of that length or more;
+// sharkLen: words of that length or more are cashed first); -v4 entries are the
+// same fits without those. The -v4 fields use -v4c unless named -v4base.
+// Known gap (validate4, 30 matches): the fitted top rivals score 20 to 35
+// points below their live level (they turn fewer letters into 7+ words), so
+// levels are optimistic for SookraBot; trust paired differences, check a
+// result in ar6-top-mixed too, and calibrate rho with validate4.
 
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -88,7 +107,7 @@ import {
   type ParticipantRow,
   SookraBot,
 } from "./bot.js";
-import { LETTER_VALUE, WordIndex, countsKey, countsOf, letterIndex, valuate, wordReward } from "./engine.js";
+import { type Counts, LETTER_VALUE, WordIndex, countsKey, countsOf, letterIndex, valuate, wordReward } from "./engine.js";
 import {
   type AuctionKind,
   type Policy,
@@ -188,6 +207,18 @@ interface RivalModel {
    * bag counts. The marginal bid distribution is kept; the rival bids high on the letters it needs.
    */
   rho?: number;
+  /**
+   * Optional (-v4c entries): survival runs at balance 100, pooled over value classes and clock
+   * blocks, for letters that complete a 7+ word on the rival's rack (the rack alone spells none,
+   * rack + letter spells one). Such a bid is drawn from these runs without the rack-rank copula;
+   * every other bid from cells. Live Chinese Dante wins 61% of such auctions (86 of 142) against 25%
+   * of the rest (539 of 2140; rival_refit_v4b.py).
+   */
+  complete7?: [number, number][];
+  /** Hazard policy only (-v4c entries): the hazard step plays words of at least this many letters (default 2). */
+  minLen?: number;
+  /** Hazard policy only (-v4c entries): every word of at least this many letters is cashed before the hazard step. */
+  sharkLen?: number;
 }
 
 /** Standard normal CDF (erfc via Numerical Recipes' Chebyshev fit, |error| < 1.2e-7). */
@@ -243,9 +274,13 @@ function blockOf(bagLeft: number): number {
   return bagLeft >= 18 ? 0 : bagLeft >= 10 ? 1 : bagLeft >= 5 ? 2 : 3;
 }
 
-/** A fitted rival's bid. Always draws three numbers so its noise stream stays aligned across variants. */
+/**
+ * A fitted rival's bid. Always draws three numbers so its noise stream stays aligned across variants.
+ * `completes`: the letter completes a 7+ word on the rival's rack (used only by models with complete7).
+ */
 function rivalBid(
   m: RivalModel, rng: Rng, letter: string, bagLeft: number, balance: number, auctions = 0, rankQ = 0.5,
+  completes = false,
 ): number {
   const u1 = rng();
   const u2 = rng();
@@ -257,13 +292,14 @@ function rivalBid(
   const b = m.bid;
   if (b.kind === "survival") {
     let u = u1;
-    const rho = m.rho ?? 0;
+    const c7 = completes && m.complete7 !== undefined;
+    const rho = c7 ? 0 : m.rho ?? 0;
     if (rho > 0) {
       const z = rho * normInv(Math.min(0.98, Math.max(0.02, rankQ))) + Math.sqrt(1 - rho * rho) * normInv(1 - u1);
       u = 1 - normCdf(z);
     }
     let x = 200;
-    for (const [rx, s] of b.cells[`${VCLASS[v]}|${blk}`]) {
+    for (const [rx, s] of c7 ? m.complete7! : b.cells[`${VCLASS[v]}|${blk}`]) {
       if (s < u) {
         x = rx;
         break;
@@ -308,6 +344,8 @@ interface Seat {
   bot?: SookraBot;
   /** Rack-aware fitted rivals: marginal values per rack key, this match only. */
   valCache?: Map<string, Float64Array>;
+  /** Fitted rivals with complete7: sevenCompleters per rack key, this match only. */
+  c7Cache?: Map<string, number>;
 }
 
 /**
@@ -335,6 +373,36 @@ function rackRank(index: WordIndex, seat: Seat, letter: string): number {
     else if (dc <= d + 1e-9) equal += w;
   }
   return (below + 0.5 * equal) / total;
+}
+
+/**
+ * Bit i set when letter i completes a 7+ word on this rack: the rack alone spells no 7+ word and the
+ * rack plus that letter spells one (0 when the rack already spells one). One scan with one extra tile
+ * answers all 26 letters (WordIndex.scan tags each key that needs exactly one more tile with its letter).
+ */
+export function sevenCompleters(index: WordIndex, counts: Counts): number {
+  const cands = index.scan(counts, true);
+  let mask = 0;
+  for (let i = 0; i < cands.n; i++) {
+    if (index.len[cands.keys[i]] < 7) continue;
+    const e = cands.extra[i];
+    if (e === -1) return 0;
+    mask |= 1 << e;
+  }
+  return mask >>> 0;
+}
+
+/** Whether `letter` completes a 7+ word on this seat's rack (cached per rack for the match). */
+function completes7(index: WordIndex, seat: Seat, letter: string): boolean {
+  const counts = countsOf(seat.rack);
+  const key = countsKey(counts);
+  seat.c7Cache ??= new Map();
+  let mask = seat.c7Cache.get(key);
+  if (mask === undefined) {
+    mask = sevenCompleters(index, counts);
+    seat.c7Cache.set(key, mask);
+  }
+  return ((mask >>> letterIndex(letter)) & 1) === 1;
 }
 
 class Table {
@@ -453,8 +521,16 @@ function rivalAct(table: Table, seat: Seat, m: RivalModel, bagLeft: number, fina
     flush();
     return;
   }
+  if (m.sharkLen !== undefined) {
+    for (;;) {
+      const k = index.bestKey(cands, counts, m.sharkLen);
+      if (k < 0) break;
+      table.playKey(seat, k);
+      index.consume(counts, k);
+    }
+  }
   for (let i = 0; i < 4; i++) {
-    const k = index.bestKey(cands, counts, 2);
+    const k = index.bestKey(cands, counts, m.minLen ?? 2);
     if (k < 0) return;
     const p = 1 / (1 + Math.exp(-(m.hazard!.c0 + m.hazard!.c1 * index.reward[k])));
     if (!(seat.wordRng() < p)) return;
@@ -629,8 +705,11 @@ export async function playMatch(
         const want = (s.rack.get(letter) ?? 0) === 0 ? value + 2 : Math.max(1, value);
         amounts.set(s, Math.min(want, Math.max(0, s.balance)));
       } else if (spec.kind === "fitted") {
-        const q = (spec.model.rho ?? 0) > 0 && bagLeft > 0 ? rackRank(index, s, letter) : 0.5;
-        let amt = rivalBid(spec.model, s.bidRng, letter, bagLeft, s.balance, auctions, q);
+        const m = spec.model;
+        const c7 = m.complete7 !== undefined && bagLeft > 0 && completes7(index, s, letter);
+        // The rack rank only feeds the copula, which a complete7 bid does not use.
+        const q = !c7 && (m.rho ?? 0) > 0 && bagLeft > 0 ? rackRank(index, s, letter) : 0.5;
+        let amt = rivalBid(m, s.bidRng, letter, bagLeft, s.balance, auctions, q, c7);
         if (env.shade !== 1 && amt > 0) amt = Math.max(0, Math.min(roundHalfEven(amt * env.shade), s.balance));
         amounts.set(s, amt);
       }
@@ -762,7 +841,11 @@ export function parseVariant(name: string): Variant {
 // ---- fields ----
 
 const sookra = (name: string, policy: Policy): SeatSpec => ({ kind: "sookra", name, policy });
-const fitted = (name: string): SeatSpec => ({ kind: "fitted", name, model: RIVALS[name] });
+function fitted(name: string): SeatSpec {
+  const model = RIVALS[name];
+  if (!model) throw new Error(`no rival model ${name} in fixtures/rival-models.json`);
+  return { kind: "fitted", name, model };
+}
 function randomSims(rnd: Rng, k: number): SeatSpec[] {
   const pool = [...SIMS];
   const out: SeatSpec[] = [];
@@ -774,6 +857,29 @@ function randomSims(rnd: Rng, k: number): SeatSpec[] {
 }
 
 const HEAD = DEFAULT_POLICY;
+/** The live bot before it held words at all-real tables (build A): cashes every 7+ word as it forms. */
+const CASH7: Policy = Object.freeze({ ...DEFAULT_POLICY, HOLD_MIN_REAL_RIVALS: 99 });
+
+/** A rival's v4 fixture entry: -v4c (complete7 bids, likelihood-chosen word policy) or -v4 (without them). */
+const v4 = (name: string, entries: "v4c" | "v4" = "v4c") => `${name}-${entries}`;
+const v4Pool = (pool: readonly (readonly [string, number])[], entries: "v4c" | "v4" = "v4c"): [string, number][] =>
+  pool.map(([name, w]): [string, number] => [v4(name, entries), w]);
+/**
+ * Rivals with v4 fits and how many of the 91 live all-real 6-seat tables m300 to m390 each sat at
+ * (the Swiss round 1 draw and validate4). Left out though fitted: Doppio (no seat there) and
+ * slow-n-dumb (4 seats; its fit stops at m301).
+ */
+const V4_TABLES: [string, number][] = [
+  ["LetterShark", 43], ["LUCENT", 41], ["Yezi", 39], ["scrabbler", 38], ["keanu", 37], ["podzemski", 36],
+  ["cashu", 34], ["Dante", 32], ["code", 31], ["MagnusBot", 31], ["TileShark", 30], ["james", 27],
+  ["SkyScrabble", 25], ["tinytung", 18], ["bot", 13],
+];
+/**
+ * The strongest rivals with v4 fits, by live all-real place over m300 to m390 (james 2.00, Chinese
+ * Dante 2.12, YeziShanYang 2.54, keanu_reeves 2.65, LetterShark 2.65, cashu 2.97, code 3.42; SookraBot 3.06).
+ */
+const V4_STRONGEST = ["james", "Dante", "Yezi", "keanu", "LetterShark", "cashu", "code"];
+
 const FIELDS: Record<string, { about: string; seats: (focal: SeatSpec, rnd: Rng) => SeatSpec[] }> = {
   sims: { about: "focal + 5 random sims", seats: (f, r) => [f, ...randomSims(r, 5)] },
   starters: {
@@ -820,10 +926,11 @@ const FIELDS: Record<string, { about: string; seats: (focal: SeatSpec, rnd: Rng)
   },
   // All-real tables, the tournament shape (no sims). Rivals refitted on the live all-real 6-bot
   // matches m147 to m190 (suffix -ar). ar6 draws 5 of the 7 active rivals per match, weighted by
-  // how often each sat at those tables; ar6-top is the five most frequent.
+  // how often each sat at those tables; ar6-top-ar is the five most frequent (named ar6-top before
+  // the v4 fits; ar6-top is now the five strongest -v4c rivals, below).
   ar6: { about: "focal + 5 of 7 active real rivals (-ar fits), drawn by live table frequency", seats: (f, r) => [f, ...drawRivals(r, 5)] },
-  "ar6-top": {
-    about: "focal, Yezi-ar, code-ar, bot-ar, tinytung-ar, dev-voices-ar",
+  "ar6-top-ar": {
+    about: "focal, Yezi-ar, code-ar, bot-ar, tinytung-ar, dev-voices-ar (the old ar6-top)",
     seats: (f) => [f, ...["Yezi-ar", "code-ar", "bot-ar", "tinytung-ar", "dev-voices-ar"].map(fitted)],
   },
   "ar6-head": {
@@ -834,6 +941,24 @@ const FIELDS: Record<string, { about: string; seats: (focal: SeatSpec, rnd: Rng)
   "duel-code-ar": { about: "2-bot duel vs code-ar", seats: (f) => [f, fitted("code-ar")] },
   "duel-bot-ar": { about: "2-bot duel vs bot-ar", seats: (f) => [f, fitted("bot-ar")] },
   "duel-tinytung-ar": { about: "2-bot duel vs tinytung-ar", seats: (f) => [f, fitted("tinytung-ar")] },
+  // The v4 fits (see the header), -v4c entries unless the field ends in -v4base. The tournament's
+  // shape: Swiss round 1 draws its tables (ar6-v4), later rounds seat the leaders together
+  // (ar6-top), the bracket runs one table from the cut down to 3 bots (arN-top, arN-topdraw), and
+  // the final is a 3-game duel (duel-*-v4). The loops below add arN-v4, arN-top and arN-topdraw.
+  // Robustness: the fitted top rivals score below their live level, so ar6-top-mixed gives two seats
+  // to value-bidding SookraBots (HEAD, and a cash-7 one, the live bot before holding words).
+  "ar6-top-mixed": {
+    about: "focal, a HEAD SookraBot, a cash-7 SookraBot (HOLD_MIN_REAL_RIVALS=99), james-v4c, Dante-v4c, Yezi-v4c",
+    seats: (f) => [f, sookra("SookraHead", HEAD), sookra("SookraCash7", CASH7), ...V4_STRONGEST.slice(0, 3).map((n) => fitted(v4(n)))],
+  },
+  "ar6-v4base": {
+    about: "ar6-v4 with the -v4 entries (no complete7 bids, every hazard rival on minLen 2)",
+    seats: (f, r) => [f, ...drawFrom(r, v4Pool(V4_TABLES, "v4"), 5)],
+  },
+  "ar6-top-v4base": {
+    about: `ar6-top with the -v4 entries: ${V4_STRONGEST.slice(0, 5).map((n) => v4(n, "v4")).join(", ")}`,
+    seats: (f) => [f, ...V4_STRONGEST.slice(0, 5).map((n) => fitted(v4(n, "v4")))],
+  },
 };
 // All-real tables of every size: arN is the focal bot + N - 1 drawn -ar rivals (BAG_TILES - 5N auctions).
 // The final is a duel (ar2); bracket tables shrink from the cut to 3 bots; a Swiss round seats
@@ -844,6 +969,43 @@ for (let size = 2; size <= 8; size++) {
     seats: (f, r) => [f, ...drawRivals(r, size - 1)],
   };
 }
+/** Adds a field, refusing to replace one (a silently redefined name would change old commands' meaning). */
+function addField(name: string, about: string, seats: (focal: SeatSpec, rnd: Rng) => SeatSpec[]) {
+  if (FIELDS[name]) throw new Error(`field ${name} is defined twice`);
+  FIELDS[name] = { about, seats };
+}
+for (let size = 2; size <= 8; size++) {
+  addField(
+    `ar${size}-v4`,
+    `focal + ${size - 1} -v4c rival${size > 2 ? "s" : ""} drawn by m300 to m390 table frequency (${BAG_TILES - RACK * size} auctions)`,
+    (f, r) => [f, ...drawFrom(r, v4Pool(V4_TABLES), size - 1)],
+  );
+}
+for (let size = 3; size <= 8; size++) {
+  const names = V4_STRONGEST.slice(0, size - 1).map((n) => v4(n));
+  addField(`ar${size}-top`, `focal + the ${size - 1} strongest: ${names.join(", ")}`, (f) => [f, ...names.map(fitted)]);
+}
+for (const size of [3, 4]) {
+  const top6 = V4_STRONGEST.slice(0, 6);
+  addField(
+    `ar${size}-topdraw`,
+    `focal + ${size - 1} drawn equally from the six strongest -v4c rivals (${top6.join(", ")})`,
+    (f, r) => [f, ...drawFrom(r, v4Pool(top6.map((n): [string, number] => [n, 1])), size - 1)],
+  );
+}
+for (const [short, name] of [
+  ["james", "james"], ["dante", "Dante"], ["yezi", "Yezi"], ["keanu", "keanu"],
+  ["ls", "LetterShark"], ["cashu", "cashu"], ["code", "code"], ["doppio", "Doppio"],
+] as const) {
+  addField(`duel-${short}-v4`, `2-bot duel vs ${v4(name)} (88 auctions; the final)`, (f) => [f, fitted(v4(name))]);
+}
+/** Every field name, in list order. */
+export const FIELD_NAMES: readonly string[] = Object.freeze(Object.keys(FIELDS));
+
+/** Seat names of a field's match with match seed `ms`, focal bot first (for checks; the focal plays HEAD). */
+export function fieldSeatNames(fieldText: string, ms: number): string[] {
+  return fieldSeats(parseField(fieldText), HEAD, ms).map((s) => s.name);
+}
 
 /** Active all-real rivals and how many of the 44 live all-real tables (m147 to m190) each sat at. */
 const AR_POOL: [string, number][] = [
@@ -853,7 +1015,12 @@ const AR_POOL: [string, number][] = [
 
 /** k distinct rivals from AR_POOL, each draw proportional to the remaining weights. */
 function drawRivals(rnd: Rng, k: number): SeatSpec[] {
-  const pool = [...AR_POOL];
+  return drawFrom(rnd, AR_POOL, k);
+}
+
+/** k distinct rivals from a weighted pool of fixture entries, each draw proportional to the remaining weights. */
+function drawFrom(rnd: Rng, weighted: readonly (readonly [string, number])[], k: number): SeatSpec[] {
+  const pool = [...weighted];
   const out: SeatSpec[] = [];
   for (let i = 0; i < k; i++) {
     const total = pool.reduce((s, [, w]) => s + w, 0);
@@ -1279,6 +1446,72 @@ async function validate(n: number, seed: number) {
   }
 }
 
+/** A v4 rival's live numbers over its fit's range (fixtures/rival-live-v4.json, from rival_refit_v4.py). */
+interface LiveObs {
+  score: number;
+  won: number;
+  paid: number;
+  final_balance: number;
+  n_words: number;
+  place: number;
+}
+
+/**
+ * v4 rivals only, six to a table drawn by m300 to m390 table frequency (the live casual tables, with
+ * SookraBot's seat given to one more rival): per rival, the simulated mean score, place, win rate,
+ * letters won, coins paid, final balance and words, beside the live numbers its fit came from. `rho`
+ * replaces every rival's fitted rack awareness (undefined keeps each entry's own). One summary per
+ * rival, strongest live place first; calibrate by picking the rho whose simulated rivals match live.
+ */
+export async function validate4(
+  n: number, seed: number, rho?: number, entries: "v4c" | "v4" = "v4c",
+): Promise<Record<string, unknown>[]> {
+  if (!(Number.isInteger(n) && n > 0)) throw new Error(`matches must be a whole number > 0, got ${n}`);
+  if (!Number.isInteger(seed)) throw new Error(`seed must be a whole number, got ${seed}`);
+  if (rho !== undefined && !(rho >= 0 && rho < 1)) throw new Error(`rho must be in [0, 1) or "-", got ${rho}`);
+  if (entries !== "v4c" && entries !== "v4") throw new Error(`entries must be v4c or v4, got ${entries}`);
+  const live: Record<string, LiveObs> = JSON.parse(
+    fs.readFileSync(new URL("./fixtures/rival-live-v4.json", import.meta.url), "utf8"),
+  ).rivals;
+  const index = loadIndex();
+  const pool = v4Pool(V4_TABLES, entries);
+  const acc = new Map<string, number[]>();
+  for (let i = 0; i < n; i++) {
+    const ms = mix(seed, i, 4);
+    const specs = drawFrom(mulberry32(mix(ms, STREAM.field)), pool, 6).map((s) =>
+      rho !== undefined && s.kind === "fitted" ? { ...s, model: { ...s.model, rho } } : s,
+    );
+    const seats = (await playMatch(index, specs, ms)).seats;
+    for (const r of seats) {
+      const ahead = seats.filter((o) => o.score > r.score).length;
+      const a = acc.get(r.name) ?? [0, 0, 0, 0, 0, 0, 0, 0];
+      [r.score, ahead + 1, ahead === 0 ? 1 : 0, r.won, r.paid, r.balance, r.words, 1].forEach((x, j) => (a[j] += x));
+      acc.set(r.name, a);
+    }
+  }
+  const r1 = (x: number) => +x.toFixed(1);
+  const r2 = (x: number) => +x.toFixed(2);
+  const out = [...acc].map(([name, a]) => {
+    const m = a[7];
+    const stem = name.replace(/-v4c?$/, "");
+    const obs = live[stem];
+    const sim = {
+      score: r1(a[0] / m), place: r2(a[1] / m), win: r2(a[2] / m), won: r1(a[3] / m),
+      paid: r1(a[4] / m), final_balance: r1(a[5] / m), words: r2(a[6] / m),
+    };
+    return {
+      kind: "validate4", rival: name, entries, rho: rho ?? RIVALS[name].rho ?? 0, rhoFitted: rho === undefined,
+      matches: n, seed, seats: m, sim,
+      live: obs
+        ? { score: obs.score, place: obs.place, won: obs.won, paid: obs.paid, final_balance: obs.final_balance, words: obs.n_words }
+        : null,
+      simMinusLive: obs ? { score: r1(sim.score - obs.score), place: r2(sim.place - obs.place), won: r1(sim.won - obs.won) } : null,
+    };
+  });
+  out.sort((x, y) => (x.live?.place ?? 9) - (y.live?.place ?? 9) || x.rival.localeCompare(y.rival));
+  return out;
+}
+
 function list() {
   for (const [k, f] of Object.entries(FIELDS)) console.log(`${k.padEnd(16)} ${f.about}`);
   console.log("field modifiers: <field>[@<rho>][,fp][,vickrey][,shade=<s>][,warm]   e.g. ar6@0.9,fp,shade=0.8,warm");
@@ -1314,6 +1547,12 @@ async function main() {
     merge(pos, expect === undefined ? undefined : Number(expect));
   } else if (mode === "validate") {
     await validate(Number(pos[0] ?? 300), Number(pos[1] ?? 1));
+  } else if (mode === "validate4") {
+    const rho = pos[2] === undefined || pos[2] === "-" ? undefined : Number(pos[2]);
+    const entries = (pos[3] ?? "v4c").replace(/^-/, "");
+    for (const s of await validate4(Number(pos[0] ?? 200), Number(pos[1] ?? 1), rho, entries as "v4c" | "v4")) {
+      console.log(JSON.stringify(s));
+    }
   } else if (mode === "list") {
     list();
   } else {

@@ -10,17 +10,22 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
+import { WordIndex, countsOf, letterIndex } from "./engine.js";
 import {
+  FIELD_NAMES,
   POLICY_KEYS,
   RULES,
   type Row,
   compare,
+  fieldSeatNames,
   parseField,
   parseVariant,
   pricePaid,
   readRows,
+  sevenCompleters,
   shardRange,
   summarize,
+  validate4,
 } from "./selfplay.js";
 import { DEFAULT_POLICY } from "./strategy.js";
 
@@ -149,6 +154,85 @@ test("self-play: under first price the bot sees first-price auctions, and warm s
   const early = (ls: string[]) => ls.filter((l) => / bag 8[4-7]: bid /.test(l));
   assert.ok(early(cold).length > 0 && early(cold).every((l) => !/fp q0\.75x/.test(l)), "cold: no history yet");
   assert.ok(early(warm).some((l) => /fp q0\.75x\d+/.test(l)), "warm: the first auctions already use the history");
+});
+
+test("fixture: the old entries are kept, the v4 entries are added, and every field seats real fixture entries", () => {
+  const fixture = JSON.parse(fs.readFileSync(new URL("./fixtures/rival-models.json", import.meta.url), "utf8")).rivals;
+  for (const old of ["LetterShark", "code", "bot", "dev-voices", "code-v2", "Yezi", "tinytung", "bot-v2", "slow-n-dumb",
+    "dev-voices-v2", "Yezi-ar", "code-ar", "bot-ar", "tinytung-ar", "dev-voices-ar", "slow-n-dumb-ar", "podzemski-ar"]) {
+    assert.ok(fixture[old], old);
+    assert.equal(fixture[old].complete7, undefined, `${old}: old entries have no v4c features`);
+  }
+  const live = JSON.parse(fs.readFileSync(new URL("./fixtures/rival-live-v4.json", import.meta.url), "utf8")).rivals;
+  for (const stem of Object.keys(live)) {
+    assert.ok(fixture[`${stem}-v4`] && fixture[`${stem}-v4c`], stem);
+    assert.ok(typeof fixture[`${stem}-v4`].rho === "number" && fixture[`${stem}-v4`].complete7 === undefined, `${stem}-v4`);
+  }
+  assert.equal(Object.keys(live).length, 17);
+  // fitted() refuses a name the fixture lacks, so building every field's seats checks every name.
+  for (const name of FIELD_NAMES) {
+    for (const ms of [1, 2, 3]) {
+      const seats = fieldSeatNames(name, ms);
+      assert.equal(seats[0], "SookraBot", name);
+      assert.equal(new Set(seats).size, seats.length, `${name}: distinct seats`);
+    }
+  }
+  assert.deepEqual(fieldSeatNames("ar6-top", 1).slice(1), ["james-v4c", "Dante-v4c", "Yezi-v4c", "keanu-v4c", "LetterShark-v4c"]);
+  assert.deepEqual(fieldSeatNames("ar4-top", 1).slice(1), ["james-v4c", "Dante-v4c", "Yezi-v4c"]);
+  assert.deepEqual(fieldSeatNames("ar3-top", 1).slice(1), ["james-v4c", "Dante-v4c"]);
+  assert.deepEqual(fieldSeatNames("ar6-top-ar", 1).slice(1), ["Yezi-ar", "code-ar", "bot-ar", "tinytung-ar", "dev-voices-ar"]);
+  assert.deepEqual(fieldSeatNames("duel-dante-v4", 1), ["SookraBot", "Dante-v4c"]);
+  assert.ok(fieldSeatNames("ar6-v4", 9).slice(1).every((n) => n.endsWith("-v4c")));
+  assert.ok(fieldSeatNames("ar6-v4base", 9).slice(1).every((n) => n.endsWith("-v4")));
+  assert.equal(fieldSeatNames("ar8-v4", 5).length, 8);
+});
+
+test("complete7: one scan with an extra tile finds exactly the letters that complete a 7+ word", () => {
+  const index = WordIndex.fromWords(fs.readFileSync(new URL("../../spacetimedb/wordlist.txt", import.meta.url), "utf8").split("\n"));
+  const bag = Object.entries(RULES.BAG).flatMap(([c, k]) => Array<string>(k).fill(c));
+  let seed = 12345;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296);
+  const has7 = (counts: Int32Array) => index.bestKey(index.scan(counts, false), counts, 7) >= 0;
+  let withCompleters = 0;
+  let already7 = 0;
+  for (let r = 0; r < 40; r++) {
+    const tiles = 8 + Math.floor(rnd() * 4);
+    const rack = Array.from({ length: tiles }, () => bag[Math.floor(rnd() * bag.length)]).join("");
+    const counts = countsOf(rack);
+    const mask = sevenCompleters(index, counts);
+    if (has7(counts)) {
+      already7++;
+      assert.equal(mask, 0, rack);
+      continue;
+    }
+    for (const letter of "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+      const plus = new Int32Array(counts);
+      plus[letterIndex(letter)]++;
+      assert.equal(((mask >>> letterIndex(letter)) & 1) === 1, has7(plus), `${rack} + ${letter}`);
+    }
+    if (mask !== 0) withCompleters++;
+  }
+  assert.ok(withCompleters > 3 && already7 > 3, `both cases covered (${withCompleters} with completers, ${already7} already 7+)`);
+});
+
+test("self-play: the v4 fields play, with the v4c word policies, and validate4 sets the rivals beside live", async () => {
+  for (const field of ["ar6-top", "ar7-top", "ar6-top-mixed", "duel-james-v4"]) {
+    const rows = await compare(field, 1, 3, ["head"], { quiet: true });
+    assert.equal(rows.length, 1);
+    // These fields seat fixed rivals, so any match seed gives the same names.
+    assert.deepEqual(rows[0].others.map((o) => o.name), fieldSeatNames(field, 0).slice(1), field);
+    assert.ok([rows[0].score, ...rows[0].others.map((o) => o.score)].some((s) => s > 0), field);
+  }
+  const v = await validate4(2, 1);
+  assert.ok(v.length >= 6, "six rivals a table");
+  for (const s of v as { rival: string; seats: number; live: { score: number } | null; rho: number }[]) {
+    assert.match(s.rival, /-v4c$/);
+    assert.ok(s.live && s.live.score > 0, `${s.rival}: live numbers`);
+    assert.ok(s.seats >= 1);
+  }
+  const fixed = (await validate4(1, 1, 0.5, "v4")) as { rival: string; rho: number; rhoFitted: boolean }[];
+  assert.ok(fixed.every((s) => s.rival.endsWith("-v4") && s.rho === 0.5 && !s.rhoFitted));
+  await assert.rejects(validate4(1, 1, 1), /rho/);
 });
 
 test("self-play: shards merge into exactly the unsharded run", async () => {
