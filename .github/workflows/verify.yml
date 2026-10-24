@@ -200,6 +200,12 @@ jobs:
           for f in engine strategy bot; do
             git show "$REFERENCE:bot-starter/src/$f.ts" > "$RUNNER_TEMP/ref/$f.ts"
           done
+          # Modules the reference bot.ts imports since prediction v2 (absent in older references).
+          for f in pool empirical; do
+            if git cat-file -e "$REFERENCE:bot-starter/src/$f.ts" 2>/dev/null; then
+              git show "$REFERENCE:bot-starter/src/$f.ts" > "$RUNNER_TEMP/ref/$f.ts"
+            fi
+          done
           sha256sum "$RUNNER_TEMP"/ref/*.ts
       - name: Check
         working-directory: bot-starter
