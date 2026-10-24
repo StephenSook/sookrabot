@@ -181,6 +181,8 @@ export class TargetedSubscription {
   private pending: Entry | null = null;
   private botId: bigint | null = null;
   private stopped = false;
+  /** Superseded by a resubscribe: report nothing, keep the handles until stop(). */
+  private quiesced = false;
   private lastAttemptMs = -Infinity;
 
   constructor(
@@ -191,7 +193,7 @@ export class TargetedSubscription {
 
   /** Subscribe the base and the seed. */
   start() {
-    if (this.stopped || this.base !== null) return;
+    if (this.stopped || this.quiesced || this.base !== null) return;
     const baseApplied = () => {
       // First time: wait for both. A replay after the seed was dropped: the base alone.
       if (!this.base?.handle?.isActive()) return;
@@ -204,7 +206,7 @@ export class TargetedSubscription {
 
   /** Subscribe the window for `botId`. Does nothing if one is already open (a replayed base). */
   openWindow(botId: bigint, seatMatchIds: Iterable<bigint>, nowMs: number) {
-    if (this.stopped || this.window !== null) return;
+    if (this.stopped || this.quiesced || this.window !== null) return;
     this.botId = botId;
     this.addWindow(botId, windowFloors(seatMatchIds, nowMs), "window");
   }
@@ -216,7 +218,7 @@ export class TargetedSubscription {
    * the last attempt, or when the floors barely moved. True if one started.
    */
   refloor(seatMatchIds: Iterable<bigint>, nowMs: number): boolean {
-    if (this.stopped || this.botId === null || this.pending !== null) return false;
+    if (this.stopped || this.quiesced || this.botId === null || this.pending !== null) return false;
     if (!this.window?.handle?.isActive()) return false;
     if (nowMs - this.lastAttemptMs < REFLOOR_RETRY_MS) return false;
     const cur = this.window.floors!;
@@ -229,13 +231,13 @@ export class TargetedSubscription {
   }
 
   /**
-   * Report nothing from now on, but keep the applied handles (and their rows)
-   * until stop(): a resubscribe quiesces the old plan and stops it once the
-   * new one is ready, so rows held by both never leave the cache and their
-   * insert callbacks never fire a second time.
+   * Report nothing from now on, but keep every handle (and its rows) until
+   * stop(), a reconnect replay of it included: a resubscribe quiesces the old
+   * plan and stops it once the new one is ready, so rows held by both never
+   * leave the cache and their insert callbacks never fire a second time.
    */
   quiesce() {
-    this.stopped = true;
+    this.quiesced = true;
   }
 
   /** Drop every handle; callbacks that arrive later do nothing. */
@@ -260,7 +262,7 @@ export class TargetedSubscription {
         onApplied();
       },
       (err) => {
-        if (this.stopped || !this.holds(entry)) return;
+        if (this.stopped || this.quiesced || !this.holds(entry)) return;
         if (entry === this.pending) {
           // Not fatal: the current window still holds everything. The next re-floor tries again.
           this.pending = null;
@@ -303,11 +305,17 @@ export class TargetedSubscription {
     return entry === this.base || entry === this.seed || entry === this.window || entry === this.pending;
   }
 
-  /** A handle no longer wanted unsubscribes itself once applied. True if it was retired. */
+  /**
+   * True if an applied handle must not report: one no longer wanted (stopped
+   * plan, replaced window) unsubscribes itself; a quiesced plan's handle
+   * stays subscribed, silent, until stop().
+   */
   private retire(entry: Entry): boolean {
-    if (!this.stopped && this.holds(entry)) return false;
-    drop(entry.handle);
-    return true;
+    if (this.stopped || !this.holds(entry)) {
+      drop(entry.handle);
+      return true;
+    }
+    return this.quiesced;
   }
 }
 

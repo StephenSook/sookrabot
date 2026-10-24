@@ -291,16 +291,88 @@ test("quiesce keeps applied handles (their rows) but reports nothing; stop then 
   events.length = 0;
   plan.quiesce();
   assert.deepEqual(handles.map((h) => h.unsubscribes), [0, 1, 0], "only the seed was dropped (by the window)");
-  // A replay re-applies everything in one batch (the new plan's rows included): the old base retires.
+  // A reconnect replay of a quiesced plan: it stays subscribed and reports nothing.
   handles[0].apply();
-  assert.equal(handles[0].unsubscribes, 1);
+  handles[2].apply();
+  assert.deepEqual(handles.map((h) => h.unsubscribes), [0, 1, 0]);
   handles[2].fail(new Error("gone"));
   assert.deepEqual(events, []);
   assert.equal(plan.refloor([1n, 2n, 3n, 4n], NOW + REFLOOR_RETRY_MS), false);
+  plan.openWindow(9n, [1n, 2n, 3n, 4n], NOW);
+  assert.equal(handles.length, 3, "a quiesced plan opens nothing");
   plan.stop();
   assert.deepEqual(handles.map((h) => h.unsubscribes), [1, 1, 0], "the failed window has nothing left to drop");
   plan.stop(); // idempotent
   assert.deepEqual(handles.map((h) => h.unsubscribes), [1, 1, 0]);
+});
+
+test("a reconnect replay during a resubscribe keeps the old window until the new one is applied", () => {
+  // Codex round 2: A's window applied, A's base failed, so B was started; the
+  // connection dropped before B opened its window, and the replay re-applies
+  // A's window next to B's base and seed. A's window must stay subscribed
+  // until B's window is applied, or rows in both leave the cache and their
+  // insert callbacks (fpHistory, auction log) fire again.
+  const ops: string[] = [];
+  const chain = new PlanChain();
+  const make = (name: string) => {
+    let n = 0;
+    const plan: TargetedSubscription = new TargetedSubscription(
+      (queries, onApplied, onError) => {
+        const label = `${name}:${["base", "seed", "window"][n++] ?? "refloor"}`;
+        ops.push(`subscribe ${label}`);
+        const h = new FakeHandle(queries, onApplied, onError);
+        const unsub = h.unsubscribe.bind(h);
+        h.unsubscribe = () => {
+          ops.push(`unsubscribe ${label}`);
+          unsub();
+        };
+        return h;
+      },
+      SCOPE,
+      {
+        onBaseApplied: () => plan.openWindow(9n, [1n, 2n, 3n], NOW),
+        onReady: () => chain.ready(),
+        onError: () => {},
+        log: () => {},
+      },
+    );
+    return plan;
+  };
+  const hs: FakeHandle[] = [];
+  const capture = (plan: TargetedSubscription) => {
+    // Grab the handles the plan creates, in order.
+    const sub = (plan as unknown as { subscribe: (...a: unknown[]) => FakeHandle }).subscribe;
+    (plan as unknown as { subscribe: (...a: unknown[]) => FakeHandle }).subscribe = (...a: unknown[]) => {
+      const h = sub(...a);
+      hs.push(h);
+      return h;
+    };
+  };
+  const a = make("A");
+  capture(a);
+  chain.replace(a);
+  a.start();
+  hs[0].apply(); // A base
+  hs[1].apply(); // A seed -> A window subscribed
+  hs[2].apply(); // A window applied -> ready
+  hs[0].fail(new Error("base removed")); // index.ts resubscribes
+  const b = make("B");
+  capture(b);
+  chain.replace(b);
+  b.start(); // B base, B seed
+  // Disconnect, then the replay: A's window, B's base and seed.
+  hs[2].apply();
+  hs[3].apply();
+  hs[4].apply(); // B opens its window
+  assert.ok(!ops.includes("unsubscribe A:window"), `A's window dropped early: ${ops.join(", ")}`);
+  hs[5].apply(); // B's window applied: now A goes
+  const iDrop = ops.indexOf("unsubscribe A:window");
+  assert.ok(iDrop > ops.indexOf("subscribe B:window"), ops.join(", "));
+  assert.deepEqual(
+    hs.map((h) => h.active),
+    [false, false, false, true, false, true],
+    "B's base and window remain; A is gone; B's seed was dropped by its window",
+  );
 });
 
 test("stop after quiesce drops the handles that were kept", () => {
