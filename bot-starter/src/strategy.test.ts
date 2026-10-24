@@ -356,6 +356,21 @@ test("duel rule: one rival means a cash reserve sized to the remaining auctions"
   );
 });
 
+test("Codex repro: the broke-rival branch still respects the duel reserve", () => {
+  const duel = (myBalance: number, rivalBalance: number, bagTotal: number) =>
+    decideBid({
+      letter: "S", delta: 6, bagTotal, auctionType: "Vickrey", myBalance,
+      opponents: [{ isSim: false, balance: rivalBalance }],
+    }).amount;
+  // Reserve 10, duel cap max(2 - 10, floor(2 / 31)) = 0: do not spend the last 2 coins on a tie.
+  assert.equal(duel(2, 2, 30), 0);
+  // With cash above the reserve the minimum winning bid still goes out.
+  assert.equal(duel(50, 2, 30), 3);
+  assert.equal(duel(50, 0, 30), 1);
+  // Late in the match the reserve shrinks with the remaining auctions.
+  assert.equal(duel(4, 2, 1), 3); // reserve 1: cap max(3, 2) = 3
+});
+
 test("final letter: deny it to sims (they can still score it), 0 against real bots only", () => {
   const input = (opponents: Opponent[], myBalance = 100) =>
     decideBid({ letter: "E", delta: 0, bagTotal: 0, auctionType: "Vickrey", myBalance, opponents });

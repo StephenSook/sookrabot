@@ -193,10 +193,29 @@ export function decideBid(input: BidInput): BidDecision {
   }
   const rivalMax = input.opponents.reduce((m, o) => Math.max(m, maxPossibleBid(o, input.letter)), 0);
   const rivalCap = rivalMax + 1;
+  let amount: number;
+  let reason: string;
   if (rivalMax <= BROKE_RIVAL_MAX_BID) {
-    return { amount: clamp(rivalCap), reason: `rivals broke (max ${rivalMax})` };
+    amount = rivalCap;
+    reason = `rivals broke (max ${rivalMax})`;
+  } else {
+    ({ amount, reason } = valueBid(input, rivalCap));
   }
+  // The duel reserve applies to every branch, the broke-rival one included.
+  const reserve = duelReserve(input.opponents.length, input.bagTotal);
+  if (reserve > 0) {
+    const evenShare = Math.floor(balance / (input.bagTotal + 1));
+    const duelCap = Math.max(balance - reserve, evenShare);
+    if (amount > duelCap) {
+      amount = duelCap;
+      reason += ` duel-reserve ${reserve}`;
+    }
+  }
+  return { amount: clamp(amount), reason };
+}
 
+/** Bid from the marginal value (kappa, sims-only cap, first-price shading), capped at rivalCap. */
+function valueBid(input: BidInput, rivalCap: number): BidDecision {
   const sims = input.opponents.filter((o) => o.isSim && o.strategy);
   const simCap = sims.length
     ? Math.max(...sims.map((o) => maxSimBid(o.strategy!, input.letter, o.balance))) + 1
@@ -237,16 +256,7 @@ export function decideBid(input: BidInput): BidDecision {
     amount = rivalCap;
     reason += ` rival-cap ${rivalCap}`;
   }
-  const reserve = duelReserve(input.opponents.length, input.bagTotal);
-  if (reserve > 0) {
-    const evenShare = Math.floor(balance / (input.bagTotal + 1));
-    const duelCap = Math.max(balance - reserve, evenShare);
-    if (amount > duelCap) {
-      amount = duelCap;
-      reason += ` duel-reserve ${reserve}`;
-    }
-  }
-  return { amount: clamp(amount), reason };
+  return { amount, reason };
 }
 
 // ---- Word play ----
