@@ -227,6 +227,48 @@ export const CASH_BROKE_AUCTIONS = 0;
  */
 export const DEAD_KAPPA_SCALE = 1;
 
+// Prediction v2 knobs. Each is off by default, so DEFAULT_POLICY plays exactly
+// as the live build does; the self-play harness turns one on by name.
+
+/**
+ * WORDS_EXACT_NODES: word choices use the optimal packing of the rack
+ * (WordIndex.packExact, branch and bound from the greedy packing, at most this
+ * many search nodes) instead of the greedy one: the end-of-match flush cashes
+ * it, and a liquidity word is judged by the optimal value of what it leaves.
+ * 0: off (greedy). Random racks from the bag (scripts/packcheck.ts, 200 each,
+ * budget 200000): greedy 72.2 / 93.0 / 117.5 against optimal 83.4 / 105.2 /
+ * 127.6 at 16 / 20 / 24 tiles, 0.9 to 2.9 ms a rack.
+ */
+export const WORDS_EXACT_NODES = 0;
+/**
+ * EXACT_VALUE_NODES: the bid table (valuate) values each rack and rack + letter
+ * by the optimal packing (packExact, at most this many nodes each) instead of
+ * the greedy one, so a letter's marginal value is what it adds to the best
+ * packing. 0: off (greedy).
+ */
+export const EXACT_VALUE_NODES = 0;
+/**
+ * DEAD_GATE_REAL_RIVALS: DEAD_KAPPA_SCALE applies only in Vickrey auctions at
+ * tables with at least this many real (non-sim) rivals. 0: no gate (the round
+ * 2 lever as it was). Why: round 2 (cloud, seeds 5102, 5201, 5401) measured
+ * DEAD_KAPPA_SCALE 1.1 at about +1.4 points at 6-seat Vickrey tables (t 5 to
+ * 6 pooled) and losses in duels, at 4 seats and under first price, and
+ * proposed this gate.
+ */
+export const DEAD_GATE_REAL_RIVALS = 0;
+/**
+ * LOOKAHEAD_WEIGHT: the refined bid (bot.ts refresh) values the letter on
+ * auction with a one-step lookahead over the unseen pool (pool.ts
+ * lookaheadDelta): its marginal value plus LOOKAHEAD_WEIGHT x how winning it
+ * changes the expected marginal value of the next letter, ramped to 0 over the
+ * last LOOKAHEAD_HORIZON auctions. LOOKAHEAD_POOL 1 weights the next letter by
+ * the unseen pool (bag minus auctioned letters minus our starting tiles), 0 by
+ * the full bag. LOOKAHEAD_WEIGHT 0: off.
+ */
+export const LOOKAHEAD_WEIGHT = 0;
+export const LOOKAHEAD_HORIZON = 10;
+export const LOOKAHEAD_POOL = 1;
+
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
  * (STARTING_BALANCE, BAG_TILES, SIM_BID_JITTER) and the network-stall bounds of
@@ -268,6 +310,12 @@ export interface Policy {
   readonly CASH_BROKE_BALANCE: number;
   readonly CASH_BROKE_AUCTIONS: number;
   readonly DEAD_KAPPA_SCALE: number;
+  readonly WORDS_EXACT_NODES: number;
+  readonly EXACT_VALUE_NODES: number;
+  readonly DEAD_GATE_REAL_RIVALS: number;
+  readonly LOOKAHEAD_WEIGHT: number;
+  readonly LOOKAHEAD_HORIZON: number;
+  readonly LOOKAHEAD_POOL: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -307,6 +355,12 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   CASH_BROKE_BALANCE,
   CASH_BROKE_AUCTIONS,
   DEAD_KAPPA_SCALE,
+  WORDS_EXACT_NODES,
+  EXACT_VALUE_NODES,
+  DEAD_GATE_REAL_RIVALS,
+  LOOKAHEAD_WEIGHT,
+  LOOKAHEAD_HORIZON,
+  LOOKAHEAD_POOL,
 });
 
 // ---- Types ----
@@ -595,8 +649,11 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
     : kappaFor(input.bagTotal, undefined, p);
   const simsOnlyVickrey = simsOnly && input.auctionType === "Vickrey";
   // Round 2 levers (off by default: DEAD_KAPPA_SCALE 1, COMPLETE7_PREMIUM 1); tag marks them in the reason.
+  const deadGateOpen =
+    p.DEAD_GATE_REAL_RIVALS <= 0 || (input.auctionType === "Vickrey" && realRivals >= p.DEAD_GATE_REAL_RIVALS);
   const dead =
     p.DEAD_KAPPA_SCALE !== 1 &&
+    deadGateOpen &&
     !simsOnlyVickrey &&
     input.leaveAlpha !== undefined &&
     isDeadLetter(input.letter, input.delta, input.leaveAlpha);
@@ -755,7 +812,11 @@ export function liquidityWord(
     for (const k of eligible) {
       const rest = new Int32Array(rem);
       index.consume(rest, k);
-      const score = index.reward[k] + packValue(index.pack(cands, rest, -1, alpha), alpha);
+      const restPack =
+        p.WORDS_EXACT_NODES > 0
+          ? index.packExact(cands, rest, -1, alpha, p.WORDS_EXACT_NODES)
+          : index.pack(cands, rest, -1, alpha);
+      const score = index.reward[k] + packValue(restPack, alpha);
       if (score > bestScore) {
         bestScore = score;
         best = k;
@@ -776,7 +837,11 @@ export function liquidityWord(
 export function chooseWords(index: WordIndex, input: WordInput): string[] {
   const p = input.policy ?? DEFAULT_POLICY;
   if (input.flush) {
-    return index.pack(input.cands, input.counts, -1).keys.map((k) => index.words[k]);
+    const packed =
+      p.WORDS_EXACT_NODES > 0
+        ? index.packExact(input.cands, input.counts, -1, 0, p.WORDS_EXACT_NODES)
+        : index.pack(input.cands, input.counts, -1);
+    return packed.keys.map((k) => index.words[k]);
   }
   const rem = new Int32Array(input.counts);
   const out: string[] = [];

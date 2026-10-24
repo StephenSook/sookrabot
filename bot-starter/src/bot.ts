@@ -39,6 +39,7 @@ import {
   sevenCompleterMask,
   shouldFlush,
 } from "./strategy.js";
+import { PoolTracker, lookaheadDelta, lookaheadLambda, poolWeights } from "./pool.js";
 
 /** Starting rack size when match_state does not carry one (game.ts STARTING_RACK_SIZE). */
 const DEFAULT_RACK_SIZE = 5;
@@ -185,6 +186,8 @@ interface MatchModel {
   lateReplace: number;
   margins: number[];
   recvLags: number[];
+  /** Unseen-pool bookkeeping (pool.ts); fed only while LOOKAHEAD_WEIGHT is on. */
+  pool: PoolTracker;
 }
 
 function newModel(): MatchModel {
@@ -212,6 +215,7 @@ function newModel(): MatchModel {
     lateReplace: 0,
     margins: [],
     recvLags: [],
+    pool: new PoolTracker(),
   };
 }
 
@@ -453,7 +457,7 @@ export class SookraBot {
       model.vals.set(key, hit);
       return hit;
     }
-    const v = valuate(this.index, counts, alpha);
+    const v = valuate(this.index, counts, alpha, "leave", this.policy.EXACT_VALUE_NODES);
     if (v.ms > SLOW_VALUATION_MS) {
       this.log(`slow valuation: ${v.ms.toFixed(1)} ms for ${v.rackKey.length} tiles`);
     }
@@ -517,6 +521,14 @@ export class SookraBot {
       const counts = this.effectiveCounts(model, this.rackCounts(conn, a.matchId));
       const { delta, source, val } = this.lookupDelta(a.matchId, counts, alpha, a.letter);
       this.placeBid(conn, model, m, a, Number(me.balance), delta, bagTotal, source, this.opponentsFrom(conn, rows), val);
+      // After the bid: pool bookkeeping for the lookahead (off by default).
+      if (this.policy.LOOKAHEAD_WEIGHT > 0) {
+        model.pool.noteAuction(String(a.id), letterIndex(a.letter));
+        if (!model.pool.startDecided) {
+          const apm = auctionsPerMatch(rows.length, m.startingRackSize ?? DEFAULT_RACK_SIZE);
+          model.pool.noteStart(bagTotal === apm - 1 ? this.rackCounts(conn, a.matchId) : null);
+        }
+      }
     });
     this.scheduleRefresh(conn, a.matchId);
   }
@@ -782,12 +794,52 @@ export class SookraBot {
     // Without a valuation, keep whatever bid is already live rather than withdraw it.
     if (open && val) {
       const li = letterIndex(open.letter);
+      let delta = li >= 0 ? val.delta[li] : 0;
+      let source = "table";
+      if (li >= 0 && this.policy.LOOKAHEAD_WEIGHT > 0) {
+        const looked = this.lookahead(model, counts, val, open, li, bagTotal, alpha);
+        if (looked !== null) {
+          delta = looked;
+          source = "table+look";
+        }
+      }
       this.placeBid(
-        conn, model, m, open, balance, li >= 0 ? val.delta[li] : 0, bagTotal, "table",
+        conn, model, m, open, balance, delta, bagTotal, source,
         this.opponentsFrom(conn, rows), val,
       );
       this.schedulePrecompute(conn, matchId, open.letter, bagTotal, durationMs);
     }
+  }
+
+  /**
+   * One-step lookahead value of the letter on auction (pool.ts), or null when
+   * it does not apply (no future auctions, or the valuation of rack + letter
+   * failed). Values rack + letter at the same alpha (the next precompute
+   * usually finds it cached).
+   */
+  private lookahead(
+    model: MatchModel,
+    counts: Counts,
+    val: Valuation,
+    open: AuctionRow,
+    li: number,
+    bagTotal: number,
+    alpha: number,
+  ): number | null {
+    model.pool.noteAuction(String(open.id), li);
+    const lambda = lookaheadLambda(this.policy.LOOKAHEAD_WEIGHT, bagTotal, this.policy.LOOKAHEAD_HORIZON);
+    if (lambda <= 0) return null;
+    const withX = new Int32Array(counts);
+    withX[li]++;
+    let vx: Valuation;
+    try {
+      vx = this.valuation(model, withX, alpha);
+    } catch (err) {
+      this.warn("lookahead valuation", err);
+      return null;
+    }
+    const w = poolWeights(this.policy.LOOKAHEAD_POOL > 0 ? model.pool.unseen() : null);
+    return lookaheadDelta(val, vx, li, w, lambda);
   }
 
   private playWords(
