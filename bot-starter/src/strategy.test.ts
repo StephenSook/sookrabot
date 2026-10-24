@@ -360,19 +360,19 @@ test("budget pacing in a duel: the factor stops at PACE_MIN_DUEL, not PACE_MIN",
 });
 
 test("early bid cut: the paced kappa x EARLY_KAPPA_SCALE in the first EARLY_AUCTIONS auctions, duels exempt", () => {
-  const { EARLY_AUCTIONS, EARLY_KAPPA_SCALE, EARLY_MIN_RIVALS, earlyScale } = strategy;
+  const { EARLY_AUCTIONS, EARLY_KAPPA_SCALE, EARLY_MIN_REAL_RIVALS, earlyScale } = strategy;
   assert.equal(EARLY_AUCTIONS, 28);
   assert.equal(EARLY_KAPPA_SCALE, 0.4);
-  assert.equal(EARLY_MIN_RIVALS, 2);
+  assert.equal(EARLY_MIN_REAL_RIVALS, 2);
   // Auction index = auctions - 1 - bagTotal: 0 at the first auction; indexes 0 to 27 are cut.
   assert.equal(earlyScale(67, 68, 5), 0.4);
   assert.equal(earlyScale(40, 68, 5), 0.4);
   assert.equal(earlyScale(39, 68, 5), 1);
   assert.equal(earlyScale(1, 68, 5), 1);
-  assert.equal(earlyScale(82, 83, 2), 0.4); // two rivals are enough
+  assert.equal(earlyScale(82, 83, 2), 0.4); // two real rivals are enough
   assert.equal(earlyScale(87, 88, 1), 1); // a duel (the 3-game final) is exempt
   assert.equal(earlyScale(67, 68, 0), 1);
-  // The rule's own parameters: window, scale (1 turns it off) and minimum rivals.
+  // The rule's own parameters: window, scale (1 turns it off) and minimum real rivals.
   assert.equal(earlyScale(40, 68, 5, 27), 1);
   assert.equal(earlyScale(67, 68, 5, 28, 1), 1);
   assert.equal(earlyScale(87, 88, 1, 28, 0.5, 1), 0.5);
@@ -398,6 +398,15 @@ test("early bid cut: the paced kappa x EARLY_KAPPA_SCALE in the first EARLY_AUCT
     { isSim: true, strategy: "Cheapskate", balance: 100 },
   ];
   assert.equal(bid(100, 80, 3, { letter: "E", opponents: sims, auctionsPerMatch: 83 }), 8);
+  // Sims do not count toward EARLY_MIN_REAL_RIVALS: one real rival and four sims (six seats) bid the
+  // full paced kappa, 4 x 6 = 24; two real rivals and three sims are cut, 9.
+  const sim = (strategy: "Aggressive" | "Cheapskate" | "ValueBidder"): Opponent => ({ isSim: true, strategy, balance: 100 });
+  const real = (): Opponent => ({ isSim: false, balance: 100 });
+  const oneReal = [real(), sim("Aggressive"), sim("Aggressive"), sim("ValueBidder"), sim("Cheapskate")];
+  assert.equal(bid(100, 67, 6, { opponents: oneReal }), 24);
+  assert.equal(bid(100, 67, 6, { opponents: [real(), real(), sim("Aggressive"), sim("ValueBidder"), sim("Cheapskate")] }), 9);
+  // One real rival and one sim (three seats, 83 auctions): no cut either, 24.
+  assert.equal(bid(100, 82, 6, { opponents: [real(), sim("Aggressive")], auctionsPerMatch: 83 }), 24);
 });
 
 test("maxSimBid follows the module's sim rule with +2 jitter", () => {
@@ -633,15 +642,15 @@ test("match 123: 10 coins, a 6-letter word in hand, 46 auctions left: cash it, t
     decideBid({ letter, delta, bagTotal, auctionType: "Vickrey", myBalance, opponents, auctionsPerMatch: auctions }).amount;
   // Auction 22 (G): 16 coins for 47 auctions, 0.23 of the starting rate per auction. The live bid at
   // kappa 4.25 was 8; paced, the factor bottoms out at PACE_MIN (kappa 2): 3. Index 21 is inside the
-  // early window at this five-rival table (sims count as rivals there), so kappa 2 x 0.4: 1.
+  // early window, but this table has one real rival (the sims do not count), so no early cut.
   assert.equal(bid("G", 1.943, 46, 16), 8);
-  assert.equal(Math.floor(pacedKappa(46, 16, 68) * 1.943), 3);
-  assert.equal(bid("G", 1.943, 46, 16, table, 68), 1);
-  // Auction 23 (K), after the cash: 45 coins for 46 auctions, kappa 4 x sqrt(0.665) = 3.26: 11, not 14;
-  // with the early cut (index 22), 3.26 x 0.4 x 3.374: 4.
+  assert.equal(bid("G", 1.943, 46, 16, table, 68), 3);
+  // Auction 23 (K), after the cash: 45 coins for 46 auctions, kappa 4 x sqrt(0.665) = 3.26: 11, not 14.
   assert.equal(bid("K", 3.374, 45, 45), 14);
-  assert.equal(Math.floor(pacedKappa(45, 45, 68) * 3.374), 11);
-  assert.equal(bid("K", 3.374, 45, 45, table, 68), 4);
+  assert.equal(bid("K", 3.374, 45, 45, table, 68), 11);
+  // With a second real rival in place of a sim, the cut applies (index 22): 3.26 x 0.4 x 3.374, so 4.
+  const twoReal: Opponent[] = [table[0], { isSim: false, balance: 100 }, ...table.slice(2)];
+  assert.equal(bid("K", 3.374, 45, 45, twoReal, 68), 4);
   // The same spot in a final (a duel vs LetterShark, 88 auctions): the factor, 0.547, is held at
   // PACE_MIN_DUEL (kappa 3), so 5 rather than 4, inside the duel cap of 16 - 10 reserved = 6.
   assert.equal(bid("G", 1.943, 46, 16, [table[0]], 88), 5);

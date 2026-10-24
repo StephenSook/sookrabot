@@ -914,14 +914,13 @@ test("duel: a cash-poor bot's paced bid is held at PACE_MIN_DUEL (the 3-game fin
   assert.equal(s.bids.length, 1);
   assert.equal(s.bids[0].amount, BigInt(Math.floor(PACED_KAPPA * PACE_MIN_DUEL * delta))); // 18
   assert.ok(logs.some((l) => l.includes("'R' bag 70: bid 18 (value 6.00")));
-  // With a sim seated (3 bots, 83 auctions) there is no duel floor: 4 x sqrt(40 / 71 / (100 / 83)) = 2.74,
-  // which would bid 16; auction index 12 is inside the early window and the sim makes two rivals, so the
-  // early cut applies: 2.74 x 0.4 x 6, so 6.
+  // With a sim seated (3 bots, 83 auctions) there is no duel floor: 4 x sqrt(40 / 71 / (100 / 83)) x 6 = 16.
+  // Auction index 12 is inside the early window, but one real rival is not enough for the cut (sims do not count).
   const three = setup("AEINST", 70, "R");
   three.s.balance(ME, 40);
   three.bot.refresh(three.s, MATCH);
   await settle();
-  assert.equal(three.s.bids.at(-1)!.amount, 6n);
+  assert.equal(three.s.bids.at(-1)!.amount, 16n);
 });
 
 test("early bid cut: a six-bot all-real table bids 0.4 of the paced kappa for 28 auctions; a duel is exempt", async () => {
@@ -946,6 +945,15 @@ test("early bid cut: a six-bot all-real table bids 0.4 of the paced kappa for 28
   duel.bot.refresh(duel.s, MATCH);
   await settle();
   assert.equal(duel.s.bids.at(-1)!.amount, 24n);
+  // So does a six-seat table of one real rival and four sims (sims do not count toward the cut): 24.
+  const padded = setup("AEINST", 67, "R");
+  for (const id of [21n, 22n, 23n]) {
+    padded.s.bots.set(id, { name: `Sim${id}`, isSimulated: true, strategy: { tag: "Cheapskate" } });
+    padded.s.participants.push({ matchId: MATCH, botId: id, balance: 100n, score: 0n });
+  }
+  padded.bot.refresh(padded.s, MATCH);
+  await settle();
+  assert.equal(padded.s.bids.at(-1)!.amount, 24n);
 });
 
 test("sims-only table bids up to the sim cap", async () => {
