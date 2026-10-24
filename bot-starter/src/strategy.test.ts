@@ -655,16 +655,30 @@ test("policy: each bid knob set in the policy moves decideBid as its constant do
   assert.equal(bid({ FP_MIN_OBS: 9 }, fpH), 18);
   assert.equal(bid({ FP_HISTORY_MAX: 5 }, fpH), 8); // the last 5 prices, 4 to 8
   assert.equal(bid({ FP_HISTORY_MAX: 4 }, fpH), 18); // fewer than FP_MIN_OBS kept: no history
+  // Early bid cut: auction index 27 of 68 (40 to come); kappa 5.1514 halved inside EARLY_AUCTIONS.
+  assert.equal(bid({ EARLY_AUCTIONS: 28, EARLY_KAPPA_SCALE: 0.5 }), 12);
+  assert.equal(bid({ EARLY_AUCTIONS: 27, EARLY_KAPPA_SCALE: 0.5 }), 25, "index 27 is past the first 27");
+  assert.equal(bid({ EARLY_AUCTIONS: 28 }), 25, "scale 1: off");
+  assert.equal(bid({ EARLY_AUCTIONS: 28, EARLY_KAPPA_SCALE: 0.5 }, { auctionsPerMatch: undefined }), Math.floor(KAPPA * 5), "unpaced: off");
+  // In a duel (index 27 of 88) unless EARLY_MIN_RIVALS exempts it: kappa 3 halved, 3 rather than 6.
+  assert.equal(bid({ EARLY_AUCTIONS: 30, EARLY_KAPPA_SCALE: 0.5 }, duel), 3);
+  assert.equal(bid({ EARLY_AUCTIONS: 30, EARLY_KAPPA_SCALE: 0.5, EARLY_MIN_RIVALS: 2 }, duel), 6);
 });
 
 test("policy: word, flush and leave knobs set in the policy move chooseWords, flushLeadMs and alphaFor", () => {
-  const play = (rack: string, myBalance: number, realRivals: number, o: Partial<Policy>) => {
+  const play = (rack: string, myBalance: number, realRivals: number, o: Partial<Policy>, bagTotal?: number) => {
     const counts = countsOf(rack);
     return chooseWords(INDEX, {
-      counts, cands: INDEX.scan(counts, true), myBalance, flush: false, realRivals, policy: withPolicy(o),
+      counts, cands: INDEX.scan(counts, true), myBalance, flush: false, realRivals, bagTotal, policy: withPolicy(o),
     });
   };
   assert.deepEqual(play("RETAINSQ", 100, 1, {}), ["QINTARS"]);
+  // HOLD_FROM_BAG: at a hold table, cash 7+ words while at least that many auctions are to come.
+  assert.deepEqual(play("RETAINSQ", 100, 5, {}, 40), []);
+  assert.deepEqual(play("RETAINSQ", 100, 5, { HOLD_FROM_BAG: 30 }, 40), ["QINTARS"]);
+  assert.deepEqual(play("RETAINSQ", 100, 5, { HOLD_FROM_BAG: 30 }, 30), ["QINTARS"]);
+  assert.deepEqual(play("RETAINSQ", 100, 5, { HOLD_FROM_BAG: 30 }, 29), []);
+  assert.deepEqual(play("RETAINSQ", 100, 5, { HOLD_FROM_BAG: 30 }), [], "bag unknown: hold");
   assert.deepEqual(play("RETAINSQ", 100, 1, { CASH_MIN_LEN: 8 }), []);
   assert.deepEqual(play("RETAINSQ", 100, 1, { HOLD_MIN_REAL_RIVALS: 1 }), []);
   assert.deepEqual(play("RETAINSQ", 100, 5, { HOLD_MIN_REAL_RIVALS: 6 }), ["QINTARS"]);

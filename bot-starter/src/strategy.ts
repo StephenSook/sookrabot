@@ -56,6 +56,16 @@ export const PACE_MIN_DUEL = 0.75;
  * ENDGAME_AUCTIONS auctions.
  */
 export const PACED_KAPPA = 4;
+/**
+ * Early bid cut while pacing: in the first EARLY_AUCTIONS auctions of a match
+ * (auction index auctionsPerMatch - 1 - bagTotal), kappa is multiplied by
+ * EARLY_KAPPA_SCALE, at tables with at least EARLY_MIN_RIVALS rivals
+ * (2: duels are exempt). Coins not spent early raise the pacing factor
+ * later. EARLY_KAPPA_SCALE 1 (default): off.
+ */
+export const EARLY_AUCTIONS = 0;
+export const EARLY_KAPPA_SCALE = 1;
+export const EARLY_MIN_RIVALS = 1;
 /** Every bot starts a match with this balance (game.ts STARTING_BALANCE). */
 export const STARTING_BALANCE = 100;
 /** Tiles in the bag at the start of a match (letters.ts DEFAULT_BAG). */
@@ -72,6 +82,13 @@ export const CASH_MIN_LEN = 7;
  * sim-padded tables keep CASH_MIN_LEN.
  */
 export const HOLD_MIN_REAL_RIVALS = 2;
+/**
+ * Holding (HOLD_MIN_REAL_RIVALS) starts only once fewer than this many
+ * auctions are still to come; before that, words of CASH_MIN_LEN+ letters are
+ * cashed as they form, so their reward buys letters while most are still to
+ * be auctioned. 999 (default): hold for the whole match.
+ */
+export const HOLD_FROM_BAG = 999;
 /**
  * Below this balance (after cashing), also cash one word: preferably of
  * LIQUIDITY_MIN_LEN+ letters, else of any length (LIQUIDITY_FALLBACK_MIN_LEN),
@@ -139,9 +156,13 @@ export interface Policy {
   readonly PACE_MAX: number;
   readonly PACE_MIN_DUEL: number;
   readonly PACED_KAPPA: number;
+  readonly EARLY_AUCTIONS: number;
+  readonly EARLY_KAPPA_SCALE: number;
+  readonly EARLY_MIN_RIVALS: number;
   readonly LEAVE_ALPHA: number;
   readonly CASH_MIN_LEN: number;
   readonly HOLD_MIN_REAL_RIVALS: number;
+  readonly HOLD_FROM_BAG: number;
   readonly LIQUIDITY_FLOOR: number;
   readonly LIQUIDITY_MIN_LEN: number;
   readonly LIQUIDITY_FALLBACK_MIN_LEN: number;
@@ -168,9 +189,13 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   PACE_MAX,
   PACE_MIN_DUEL,
   PACED_KAPPA,
+  EARLY_AUCTIONS,
+  EARLY_KAPPA_SCALE,
+  EARLY_MIN_RIVALS,
   LEAVE_ALPHA,
   CASH_MIN_LEN,
   HOLD_MIN_REAL_RIVALS,
+  HOLD_FROM_BAG,
   LIQUIDITY_FLOOR,
   LIQUIDITY_MIN_LEN,
   LIQUIDITY_FALLBACK_MIN_LEN,
@@ -279,6 +304,16 @@ export function paceMultiplier(
   return Math.min(p.PACE_MAX, Math.max(min ?? p.PACE_MIN, r ** p.PACE_EXPONENT));
 }
 
+/**
+ * Early bid cut (see EARLY_AUCTIONS): EARLY_KAPPA_SCALE in the first
+ * EARLY_AUCTIONS auctions of a match at tables with at least EARLY_MIN_RIVALS
+ * rivals, else 1.
+ */
+export function earlyScale(bagTotal: number, auctions: number, rivals: number, p: Policy = DEFAULT_POLICY): number {
+  if (p.EARLY_KAPPA_SCALE === 1 || rivals < p.EARLY_MIN_RIVALS) return 1;
+  return auctions - 1 - bagTotal < p.EARLY_AUCTIONS ? p.EARLY_KAPPA_SCALE : 1;
+}
+
 /** Kappa with budget pacing: PACED_KAPPA, doubled in the last ENDGAME_AUCTIONS auctions, times paceMultiplier. */
 export function pacedKappa(
   bagTotal: number,
@@ -378,7 +413,8 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
   const paced = pacingOn(simsOnly, input.auctionsPerMatch);
   const paceMin = input.opponents.length <= p.DUEL_MAX_OPPONENTS ? p.PACE_MIN_DUEL : p.PACE_MIN;
   const kappaExact = paced
-    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin, p)
+    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin, p) *
+      earlyScale(input.bagTotal, input.auctionsPerMatch!, input.opponents.length, p)
     : kappaFor(input.bagTotal, undefined, p);
   const kappa = +kappaExact.toFixed(4); // for the reason strings
   const full = Math.floor(kappaExact * input.delta);
@@ -475,6 +511,8 @@ export interface WordInput {
   alpha?: number;
   /** Real (non-sim) rivals at the table; HOLD_MIN_REAL_RIVALS or more holds words for the flush. */
   realRivals?: number;
+  /** Auctions still to come (match_state.bag_total); holding starts below HOLD_FROM_BAG (always when absent). */
+  bagTotal?: number;
   /** Tuning constants (default DEFAULT_POLICY). */
   policy?: Policy;
 }
@@ -534,7 +572,8 @@ export function chooseWords(index: WordIndex, input: WordInput): string[] {
   const rem = new Int32Array(input.counts);
   const out: string[] = [];
   let balance = input.myBalance;
-  const hold = (input.realRivals ?? 0) >= p.HOLD_MIN_REAL_RIVALS;
+  const hold =
+    (input.realRivals ?? 0) >= p.HOLD_MIN_REAL_RIVALS && (input.bagTotal === undefined || input.bagTotal < p.HOLD_FROM_BAG);
   while (!hold) {
     const k = index.bestKey(input.cands, rem, p.CASH_MIN_LEN);
     if (k < 0) break;

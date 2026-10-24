@@ -747,7 +747,7 @@ export class SookraBot {
     if (val) {
       let played = 0;
       try {
-        played = this.playWords(conn, matchId, model, counts, val, balance, flushWords);
+        played = this.playWords(conn, matchId, model, counts, val, balance, flushWords, bagTotal);
       } catch (err) {
         this.warn("word choice", err);
       }
@@ -781,6 +781,7 @@ export class SookraBot {
     val: Valuation,
     balance: number,
     flush: boolean,
+    bagTotal?: number,
   ): number {
     if (this.index.size === 0) return 0;
     if (this.now() < model.wordBackoffUntil) return 0;
@@ -796,6 +797,7 @@ export class SookraBot {
       flush,
       alpha: val.alpha,
       realRivals: this.opponents(conn, matchId).filter((o) => !o.isSim).length,
+      bagTotal,
       policy: this.policy,
     }).filter((w) => (model.wordFailures.get(w) ?? 0) < MAX_WORD_FAILURES);
     for (const w of words) this.submitWord(conn, matchId, model, w, flush);
