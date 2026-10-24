@@ -296,6 +296,97 @@ export class WordIndex {
     return { total, keys, leftover: rem };
   }
 
+  /**
+   * Optimal packing (branch and bound) of `counts` plus one optional extra tile:
+   * the set of disjoint words maximizing the sum of (reward - keepWeight x the
+   * leave value of the word's own tiles), so with keepWeight 0 (the flush) the
+   * highest total reward the rack can cash. Greedy packing (pack) is the
+   * starting incumbent, so the result is never below it; the search stops after
+   * maxNodes nodes and returns the best set found so far. Same candidate rules
+   * as pack: keys from `cands` that fit without an extra tile or need exactly
+   * `extraLetter`, and with keepWeight > 0 only words whose reward beats
+   * keepWeight x their own leave value.
+   */
+  packExact(cands: Candidates, counts: Counts, extraLetter = -1, keepWeight = 0, maxNodes = 20000): PackResult {
+    const greedy = this.pack(cands, counts, extraLetter, keepWeight);
+    const rem = new Int32Array(counts);
+    if (extraLetter >= 0) rem[extraLetter]++;
+    let remTiles = tileCount(rem);
+    const ks: number[] = [];
+    const ws: number[] = [];
+    for (let i = 0; i < cands.n; i++) {
+      const e = cands.extra[i];
+      if (e !== -1 && e !== extraLetter) continue;
+      const k = cands.keys[i];
+      if (this.len[k] > remTiles) continue;
+      if (keepWeight > 0 && this.reward[k] <= keepWeight * this.keyLeave[k]) continue;
+      const w = this.reward[k] - keepWeight * this.keyLeave[k];
+      if (!(w > 0)) continue;
+      ks.push(k);
+      ws.push(w);
+    }
+    const n = ks.length;
+    if (n <= 1) return greedy;
+    // Highest weight first (stable), so the search meets good words early.
+    const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => ws[b] - ws[a] || a - b);
+    const K = Int32Array.from(order, (i) => ks[i]);
+    const W = Float64Array.from(order, (i) => ws[i]);
+    const L = Int32Array.from(order, (i) => this.len[ks[i]]);
+    // Suffix maximum of weight per tile: words chosen from position j on earn at most this per tile used.
+    const dens = new Float64Array(n + 1);
+    for (let j = n - 1; j >= 0; j--) dens[j] = Math.max(dens[j + 1], W[j] / L[j]);
+    let valSum = 0;
+    for (let i = 0; i < 26; i++) valSum += rem[i] * VALUE_BY_INDEX[i];
+    const keyVal = new Int32Array(n);
+    for (let j = 0; j < n; j++) {
+      let s = 0;
+      for (let p = this.offset[K[j]]; p < this.offset[K[j] + 1]; p++) s += VALUE_BY_INDEX[this.letters[p]];
+      keyVal[j] = s;
+    }
+    let bestW = 0;
+    for (const k of greedy.keys) bestW += this.reward[k] - keepWeight * this.keyLeave[k];
+    let bestKeys: number[] | null = null;
+    const stack: number[] = [];
+    let nodes = 0;
+    const eps = 1e-9;
+    const dfs = (start: number, acc: number): void => {
+      if (acc > bestW + eps) {
+        bestW = acc;
+        bestKeys = stack.slice();
+      }
+      for (let j = start; j < n; j++) {
+        if (++nodes > maxNodes) return;
+        if (L[j] > remTiles) continue;
+        // Bound: tiles left times the best weight per tile from here on, and 3 x their face value.
+        const ub = Math.min(remTiles * dens[j], 3 * valSum);
+        if (acc + ub <= bestW + eps) return;
+        const k = K[j];
+        if (!this.take(k, rem)) continue;
+        remTiles -= L[j];
+        valSum -= keyVal[j];
+        stack.push(j);
+        dfs(j, acc + W[j]);
+        stack.pop();
+        valSum += keyVal[j];
+        remTiles += L[j];
+        for (let p = this.offset[k]; p < this.offset[k + 1]; p++) rem[this.letters[p]]++;
+        if (nodes > maxNodes) return;
+      }
+    };
+    dfs(0, 0);
+    if (bestKeys === null) return greedy;
+    const left = new Int32Array(counts);
+    if (extraLetter >= 0) left[extraLetter]++;
+    let total = 0;
+    const keys: number[] = [];
+    for (const j of bestKeys as number[]) {
+      keys.push(K[j]);
+      total += this.reward[K[j]];
+      this.consume(left, K[j]);
+    }
+    return { total, keys, leftover: left };
+  }
+
   /** Best word (by reward, then length) of at least minLen letters, or -1. */
   bestKey(cands: Candidates, counts: Counts, minLen: number): number {
     const rem = new Int32Array(counts);
@@ -364,17 +455,26 @@ export function valuate(
   counts: Counts,
   alpha: number,
   mode: "leave" | "forced" = "leave",
+  exactNodes = 0,
+  deadValue?: Float64Array,
 ): Valuation {
   const t0 = performance.now();
   const leave = mode === "leave";
   const keep = leave ? alpha : 0;
   const cands = index.scan(counts, true);
-  const base = index.pack(cands, counts, -1, keep);
+  // exactNodes > 0: optimal packing (packExact, never below greedy) in place of greedy.
+  const packer = (x: number) =>
+    exactNodes > 0 ? index.packExact(cands, counts, x, keep, exactNodes) : index.pack(cands, counts, x, keep);
+  const base = packer(-1);
   const baseValue = packValue(base, alpha);
   const delta = new Float64Array(26);
   for (let i = 0; i < 26; i++) {
-    const repacked = packValue(index.pack(cands, counts, i, keep), alpha) - baseValue;
-    delta[i] = leave ? Math.max(repacked, alpha * W7_BY_INDEX[i]) : repacked;
+    const repacked = packValue(packer(i), alpha) - baseValue;
+    const floor = alpha * W7_BY_INDEX[i];
+    // deadValue (leave mode): a letter the packing has no use for (worth only its own leave
+    // value) is valued at alpha x deadValue[i] instead, an empirical value per letter.
+    if (leave && deadValue !== undefined && repacked <= floor + 1e-9) delta[i] = alpha * deadValue[i];
+    else delta[i] = leave ? Math.max(repacked, floor) : repacked;
   }
   return {
     rackKey: countsKey(counts),

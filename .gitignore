@@ -10,3 +10,5 @@ target/
 bot-starter/src/module_bindings/
 .vercel
 .env*
+# Downloaded GitHub Actions self-play runs (bot-starter/scripts/selfplay_remote.sh).
+selfplay-runs/

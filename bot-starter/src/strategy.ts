@@ -4,10 +4,16 @@
 // file turns a marginal value into a bid and a rack into word plays. Every
 // tuning knob is a named constant below; the measured basis for each is in
 // research_notes/.../scrabblebot_strategy.md (sim.py results).
+//
+// DEFAULT_POLICY collects those constants by name. A SookraBot plays with one
+// Policy (the live bot: DEFAULT_POLICY) and passes it to every function here;
+// the self-play harness tests a variant by overriding fields of it, so the
+// variant runs exactly this code with one value changed.
 
 import {
   type Candidates,
   type Counts,
+  LEAVE_W7,
   LETTER_VALUE,
   WordIndex,
   letterIndex,
@@ -94,6 +100,12 @@ export const STARTING_BALANCE = 100;
 export const BAG_TILES = 98;
 /** Weight of the leave value of held tiles (sim: 0.35 best; 0 scored 107 vs 314). */
 export const LEAVE_ALPHA = 0.35;
+/**
+ * Leave decay: with fewer than LEAVE_DECAY_BAG auctions to come, the leave
+ * weight is LEAVE_ALPHA x (bagTotal + 1) / LEAVE_DECAY_BAG, since a held tile
+ * has fewer letters left to form a word with. 0 (default): no decay.
+ */
+export const LEAVE_DECAY_BAG = 0;
 /** Cash any word of at least this many letters as soon as it forms (multiplier saturates at 7). */
 export const CASH_MIN_LEN = 7;
 /**
@@ -104,6 +116,13 @@ export const CASH_MIN_LEN = 7;
  * sim-padded tables keep CASH_MIN_LEN.
  */
 export const HOLD_MIN_REAL_RIVALS = 2;
+/**
+ * Holding (HOLD_MIN_REAL_RIVALS) starts only once fewer than this many
+ * auctions are still to come; before that, words of CASH_MIN_LEN+ letters are
+ * cashed as they form, so their reward buys letters while most are still to
+ * be auctioned. 999 or more (default 999): off, hold for the whole match.
+ */
+export const HOLD_FROM_BAG = 999;
 /**
  * Below this balance (after cashing), also cash one word: preferably of
  * LIQUIDITY_MIN_LEN+ letters, else of any length (LIQUIDITY_FALLBACK_MIN_LEN),
@@ -167,6 +186,219 @@ export const DUEL_MAX_OPPONENTS = 1;
 export const DUEL_RESERVE_PER_AUCTION = 1;
 export const DUEL_RESERVE_WINDOW = 10;
 
+// Round 2 levers. Each is off by default, so DEFAULT_POLICY plays exactly as
+// the live build 5318ca6 does; the self-play harness turns one on by name.
+
+/**
+ * COMPLETE7_PREMIUM: when winning the letter lets the bot spell a 7+ letter
+ * word it cannot spell now (sevenCompleterMask: a 7+ letter word needs exactly
+ * this letter, and the rack plus it packs into more 7+ letter words than the
+ * rack alone), the letter is bid at COMPLETE7_PREMIUM x kappa, so
+ * floor(kappa x COMPLETE7_PREMIUM x delta) (one coin above twice the plain
+ * bid at times, from the rounding), but the raise stops at
+ * COMPLETE7_CAP_SHARE x the balance and never takes the bid below the plain
+ * one. 1: off. Live (rival-data-v4): Chinese Dante wins 61% of the auctions
+ * where the letter completes a 7-letter word, against 25% otherwise.
+ */
+export const COMPLETE7_PREMIUM = 1;
+export const COMPLETE7_CAP_SHARE = 1;
+/**
+ * CASH_WHEN_BROKE: at a table that holds words (HOLD_MIN_REAL_RIVALS), held
+ * words of CASH_MIN_LEN+ letters are cashed, best first, while the balance is
+ * under CASH_BROKE_BALANCE, and every one is cashed as it forms once fewer
+ * than CASH_BROKE_AUCTIONS auctions are to come. 0: off. Live (rival-data-v4,
+ * builds B to E): SookraBot held a playable 7+ letter word in 52% of auctions
+ * 1 to 60 and won 9% of those; james cashes at about 50 points or when broke.
+ */
+export const CASH_BROKE_BALANCE = 0;
+export const CASH_BROKE_AUCTIONS = 0;
+/**
+ * Dead letters: a letter worth no more to the rack than its own leave value
+ * (isDeadLetter: delta <= alpha x LEAVE_W7, alpha from the valuation the delta
+ * comes from) is bid at DEAD_KAPPA_SCALE x kappa. 1: off. Why this lever: in
+ * the v5 calibration (validate5 at the 288 live all-real tables from m1000 on,
+ * live side) SookraBot wins 11.4 letters a match against 13.2 for the top
+ * eleven, and the letter regimes split the 1.8 as 0.9 dead letters (it wins
+ * 8.6% of the dead letters it can afford, the top eleven 14.6%), 0.5 useful
+ * ones (25.3% against 26.8%) and 0.4 letters that complete a 7+ word (it wins
+ * 66.7% of those, more than any of them, but is offered 1.8 a match against
+ * 4.9). The harness counts a letter dead when the greedy packing gains nothing
+ * from it (selfplay.ts rackMasks), close to but not the same as this rule.
+ */
+export const DEAD_KAPPA_SCALE = 1;
+
+// Prediction v2 knobs. All are off by default except the gated lookahead
+// (LOOKAHEAD_WEIGHT 1 with LOOKAHEAD_MIN_REAL_RIVALS 2), so DEFAULT_POLICY plays
+// as the live build 5318ca6 everywhere the lookahead's gate is closed; the
+// self-play harness turns any knob on or off by name.
+
+/**
+ * WORDS_EXACT_NODES: word choices use the optimal packing of the rack
+ * (WordIndex.packExact, branch and bound from the greedy packing, at most this
+ * many search nodes) instead of the greedy one: the end-of-match flush cashes
+ * it, and a liquidity word is judged by the optimal value of what it leaves.
+ * 0: off (greedy). Random racks from the bag (scripts/packcheck.ts, 200 each,
+ * budget 200000): greedy 72.2 / 93.0 / 117.5 against optimal 83.4 / 105.2 /
+ * 127.6 at 16 / 20 / 24 tiles, 0.9 to 2.9 ms a rack.
+ */
+export const WORDS_EXACT_NODES = 0;
+/**
+ * EXACT_VALUE_NODES: the bid table (valuate) values each rack and rack + letter
+ * by the optimal packing (packExact, at most this many nodes each) instead of
+ * the greedy one, so a letter's marginal value is what it adds to the best
+ * packing. 0: off (greedy).
+ */
+export const EXACT_VALUE_NODES = 0;
+/**
+ * DEAD_GATE_REAL_RIVALS: DEAD_KAPPA_SCALE applies only in Vickrey auctions at
+ * tables with at least this many real (non-sim) rivals. 0: no gate (the round
+ * 2 lever as it was). Why: round 2 (cloud, seeds 5102, 5201, 5401) measured
+ * DEAD_KAPPA_SCALE 1.1 at about +1.4 points at 6-seat Vickrey tables (t 5 to
+ * 6 pooled) and losses in duels, at 4 seats and under first price, and
+ * proposed this gate.
+ */
+export const DEAD_GATE_REAL_RIVALS = 0;
+/**
+ * LOOKAHEAD_WEIGHT: the refined bid (bot.ts refresh) values the letter on
+ * auction with a one-step lookahead over the unseen pool (pool.ts
+ * lookaheadDelta): its marginal value plus LOOKAHEAD_WEIGHT x how winning it
+ * changes the expected marginal value of the next letter, ramped to 0 over the
+ * last LOOKAHEAD_HORIZON auctions. LOOKAHEAD_POOL 1 weights the next letter by
+ * the unseen pool (bag minus auctioned letters minus our starting tiles), 0 by
+ * the full bag. LOOKAHEAD_WEIGHT 0: off.
+ *
+ * Cloud self-play, paired against 5318ca6 (head), LOOKAHEAD_WEIGHT 1:
+ *  - 6-seat Vickrey, calibrated v5 rivals (top5, field, mixed; seeds 7102,
+ *    7201, 7203; 6000 paired matches): +6.1 points (95% CI +5.4 to +6.7),
+ *    place -0.24 (CI -0.27 to -0.21), wins +11.4 points of share;
+ *  - the same tables with stronger rivals (,smart / @0.9 / shade=1.2, seed
+ *    7202, 1800): +5.0 points (CI +3.8 to +6.3), place -0.15;
+ *  - 3 seats (1200): +8.7 points, place -0.13; 5 seats (1800): +1.8 points
+ *    (CI +0.4 to +3.3), place -0.11; 4 seats (2400): -0.7 points (CI -2.3 to
+ *    +0.9), place -0.05 (CI -0.09 to -0.02);
+ *  - duels: -9.6 to -62.7 points; 6-seat first price: -4.4. Hence the gate.
+ * Weights 0.5, 0.75, 1.5 and 2 each gained less than 1. The unseen pool and
+ * the full-bag prior measured the same (seed 7102: +6.4 / +7.4 / +4.2 against
+ * +6.7 / +7.0 / +4.3). A spend-matched control (PACED_KAPPA 4.6, seed 7203)
+ * gained only +0.6 to +1.9, so the gain is not just spending more.
+ */
+export const LOOKAHEAD_WEIGHT = 1;
+export const LOOKAHEAD_HORIZON = 10;
+export const LOOKAHEAD_POOL = 1;
+/**
+ * The lookahead applies only in Vickrey auctions at tables with at least
+ * LOOKAHEAD_MIN_REAL_RIVALS real (non-sim) rivals (3 or more seats); 0:
+ * everywhere. Gated off, duels, first-price and sim-padded tables play exactly
+ * as head (cloud run seed 7301: 600 of 600 identical in each such field).
+ */
+export const LOOKAHEAD_MIN_REAL_RIVALS = 2;
+/**
+ * EMP_DEAD_SCALE: a letter the rack's packing has no use for (its marginal
+ * value is only its own leave value, alpha x LEAVE_W7) is valued instead at
+ * alpha x EMP_DEAD_SCALE x the empirical points per won tile of that letter
+ * (empirical.ts: final score regressed on tiles won, live all-real 6-seat
+ * matches). 0: off. 0.85 keeps the table's mean near LEAVE_W7's.
+ */
+export const EMP_DEAD_SCALE = 0;
+
+/**
+ * The tuning constants above, by name: what a SookraBot plays with. Game rules
+ * (STARTING_BALANCE, BAG_TILES, SIM_BID_JITTER) and the network-stall bounds of
+ * flushLeadMs are not knobs and stay plain constants.
+ */
+export interface Policy {
+  readonly KAPPA: number;
+  readonly ENDGAME_AUCTIONS: number;
+  readonly ENDGAME_KAPPA_BOOST: number;
+  readonly PACE_EXPONENT: number;
+  readonly PACE_MIN: number;
+  readonly PACE_MAX: number;
+  readonly PACE_MIN_DUEL: number;
+  readonly PACED_KAPPA: number;
+  readonly EARLY_AUCTIONS: number;
+  readonly EARLY_KAPPA_SCALE: number;
+  readonly EARLY_MIN_REAL_RIVALS: number;
+  readonly LEAVE_ALPHA: number;
+  readonly LEAVE_DECAY_BAG: number;
+  readonly CASH_MIN_LEN: number;
+  readonly HOLD_MIN_REAL_RIVALS: number;
+  readonly HOLD_FROM_BAG: number;
+  readonly LIQUIDITY_FLOOR: number;
+  readonly LIQUIDITY_MIN_LEN: number;
+  readonly LIQUIDITY_FALLBACK_MIN_LEN: number;
+  readonly LIQUIDITY_TOP_K: number;
+  readonly SIM_ONLY_KAPPA: number;
+  readonly FLUSH_LEAD_MS: number;
+  readonly FP_HISTORY_MAX: number;
+  readonly FP_MIN_OBS: number;
+  readonly FP_QUANTILE: number;
+  readonly FP_NO_HISTORY_SHADE: number;
+  readonly BROKE_RIVAL_MAX_BID: number;
+  readonly DUEL_MAX_OPPONENTS: number;
+  readonly DUEL_RESERVE_PER_AUCTION: number;
+  readonly DUEL_RESERVE_WINDOW: number;
+  readonly COMPLETE7_PREMIUM: number;
+  readonly COMPLETE7_CAP_SHARE: number;
+  readonly CASH_BROKE_BALANCE: number;
+  readonly CASH_BROKE_AUCTIONS: number;
+  readonly DEAD_KAPPA_SCALE: number;
+  readonly WORDS_EXACT_NODES: number;
+  readonly EXACT_VALUE_NODES: number;
+  readonly DEAD_GATE_REAL_RIVALS: number;
+  readonly LOOKAHEAD_WEIGHT: number;
+  readonly LOOKAHEAD_HORIZON: number;
+  readonly LOOKAHEAD_POOL: number;
+  readonly LOOKAHEAD_MIN_REAL_RIVALS: number;
+  readonly EMP_DEAD_SCALE: number;
+}
+
+/** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
+export const DEFAULT_POLICY: Policy = Object.freeze({
+  KAPPA,
+  ENDGAME_AUCTIONS,
+  ENDGAME_KAPPA_BOOST,
+  PACE_EXPONENT,
+  PACE_MIN,
+  PACE_MAX,
+  PACE_MIN_DUEL,
+  PACED_KAPPA,
+  EARLY_AUCTIONS,
+  EARLY_KAPPA_SCALE,
+  EARLY_MIN_REAL_RIVALS,
+  LEAVE_ALPHA,
+  LEAVE_DECAY_BAG,
+  CASH_MIN_LEN,
+  HOLD_MIN_REAL_RIVALS,
+  HOLD_FROM_BAG,
+  LIQUIDITY_FLOOR,
+  LIQUIDITY_MIN_LEN,
+  LIQUIDITY_FALLBACK_MIN_LEN,
+  LIQUIDITY_TOP_K,
+  SIM_ONLY_KAPPA,
+  FLUSH_LEAD_MS,
+  FP_HISTORY_MAX,
+  FP_MIN_OBS,
+  FP_QUANTILE,
+  FP_NO_HISTORY_SHADE,
+  BROKE_RIVAL_MAX_BID,
+  DUEL_MAX_OPPONENTS,
+  DUEL_RESERVE_PER_AUCTION,
+  DUEL_RESERVE_WINDOW,
+  COMPLETE7_PREMIUM,
+  COMPLETE7_CAP_SHARE,
+  CASH_BROKE_BALANCE,
+  CASH_BROKE_AUCTIONS,
+  DEAD_KAPPA_SCALE,
+  WORDS_EXACT_NODES,
+  EXACT_VALUE_NODES,
+  DEAD_GATE_REAL_RIVALS,
+  LOOKAHEAD_WEIGHT,
+  LOOKAHEAD_HORIZON,
+  LOOKAHEAD_POOL,
+  LOOKAHEAD_MIN_REAL_RIVALS,
+  EMP_DEAD_SCALE,
+});
+
 // ---- Types ----
 
 export type AuctionKind = "Vickrey" | "FirstPrice";
@@ -199,6 +431,19 @@ export interface BidInput {
   fpHistory?: PricePoint[];
   /** Auctions in this match (auctionsPerMatch()); budget pacing is off when absent. */
   auctionsPerMatch?: number;
+  /** Tuning constants (default DEFAULT_POLICY). */
+  policy?: Policy;
+  /**
+   * Winning this letter lets the rack spell a 7+ letter word it cannot spell
+   * now (sevenCompleterMask of the valuation the delta comes from). Read only
+   * when COMPLETE7_PREMIUM is on; absent: unknown, no premium.
+   */
+  completes7?: boolean;
+  /**
+   * Leave weight of the valuation the delta comes from (Valuation.alpha), for
+   * isDeadLetter. Read only when DEAD_KAPPA_SCALE is on; absent: never dead.
+   */
+  leaveAlpha?: number;
 }
 
 export interface BidDecision {
@@ -224,8 +469,10 @@ function quantile(xs: number[], q: number): number {
   return s[pos];
 }
 
-export function kappaFor(bagTotal: number, base = KAPPA): number {
-  return bagTotal < ENDGAME_AUCTIONS ? base * ENDGAME_KAPPA_BOOST : base;
+/** Kappa `base` (default the policy's KAPPA), times ENDGAME_KAPPA_BOOST in the last ENDGAME_AUCTIONS auctions. */
+export function kappaFor(bagTotal: number, base?: number, p: Policy = DEFAULT_POLICY): number {
+  const k = base ?? p.KAPPA;
+  return bagTotal < p.ENDGAME_AUCTIONS ? k * p.ENDGAME_KAPPA_BOOST : k;
 }
 
 /** Pacing is on at tables with a real rival once the match length is known. */
@@ -240,18 +487,19 @@ export function auctionsPerMatch(seats: number, startingRackSize: number): numbe
 
 /**
  * Budget pacing multiplier on kappa (see PACE_EXPONENT), clamped to
- * min..PACE_MAX (min: PACE_MIN, or PACE_MIN_DUEL in a duel); 1 when the
- * match length is unknown.
+ * min..PACE_MAX (min: PACE_MIN, or PACE_MIN_DUEL in a duel; default the
+ * policy's PACE_MIN); 1 when the match length is unknown.
  */
 export function paceMultiplier(
   balance: number,
   bagTotal: number,
   auctions: number | undefined,
-  min = PACE_MIN,
+  min?: number,
+  p: Policy = DEFAULT_POLICY,
 ): number {
   if (auctions === undefined || !(auctions > 0) || !(bagTotal >= 0)) return 1;
   const r = Math.max(0, balance) / (bagTotal + 1) / (STARTING_BALANCE / auctions);
-  return Math.min(PACE_MAX, Math.max(min, r ** PACE_EXPONENT));
+  return Math.min(p.PACE_MAX, Math.max(min ?? p.PACE_MIN, r ** p.PACE_EXPONENT));
 }
 
 /**
@@ -274,8 +522,14 @@ export function earlyScale(
 }
 
 /** Kappa with budget pacing: PACED_KAPPA, doubled in the last ENDGAME_AUCTIONS auctions, times paceMultiplier. */
-export function pacedKappa(bagTotal: number, balance: number, auctions: number | undefined, min = PACE_MIN): number {
-  return kappaFor(bagTotal, PACED_KAPPA) * paceMultiplier(balance, bagTotal, auctions, min);
+export function pacedKappa(
+  bagTotal: number,
+  balance: number,
+  auctions: number | undefined,
+  min?: number,
+  p: Policy = DEFAULT_POLICY,
+): number {
+  return kappaFor(bagTotal, p.PACED_KAPPA, p) * paceMultiplier(balance, bagTotal, auctions, min, p);
 }
 
 /** Highest bid this opponent can place right now (real bots: their whole balance). */
@@ -289,9 +543,51 @@ export function maxPossibleBid(o: Opponent, letter: string): number {
  * DUEL_RESERVE_PER_AUCTION for each remaining auction, counting at most
  * DUEL_RESERVE_WINDOW of them. 0 at tables with more than DUEL_MAX_OPPONENTS rivals.
  */
-export function duelReserve(opponentCount: number, bagTotal: number): number {
-  if (opponentCount > DUEL_MAX_OPPONENTS) return 0;
-  return DUEL_RESERVE_PER_AUCTION * Math.max(0, Math.min(bagTotal, DUEL_RESERVE_WINDOW));
+export function duelReserve(opponentCount: number, bagTotal: number, p: Policy = DEFAULT_POLICY): number {
+  if (opponentCount > p.DUEL_MAX_OPPONENTS) return 0;
+  return p.DUEL_RESERVE_PER_AUCTION * Math.max(0, Math.min(bagTotal, p.DUEL_RESERVE_WINDOW));
+}
+
+/**
+ * A dead letter for DEAD_KAPPA_SCALE: worth no more to the rack than its own
+ * leave value, delta <= alpha x LEAVE_W7 (valuate floors every delta there, so
+ * a dead letter's delta is exactly that), with alpha the leave weight of the
+ * valuation the delta comes from. At alpha 0 (flushing) no letter with value is dead.
+ */
+export function isDeadLetter(letter: string, delta: number, alpha: number): boolean {
+  const w = LEAVE_W7[letter];
+  return w !== undefined && delta <= alpha * w + 1e-9;
+}
+
+/**
+ * Letters that complete a 7+ letter word on this rack, for COMPLETE7_PREMIUM
+ * (bit i for letter i): some word of 7+ letters needs exactly that letter as
+ * its one extra tile (scan's tag), and the rack plus that letter packs into
+ * more words of 7+ letters than the rack alone (WordIndex.pack, keepWeight as
+ * the valuation packs; for a rack that already holds a 7+ word, a second one).
+ * `cands` is scan(counts, true), as in a Valuation. When the rack spells no 7+
+ * word this is a subset of selfplay.ts sevenCompleters (the calibration's
+ * complete7 regime): it leaves out a letter whose 7+ word the greedy packing
+ * would not use (equal on 111 of 159 random racks of 6 to 15 tiles).
+ */
+export function sevenCompleterMask(index: WordIndex, cands: Candidates, counts: Counts, keepWeight: number): number {
+  let needs = 0;
+  for (let i = 0; i < cands.n; i++) {
+    const e = cands.extra[i];
+    if (e >= 0 && index.len[cands.keys[i]] >= 7) needs |= 1 << e;
+  }
+  if (needs === 0) return 0;
+  const sevens = (keys: number[]) => {
+    let n = 0;
+    for (const k of keys) if (index.len[k] >= 7) n++;
+    return n;
+  };
+  const base = sevens(index.pack(cands, counts, -1, keepWeight).keys);
+  let mask = 0;
+  for (let i = 0; i < 26; i++) {
+    if (((needs >>> i) & 1) === 1 && sevens(index.pack(cands, counts, i, keepWeight).keys) > base) mask |= 1 << i;
+  }
+  return mask >>> 0;
 }
 
 /**
@@ -310,6 +606,11 @@ export function duelReserve(opponentCount: number, bagTotal: number): number {
  *    otherwise), and by EARLY_KAPPA_SCALE in the first EARLY_AUCTIONS
  *    auctions at tables of EARLY_MIN_REAL_RIVALS or more real (non-sim)
  *    rivals (earlyScale);
+ *  - round 2 levers, off by default: kappa x DEAD_KAPPA_SCALE on a dead
+ *    letter (isDeadLetter), and on a letter that completes a 7+ word
+ *    (completes7) kappa x COMPLETE7_PREMIUM, the raise stopping at
+ *    COMPLETE7_CAP_SHARE x the balance; neither applies at a sims-only
+ *    Vickrey table;
  *  - first price (you pay your own bid): shade to min(full bid, estimated
  *    price to win), where the estimate is max(max sim bid + 1, FP_QUANTILE
  *    of recent real-rival winning prices for letters of the same face value
@@ -322,6 +623,7 @@ export function duelReserve(opponentCount: number, bagTotal: number): number {
  *  - always clamp to 0..balance.
  */
 export function decideBid(input: BidInput): BidDecision {
+  const p = input.policy ?? DEFAULT_POLICY;
   const balance = Math.max(0, Math.floor(Number.isFinite(input.myBalance) ? input.myBalance : 0));
   const clamp = (x: number) => Math.max(0, Math.min(Math.floor(x), balance));
   if (letterIndex(input.letter) < 0) return { amount: 0, reason: "bad-letter" };
@@ -339,14 +641,14 @@ export function decideBid(input: BidInput): BidDecision {
   const rivalCap = rivalMax + 1;
   let amount: number;
   let reason: string;
-  if (rivalMax <= BROKE_RIVAL_MAX_BID) {
+  if (rivalMax <= p.BROKE_RIVAL_MAX_BID) {
     amount = rivalCap;
     reason = `rivals broke (max ${rivalMax})`;
   } else {
-    ({ amount, reason } = valueBid(input, rivalCap, balance));
+    ({ amount, reason } = valueBid(input, rivalCap, balance, p));
   }
   // The duel reserve applies to every branch, the broke-rival one included.
-  const reserve = duelReserve(input.opponents.length, input.bagTotal);
+  const reserve = duelReserve(input.opponents.length, input.bagTotal, p);
   if (reserve > 0) {
     const evenShare = Math.floor(balance / (input.bagTotal + 1));
     const duelCap = Math.max(balance - reserve, evenShare);
@@ -359,28 +661,57 @@ export function decideBid(input: BidInput): BidDecision {
 }
 
 /** Bid from the marginal value (kappa, pacing, sims-only cap, first-price shading), capped at rivalCap. */
-function valueBid(input: BidInput, rivalCap: number, balance: number): BidDecision {
+function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy): BidDecision {
   const sims = input.opponents.filter((o) => o.isSim && o.strategy);
   const simCap = sims.length
     ? Math.max(...sims.map((o) => maxSimBid(o.strategy!, input.letter, o.balance))) + 1
     : 0;
   const simsOnly = input.opponents.length > 0 && sims.length === input.opponents.length;
   const paced = pacingOn(simsOnly, input.auctionsPerMatch);
-  const paceMin = input.opponents.length <= DUEL_MAX_OPPONENTS ? PACE_MIN_DUEL : PACE_MIN;
+  const paceMin = input.opponents.length <= p.DUEL_MAX_OPPONENTS ? p.PACE_MIN_DUEL : p.PACE_MIN;
   // The early cut counts real rivals only, as HOLD_MIN_REAL_RIVALS does (bot.ts).
   const realRivals = input.opponents.filter((o) => !o.isSim).length;
   // paced implies auctionsPerMatch is a positive number (pacingOn).
-  const kappaExact = paced
-    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin) *
-      earlyScale(input.bagTotal, input.auctionsPerMatch!, realRivals)
-    : kappaFor(input.bagTotal);
+  const kappaRule = paced
+    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin, p) *
+      earlyScale(
+        input.bagTotal,
+        input.auctionsPerMatch!,
+        realRivals,
+        p.EARLY_AUCTIONS,
+        p.EARLY_KAPPA_SCALE,
+        p.EARLY_MIN_REAL_RIVALS,
+      )
+    : kappaFor(input.bagTotal, undefined, p);
+  const simsOnlyVickrey = simsOnly && input.auctionType === "Vickrey";
+  // Round 2 levers (off by default: DEAD_KAPPA_SCALE 1, COMPLETE7_PREMIUM 1); tag marks them in the reason.
+  const deadGateOpen =
+    p.DEAD_GATE_REAL_RIVALS <= 0 || (input.auctionType === "Vickrey" && realRivals >= p.DEAD_GATE_REAL_RIVALS);
+  const dead =
+    p.DEAD_KAPPA_SCALE !== 1 &&
+    deadGateOpen &&
+    !simsOnlyVickrey &&
+    input.leaveAlpha !== undefined &&
+    isDeadLetter(input.letter, input.delta, input.leaveAlpha);
+  const kappaExact = dead ? kappaRule * p.DEAD_KAPPA_SCALE : kappaRule;
   const kappa = +kappaExact.toFixed(4); // for the reason strings
-  const full = Math.floor(kappaExact * input.delta);
+  let full = Math.floor(kappaExact * input.delta);
+  let tag = dead ? ` dead x${p.DEAD_KAPPA_SCALE}` : "";
+  if (p.COMPLETE7_PREMIUM !== 1 && input.completes7 === true && !simsOnlyVickrey) {
+    const raised = Math.min(
+      Math.floor(kappaExact * p.COMPLETE7_PREMIUM * input.delta),
+      Math.floor(p.COMPLETE7_CAP_SHARE * balance),
+    );
+    if (raised > full) {
+      full = raised;
+      tag += ` c7 x${p.COMPLETE7_PREMIUM}`;
+    }
+  }
 
   let amount: number;
   let reason: string;
-  if (simsOnly && input.auctionType === "Vickrey") {
-    amount = Math.min(Math.floor(SIM_ONLY_KAPPA * input.delta), simCap);
+  if (simsOnlyVickrey) {
+    amount = Math.min(Math.floor(p.SIM_ONLY_KAPPA * input.delta), simCap);
     reason = `sims-only cap ${simCap}`;
   } else if (input.auctionType === "FirstPrice" && simsOnly) {
     amount = Math.min(full, simCap);
@@ -388,15 +719,15 @@ function valueBid(input: BidInput, rivalCap: number, balance: number): BidDecisi
   } else if (input.auctionType === "FirstPrice") {
     const face = LETTER_VALUE[input.letter] ?? 1;
     const obs = (input.fpHistory ?? [])
-      .filter((p) => p.face === face)
-      .slice(-FP_HISTORY_MAX)
-      .map((p) => p.paid);
+      .filter((pp) => pp.face === face)
+      .slice(-p.FP_HISTORY_MAX)
+      .map((pp) => pp.paid);
     let target: number;
-    if (obs.length >= FP_MIN_OBS) {
-      target = Math.max(simCap, quantile(obs, FP_QUANTILE) + 1);
-      reason = `fp q${FP_QUANTILE}x${obs.length} k${kappa}`;
+    if (obs.length >= p.FP_MIN_OBS) {
+      target = Math.max(simCap, quantile(obs, p.FP_QUANTILE) + 1);
+      reason = `fp q${p.FP_QUANTILE}x${obs.length} k${kappa}`;
     } else {
-      target = Math.max(simCap, Math.floor(full * FP_NO_HISTORY_SHADE));
+      target = Math.max(simCap, Math.floor(full * p.FP_NO_HISTORY_SHADE));
       reason = `fp no-history k${kappa}`;
     }
     amount = Math.min(full, target);
@@ -404,6 +735,7 @@ function valueBid(input: BidInput, rivalCap: number, balance: number): BidDecisi
     amount = full;
     reason = `k${kappa}`;
   }
+  reason += tag;
 
   if (amount > rivalCap) {
     amount = rivalCap;
@@ -433,18 +765,18 @@ export const FLUSH_BASELINE_PERCENTILE = 0.1;
  * self-play harness (no lag) are unchanged. It only moves word plays earlier;
  * valuation alpha keeps the fixed rule, so precomputed bid tables stay valid.
  */
-export function flushLeadMs(lagsMs: readonly number[]): number {
+export function flushLeadMs(lagsMs: readonly number[], p: Policy = DEFAULT_POLICY): number {
   // Baseline: a low percentile of the recent lags, so one early outlier (a clock
   // correction mid-match) expires instead of making every later lag look stalled.
   const recent = lagsMs.filter((lag) => Number.isFinite(lag)).slice(-FLUSH_BASELINE_WINDOW);
-  if (recent.length === 0) return FLUSH_LEAD_MS;
+  if (recent.length === 0) return p.FLUSH_LEAD_MS;
   const sorted = [...recent].sort((a, b) => a - b);
   const baseline = sorted[Math.floor(FLUSH_BASELINE_PERCENTILE * (sorted.length - 1))];
   let stall = 0;
   for (const lag of lagsMs.slice(-FLUSH_LAG_WINDOW)) {
     if (Number.isFinite(lag) && lag - baseline > stall) stall = lag - baseline;
   }
-  return Math.min(MAX_FLUSH_LEAD_MS, Math.max(FLUSH_LEAD_MS, Math.ceil(2 * stall + 1000)));
+  return Math.min(MAX_FLUSH_LEAD_MS, Math.max(p.FLUSH_LEAD_MS, Math.ceil(2 * stall + 1000)));
 }
 
 /** True once the match ends within leadMs (always at the final auction). */
@@ -454,9 +786,16 @@ export function shouldFlush(bagTotal: number, auctionDurationMs: number, leadMs:
   return (bagTotal + 1) * ms <= leadMs;
 }
 
-/** Leave weight for the valuation: leftovers are worthless once flushing. */
-export function alphaFor(flush: boolean): number {
-  return flush ? 0 : LEAVE_ALPHA;
+/**
+ * Leave weight for the valuation: leftovers are worthless once flushing, and
+ * worth less near the end when LEAVE_DECAY_BAG is set (bagTotal: auctions to come).
+ */
+export function alphaFor(flush: boolean, p: Policy = DEFAULT_POLICY, bagTotal?: number): number {
+  if (flush) return 0;
+  if (p.LEAVE_DECAY_BAG > 0 && bagTotal !== undefined && bagTotal + 1 < p.LEAVE_DECAY_BAG) {
+    return (p.LEAVE_ALPHA * Math.max(0, bagTotal + 1)) / p.LEAVE_DECAY_BAG;
+  }
+  return p.LEAVE_ALPHA;
 }
 
 export interface WordInput {
@@ -469,6 +808,13 @@ export interface WordInput {
   alpha?: number;
   /** Real (non-sim) rivals at the table; HOLD_MIN_REAL_RIVALS or more holds words for the flush. */
   realRivals?: number;
+  /**
+   * Auctions still to come (match_state.bag_total); holding starts below HOLD_FROM_BAG (always when
+   * absent), and CASH_BROKE_AUCTIONS cashes held words below it (never when absent).
+   */
+  bagTotal?: number;
+  /** Tuning constants (default DEFAULT_POLICY). */
+  policy?: Policy;
 }
 
 /**
@@ -484,16 +830,17 @@ export function liquidityWord(
   rem: Counts,
   balance: number,
   alpha: number,
+  p: Policy = DEFAULT_POLICY,
 ): number {
-  for (const minLen of [LIQUIDITY_MIN_LEN, LIQUIDITY_FALLBACK_MIN_LEN]) {
+  for (const minLen of [p.LIQUIDITY_MIN_LEN, p.LIQUIDITY_FALLBACK_MIN_LEN]) {
     const top: number[] = [];
-    for (let i = 0; i < cands.n && top.length < LIQUIDITY_TOP_K; i++) {
+    for (let i = 0; i < cands.n && top.length < p.LIQUIDITY_TOP_K; i++) {
       if (cands.extra[i] !== -1) continue;
       const k = cands.keys[i];
       if (index.len[k] >= minLen && index.fits(k, rem)) top.push(k);
     }
     if (top.length === 0) continue;
-    const need = LIQUIDITY_FLOOR - balance;
+    const need = p.LIQUIDITY_FLOOR - balance;
     let eligible = top.filter((k) => index.reward[k] >= need);
     if (eligible.length === 0) eligible = [top[0]];
     let best = -1;
@@ -501,7 +848,11 @@ export function liquidityWord(
     for (const k of eligible) {
       const rest = new Int32Array(rem);
       index.consume(rest, k);
-      const score = index.reward[k] + packValue(index.pack(cands, rest, -1, alpha), alpha);
+      const restPack =
+        p.WORDS_EXACT_NODES > 0
+          ? index.packExact(cands, rest, -1, alpha, p.WORDS_EXACT_NODES)
+          : index.pack(cands, rest, -1, alpha);
+      const score = index.reward[k] + packValue(restPack, alpha);
       if (score > bestScore) {
         bestScore = score;
         best = k;
@@ -514,26 +865,40 @@ export function liquidityWord(
 
 /**
  * Words to submit now, in order. Flush: the full greedy packing. Otherwise:
- * every 7+ letter word (best first), then one liquidity word if the balance
- * would still be under LIQUIDITY_FLOOR.
+ * every 7+ letter word (best first), at a table that holds words only those
+ * CASH_WHEN_BROKE releases (CASH_BROKE_BALANCE, CASH_BROKE_AUCTIONS; off by
+ * default), then one liquidity word if the balance would still be under
+ * LIQUIDITY_FLOOR.
  */
 export function chooseWords(index: WordIndex, input: WordInput): string[] {
+  const p = input.policy ?? DEFAULT_POLICY;
   if (input.flush) {
-    return index.pack(input.cands, input.counts, -1).keys.map((k) => index.words[k]);
+    const packed =
+      p.WORDS_EXACT_NODES > 0
+        ? index.packExact(input.cands, input.counts, -1, 0, p.WORDS_EXACT_NODES)
+        : index.pack(input.cands, input.counts, -1);
+    return packed.keys.map((k) => index.words[k]);
   }
   const rem = new Int32Array(input.counts);
   const out: string[] = [];
   let balance = input.myBalance;
-  const hold = (input.realRivals ?? 0) >= HOLD_MIN_REAL_RIVALS;
-  while (!hold) {
-    const k = index.bestKey(input.cands, rem, CASH_MIN_LEN);
+  // HOLD_FROM_BAG (999 or more: off, so no bag position can reach it) cashes 7+ words while at least that
+  // many auctions are still to come.
+  const cashEarly = p.HOLD_FROM_BAG < 999 && input.bagTotal !== undefined && input.bagTotal >= p.HOLD_FROM_BAG;
+  const hold = (input.realRivals ?? 0) >= p.HOLD_MIN_REAL_RIVALS && !cashEarly;
+  // CASH_WHEN_BROKE (0 and 0: off): late in the match every held CASH_MIN_LEN+ word is cashed, and
+  // while broke the best one at a time until the balance is back at CASH_BROKE_BALANCE.
+  const late = p.CASH_BROKE_AUCTIONS > 0 && input.bagTotal !== undefined && input.bagTotal < p.CASH_BROKE_AUCTIONS;
+  const broke = () => p.CASH_BROKE_BALANCE > 0 && balance < p.CASH_BROKE_BALANCE;
+  while (!hold || late || broke()) {
+    const k = index.bestKey(input.cands, rem, p.CASH_MIN_LEN);
     if (k < 0) break;
     out.push(index.words[k]);
     balance += index.reward[k];
     index.consume(rem, k);
   }
-  if (balance < LIQUIDITY_FLOOR) {
-    const k = liquidityWord(index, input.cands, rem, balance, input.alpha ?? LEAVE_ALPHA);
+  if (balance < p.LIQUIDITY_FLOOR) {
+    const k = liquidityWord(index, input.cands, rem, balance, input.alpha ?? p.LEAVE_ALPHA, p);
     if (k >= 0) out.push(index.words[k]);
   }
   return out;

@@ -21,7 +21,7 @@ import {
 } from "./bot.js";
 import { WordIndex, countsOf, letterIndex, valuate, wordReward } from "./engine.js";
 import { ConnectionLifecycle } from "./lifecycle.js";
-import { LEAVE_ALPHA, PACED_KAPPA, PACE_MIN_DUEL, maxSimBid } from "./strategy.js";
+import { DEFAULT_POLICY, LEAVE_ALPHA, PACED_KAPPA, PACE_MIN_DUEL, type Policy, maxSimBid, pacedKappa } from "./strategy.js";
 import { Supervisor, type Scheduler } from "./supervisor.js";
 
 const INDEX = WordIndex.fromWords(
@@ -183,7 +183,7 @@ function setup(
   rack: string,
   bagTotal: number,
   letter = "S",
-  opts: { durationMs?: number; withSim?: boolean; clock?: { t: number } } = {},
+  opts: { durationMs?: number; withSim?: boolean; clock?: { t: number }; policy?: Policy } = {},
 ) {
   const s = new FakeServer();
   s.bots.set(ME, { name: "SookraBot", isSimulated: false, strategy: { tag: "Human" } });
@@ -209,6 +209,7 @@ function setup(
     "T",
     { log: (m) => logs.push(m), warn: (m) => warns.push(m) },
     clock ? () => clock.t : Date.now,
+    opts.policy,
   );
   bot.myBotId = ME;
   return { s, bot, logs, warns };
@@ -924,8 +925,9 @@ test("duel: a cash-poor bot's paced bid is held at PACE_MIN_DUEL (the 3-game fin
 });
 
 test("early bid cut: a six-bot all-real table bids 0.4 of the paced kappa for 28 auctions; a duel is exempt", async () => {
-  // Six seats with 5-tile racks: 68 auctions. AEINST values R at 6.
-  const six = setup("AEINST", 67, "R", { withSim: false });
+  // Six seats with 5-tile racks: 68 auctions. AEINST values R at 6. The lookahead is off here: this checks
+  // the 5318ca6 rules it refines (the lookahead's own test follows).
+  const six = setup("AEINST", 67, "R", { withSim: false, policy: { ...DEFAULT_POLICY, LOOKAHEAD_WEIGHT: 0 } });
   for (const id of [11n, 12n, 13n, 14n]) {
     six.s.bots.set(id, { name: `Rival${id}`, isSimulated: false, strategy: { tag: "Human" } });
     six.s.participants.push({ matchId: MATCH, botId: id, balance: 100n, score: 0n });
@@ -954,6 +956,60 @@ test("early bid cut: a six-bot all-real table bids 0.4 of the paced kappa for 28
   padded.bot.refresh(padded.s, MATCH);
   await settle();
   assert.equal(padded.s.bids.at(-1)!.amount, 24n);
+});
+
+test("round 2 levers reach the bot: a 7+ completer bid, a dead-letter bid and held words cashed when broke or late", async () => {
+  // Six seats (68 auctions), all real, so words are held for the flush.
+  const six = (rack: string, bagTotal: number, letter: string, o?: Partial<Policy>) => {
+    const t = setup(rack, bagTotal, letter, { withSim: false, policy: { ...DEFAULT_POLICY, LOOKAHEAD_WEIGHT: 0, ...(o ?? {}) } });
+    for (const id of [11n, 12n, 13n, 14n]) {
+      t.s.bots.set(id, { name: `Rival${id}`, isSimulated: false, strategy: { tag: "Human" } });
+      t.s.participants.push({ matchId: MATCH, botId: id, balance: 100n, score: 0n });
+    }
+    return t;
+  };
+  // AEINST + R spells RETAINS. Index 28 (39 to come): kappa 4 x sqrt(1.7) = 5.2154, x 6 = 31; COMPLETE7_PREMIUM 2
+  // doubles it, and a cap of 40% of the balance stops the raise at 40.
+  for (const [o, want] of [[undefined, 31n], [{ COMPLETE7_PREMIUM: 2 }, 62n], [{ COMPLETE7_PREMIUM: 2, COMPLETE7_CAP_SHARE: 0.4 }, 40n]] as const) {
+    const t = six("AEINST", 39, "R", o);
+    t.bot.refresh(t.s, MATCH);
+    await settle();
+    assert.equal(t.s.bids.at(-1)!.amount, want, JSON.stringify(o));
+    // The next auction's bid goes out from the table on open, before any deferred work, premium included
+    // (index 29: kappa 4 x sqrt(100 / 39 / (100 / 68)) = 5.2818, x 6 = 31; doubled 63; capped 40).
+    const k = pacedKappa(38, 100, 68);
+    const plain = Math.floor(k * 6);
+    const cap = Math.floor((o && "COMPLETE7_CAP_SHARE" in o ? o.COMPLETE7_CAP_SHARE : 1) * 100);
+    const onOpen = o ? Math.max(plain, Math.min(Math.floor(k * 2 * 6), cap)) : plain;
+    assert.deepEqual([plain, onOpen], o === undefined ? [31, 31] : "COMPLETE7_CAP_SHARE" in o ? [31, 40] : [31, 63]);
+    const before = t.s.bids.length;
+    t.bot.onAuctionOpen(t.s, t.s.nextAuction(AUCTION + 1n, "R", 38));
+    assert.equal(t.s.bids.length, before + 1, "bid on open");
+    assert.equal(t.s.bids.at(-1)!.amount, BigInt(onOpen), `on open ${JSON.stringify(o)}`);
+    await settle();
+  }
+  // VG + B: B joins no word, so its value is its leave value, 0.35 x 6.75 = 2.3625: 5.2154 x 2.3625 = 12, x 0.5 = 6.
+  for (const [o, want] of [[undefined, 12n], [{ DEAD_KAPPA_SCALE: 0.5 }, 6n], [{ DEAD_KAPPA_SCALE: 1.5 }, 18n]] as const) {
+    const t = six("VG", 39, "B", o);
+    t.bot.refresh(t.s, MATCH);
+    await settle();
+    assert.equal(t.s.bids.at(-1)!.amount, want, JSON.stringify(o));
+  }
+  // Holding QINTARS with 20 coins (above LIQUIDITY_FLOOR): held by default, cashed under CASH_BROKE_BALANCE 30.
+  for (const [o, want] of [[undefined, []], [{ CASH_BROKE_BALANCE: 30 }, ["QINTARS"]], [{ CASH_BROKE_BALANCE: 20 }, []]] as const) {
+    const t = six("RETAINSQ", 39, "E", o);
+    t.s.balance(ME, 20);
+    t.bot.refresh(t.s, MATCH);
+    await settle();
+    assert.deepEqual(t.s.words, want, JSON.stringify(o));
+  }
+  // With 100 coins: cashed once fewer than CASH_BROKE_AUCTIONS auctions are to come.
+  for (const [bag, want] of [[20, []], [19, ["QINTARS"]]] as const) {
+    const t = six("RETAINSQ", bag, "E", { CASH_BROKE_AUCTIONS: 20 });
+    t.bot.refresh(t.s, MATCH);
+    await settle();
+    assert.deepEqual(t.s.words, want, `bag ${bag}`);
+  }
 });
 
 test("sims-only table bids up to the sim cap", async () => {
@@ -1004,4 +1060,66 @@ test("ended matches and foreign auctions are ignored", async () => {
   await settle();
   assert.equal(other.s.bids.length + other.s.words.length, 0);
   assert.equal(letterIndex("E"), 4);
+});
+
+test("the policy given to the constructor reaches every strategy call the bot makes", async () => {
+  const P = (o: Partial<Policy>): Policy => ({ ...DEFAULT_POLICY, ...o });
+  assert.equal(setup("CAT", 30).bot.policy, DEFAULT_POLICY, "no policy: the live one");
+  // decideBid: the duel spot above (40 coins, 71 to go) bids 18; PACE_MIN_DUEL 1 makes it 4 x 1 x 6.
+  const duel = setup("AEINST", 70, "R", { withSim: false, policy: P({ PACE_MIN_DUEL: 1 }) });
+  duel.s.balance(ME, 40);
+  duel.bot.refresh(duel.s, MATCH);
+  await settle();
+  assert.equal(duel.s.bids.at(-1)!.amount, 24n);
+  // chooseWords: a duel cashes QINTARS at once; CASH_MIN_LEN 8 keeps it.
+  const cash = setup("RETAINSQ", 30, "E", { withSim: false, policy: P({ CASH_MIN_LEN: 8 }) });
+  cash.bot.refresh(cash.s, MATCH);
+  await settle();
+  assert.deepEqual(cash.s.words, []);
+  // shouldFlush and flushLeadMs: 3 auctions out still hoards; FLUSH_LEAD_MS 5000 flushes from 4 out.
+  const lead = setup("CATSX", 3, "O", { policy: P({ FLUSH_LEAD_MS: 5000 }) });
+  lead.bot.refresh(lead.s, MATCH);
+  await settle();
+  assert.deepEqual(lead.s.words, ["SAX"]);
+  // alphaFor: every valuation table (current rack and the precomputed ones) uses the policy's LEAVE_ALPHA.
+  const leave = setup("CAT", 30, "S", { policy: P({ LEAVE_ALPHA: 0.5 }) });
+  leave.bot.refresh(leave.s, MATCH);
+  await settle();
+  const vals = [...leave.bot.models.get(String(MATCH))!.vals.keys()];
+  assert.ok(vals.length >= 2 && vals.every((k) => k.endsWith("|0.5")), vals.join(", "));
+  // The first-price price history is capped at 26 x FP_HISTORY_MAX.
+  for (const [max, kept] of [[1, 26], [DEFAULT_POLICY.FP_HISTORY_MAX, 40]] as const) {
+    const fp = setup("CAT", 30, "S", { policy: P({ FP_HISTORY_MAX: max }) });
+    fp.s.matchStates.set(MATCH, { ...fp.s.matchStates.get(MATCH)!, auctionType: { tag: "FirstPrice" } });
+    for (let i = 0; i < 40; i++) {
+      fp.bot.onAuctionResult(fp.s, { auctionId: BigInt(200 + i), matchId: MATCH, letter: "E", winnerBotId: RIVAL, paid: 3n });
+    }
+    assert.equal(fp.bot.fpHistory.length, kept);
+  }
+});
+
+test("lookahead: refines the bid at an all-real Vickrey table, never in a duel or with sims only", async () => {
+  const seated = (rivals: number, o: Partial<Policy>) => {
+    const t = setup("AEINST", 39, "R", { withSim: false, policy: { ...DEFAULT_POLICY, ...o } });
+    for (let k = 0; k < rivals; k++) {
+      const id = 11n + BigInt(k);
+      t.s.bots.set(id, { name: `Rival${id}`, isSimulated: false, strategy: { tag: "Human" } });
+      t.s.participants.push({ matchId: MATCH, botId: id, balance: 100n, score: 0n });
+    }
+    return t;
+  };
+  // Six seats (the focal bot, its rival and four more): the refined bid comes from the lookahead.
+  const on = seated(4, {});
+  on.bot.refresh(on.s, MATCH);
+  await settle();
+  assert.ok(on.logs.some((l) => l.includes("table+look")), "lookahead source logged");
+  // A duel (one rival) is gated out: the same bid as with the lookahead off.
+  const duelOn = setup("AEINST", 87, "R", { withSim: false });
+  duelOn.bot.refresh(duelOn.s, MATCH);
+  await settle();
+  const duelOff = setup("AEINST", 87, "R", { withSim: false, policy: { ...DEFAULT_POLICY, LOOKAHEAD_WEIGHT: 0 } });
+  duelOff.bot.refresh(duelOff.s, MATCH);
+  await settle();
+  assert.equal(duelOn.s.bids.at(-1)!.amount, duelOff.s.bids.at(-1)!.amount);
+  assert.ok(!duelOn.logs.some((l) => l.includes("table+look")));
 });

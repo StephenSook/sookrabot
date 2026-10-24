@@ -6,7 +6,7 @@
   "scripts": {
     "generate": "npm install --prefix ../spacetimedb && spacetime generate --lang typescript --out-dir src/module_bindings --module-path ../spacetimedb",
     "start": "tsx src/index.ts",
-    "test": "node --import tsx --test src/strategy.test.ts src/bot.test.ts src/supervisor.test.ts",
+    "test": "node --import tsx --test src/strategy.test.ts src/bot.test.ts src/supervisor.test.ts src/selfplay.test.ts src/prediction.test.ts",
     "build": "tsc"
   },
   "dependencies": {

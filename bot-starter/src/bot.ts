@@ -27,16 +27,20 @@ import {
   type AuctionKind,
   type BidDecision,
   type Opponent,
+  type Policy,
   type PricePoint,
   type SimStrategy,
-  FP_HISTORY_MAX,
+  DEFAULT_POLICY,
   alphaFor,
   auctionsPerMatch,
   chooseWords,
   decideBid,
   flushLeadMs,
+  sevenCompleterMask,
   shouldFlush,
 } from "./strategy.js";
+import { PoolTracker, lookaheadDelta, lookaheadLambda, poolWeights } from "./pool.js";
+import { scaledEmpirical } from "./empirical.js";
 
 /** Starting rack size when match_state does not carry one (game.ts STARTING_RACK_SIZE). */
 const DEFAULT_RACK_SIZE = 5;
@@ -183,6 +187,8 @@ interface MatchModel {
   lateReplace: number;
   margins: number[];
   recvLags: number[];
+  /** Unseen-pool bookkeeping (pool.ts); fed only while LOOKAHEAD_WEIGHT is on. */
+  pool: PoolTracker;
 }
 
 function newModel(): MatchModel {
@@ -210,6 +216,7 @@ function newModel(): MatchModel {
     lateReplace: 0,
     margins: [],
     recvLags: [],
+    pool: new PoolTracker(),
   };
 }
 
@@ -272,13 +279,34 @@ export class SookraBot {
    * long it had waited by then. Kept across connections: it measures the server.
    */
   private readonly wordLatencies: number[] = [];
+  /**
+   * Per valuation table, the letters that complete a 7+ word on its rack
+   * (sevenCompleterMask), set when the table is made and only while
+   * COMPLETE7_PREMIUM is on, so the bid on an auction's open stays a lookup.
+   */
+  private readonly sevenMasks = new WeakMap<Valuation, number>();
+  /** EMP_DEAD_SCALE's table (empirical.ts), or undefined while that knob is off. */
+  private readonly deadValue: Float64Array | undefined;
 
+  /**
+   * `policy` holds every tuning constant this bot plays with (strategy.ts);
+   * the live bot uses DEFAULT_POLICY, and the self-play harness passes a
+   * variant's here, the one place a variant reaches the bot.
+   */
   constructor(
     private readonly index: WordIndex,
     private readonly name: string,
     private readonly out: Logger = console,
     private readonly now: () => number = Date.now,
-  ) {}
+    readonly policy: Policy = DEFAULT_POLICY,
+  ) {
+    this.deadValue = policy.EMP_DEAD_SCALE > 0 ? scaledEmpirical(policy.EMP_DEAD_SCALE) : undefined;
+  }
+
+  /** The fixed flush rule (FLUSH_LEAD_MS), which valuation alpha and the precomputed tables follow. */
+  private flushAt(bagTotal: number, durationMs: number): boolean {
+    return shouldFlush(bagTotal, durationMs, this.policy.FLUSH_LEAD_MS);
+  }
 
   // ---- logging ----
 
@@ -434,10 +462,12 @@ export class SookraBot {
       model.vals.set(key, hit);
       return hit;
     }
-    const v = valuate(this.index, counts, alpha);
+    const v = valuate(this.index, counts, alpha, "leave", this.policy.EXACT_VALUE_NODES, this.deadValue);
     if (v.ms > SLOW_VALUATION_MS) {
       this.log(`slow valuation: ${v.ms.toFixed(1)} ms for ${v.rackKey.length} tiles`);
     }
+    // valuate packs with keepWeight alpha (its "leave" mode), so the mask counts the same packing.
+    if (this.policy.COMPLETE7_PREMIUM !== 1) this.sevenMasks.set(v, sevenCompleterMask(this.index, v.cands, counts, v.alpha));
     model.vals.set(key, v);
     while (model.vals.size > VAL_CACHE_MAX) {
       const oldest = model.vals.keys().next().value;
@@ -448,16 +478,24 @@ export class SookraBot {
     return v;
   }
 
-  /** Table lookup only: never touches the dictionary. */
-  lookupDelta(matchId: bigint, counts: Counts, alpha: number, letter: string): { delta: number; source: string } {
+  /**
+   * Table lookup only: never touches the dictionary. `val` is the table the
+   * delta comes from when it values exactly this rack ("table", "table-alpha").
+   */
+  lookupDelta(
+    matchId: bigint,
+    counts: Counts,
+    alpha: number,
+    letter: string,
+  ): { delta: number; source: string; val?: Valuation } {
     const model = this.modelFor(matchId);
     const li = letterIndex(letter);
     if (li < 0) return { delta: 0, source: "bad-letter" };
     const rk = countsKey(counts);
     const exact = model.vals.get(`${rk}|${alpha}`);
-    if (exact) return { delta: exact.delta[li], source: "table" };
+    if (exact) return { delta: exact.delta[li], source: "table", val: exact };
     for (const v of model.vals.values()) {
-      if (v.rackKey === rk) return { delta: v.delta[li], source: "table-alpha" };
+      if (v.rackKey === rk) return { delta: v.delta[li], source: "table-alpha", val: v };
     }
     if (model.latest) return { delta: model.latest.delta[li], source: "stale" };
     return { delta: STATIC_DELTA_SCALE * (LEAVE_W7[letter] ?? 0), source: "static" };
@@ -484,10 +522,18 @@ export class SookraBot {
       const opensMs = microsToMs(a.opensAt);
       if (opensMs !== undefined) model.recvLags.push(recvWall - opensMs);
       const bagTotal = Number(m.bagTotal);
-      const alpha = alphaFor(shouldFlush(bagTotal, Number(m.auctionDurationMs)));
+      const alpha = alphaFor(this.flushAt(bagTotal, Number(m.auctionDurationMs)), this.policy, bagTotal);
       const counts = this.effectiveCounts(model, this.rackCounts(conn, a.matchId));
-      const { delta, source } = this.lookupDelta(a.matchId, counts, alpha, a.letter);
-      this.placeBid(conn, model, m, a, Number(me.balance), delta, bagTotal, source, this.opponentsFrom(conn, rows));
+      const { delta, source, val } = this.lookupDelta(a.matchId, counts, alpha, a.letter);
+      this.placeBid(conn, model, m, a, Number(me.balance), delta, bagTotal, source, this.opponentsFrom(conn, rows), val);
+      // After the bid: pool bookkeeping for the lookahead (off by default).
+      if (this.policy.LOOKAHEAD_WEIGHT > 0) {
+        model.pool.noteAuction(String(a.id), letterIndex(a.letter));
+        if (!model.pool.startDecided) {
+          const apm = auctionsPerMatch(rows.length, m.startingRackSize ?? DEFAULT_RACK_SIZE);
+          model.pool.noteStart(bagTotal === apm - 1 ? this.rackCounts(conn, a.matchId) : null);
+        }
+      }
     });
     this.scheduleRefresh(conn, a.matchId);
   }
@@ -513,7 +559,7 @@ export class SookraBot {
     const key = String(matchId);
     if (this.precomputeScheduled.has(key)) return;
     this.precomputeScheduled.add(key);
-    const nextAlpha = alphaFor(shouldFlush(bagTotal - 1, durationMs));
+    const nextAlpha = alphaFor(this.flushAt(bagTotal - 1, durationMs), this.policy, bagTotal - 1);
     const step = (withLetter: boolean) => () =>
       this.guard(`precompute m${key}`, () => {
         if (!this.online) return;
@@ -613,7 +659,7 @@ export class SookraBot {
         const bot = conn.db.bot.id.find(winner);
         if (bot && !bot.isSimulated) {
           this.fpHistory.push({ face: LETTER_VALUE[r.letter] ?? 1, paid: Number(r.paid) });
-          if (this.fpHistory.length > 26 * FP_HISTORY_MAX) this.fpHistory.shift();
+          if (this.fpHistory.length > 26 * this.policy.FP_HISTORY_MAX) this.fpHistory.shift();
         }
       }
       const model = this.models.get(String(r.matchId));
@@ -717,9 +763,10 @@ export class SookraBot {
     const durationMs = Number(m.auctionDurationMs);
     // Valuation keeps the fixed flush rule (so precomputed tables match); only word
     // plays move earlier when this match has seen a network stall (flushLeadMs).
-    const flush = open !== undefined && shouldFlush(bagTotal, durationMs);
-    const flushWords = open !== undefined && (flush || shouldFlush(bagTotal, durationMs, flushLeadMs(model.recvLags)));
-    const alpha = alphaFor(flush);
+    const flush = open !== undefined && this.flushAt(bagTotal, durationMs);
+    const flushWords =
+      open !== undefined && (flush || shouldFlush(bagTotal, durationMs, flushLeadMs(model.recvLags, this.policy)));
+    const alpha = alphaFor(flush, this.policy, bagTotal);
     const balance = Number(me.balance);
 
     let counts = this.effectiveCounts(model, this.rackCounts(conn, matchId));
@@ -734,7 +781,7 @@ export class SookraBot {
     if (val) {
       let played = 0;
       try {
-        played = this.playWords(conn, matchId, model, counts, val, balance, flushWords);
+        played = this.playWords(conn, matchId, model, counts, val, balance, flushWords, bagTotal);
       } catch (err) {
         this.warn("word choice", err);
       }
@@ -752,12 +799,61 @@ export class SookraBot {
     // Without a valuation, keep whatever bid is already live rather than withdraw it.
     if (open && val) {
       const li = letterIndex(open.letter);
+      let delta = li >= 0 ? val.delta[li] : 0;
+      let source = "table";
+      if (li >= 0 && this.lookaheadOn(conn, m, rows)) {
+        const looked = this.lookahead(model, counts, val, open, li, bagTotal, alpha);
+        if (looked !== null) {
+          delta = looked;
+          source = "table+look";
+        }
+      }
       this.placeBid(
-        conn, model, m, open, balance, li >= 0 ? val.delta[li] : 0, bagTotal, "table",
-        this.opponentsFrom(conn, rows),
+        conn, model, m, open, balance, delta, bagTotal, source,
+        this.opponentsFrom(conn, rows), val,
       );
       this.schedulePrecompute(conn, matchId, open.letter, bagTotal, durationMs);
     }
+  }
+
+  /** The lookahead is on (LOOKAHEAD_WEIGHT) and this table passes its gate (Vickrey, LOOKAHEAD_MIN_REAL_RIVALS). */
+  private lookaheadOn(conn: ConnLike, m: MatchStateRow, rows: ParticipantRow[]): boolean {
+    const p = this.policy;
+    if (!(p.LOOKAHEAD_WEIGHT > 0)) return false;
+    if (p.LOOKAHEAD_MIN_REAL_RIVALS <= 0) return true;
+    if (m.auctionType.tag !== "Vickrey") return false;
+    return this.opponentsFrom(conn, rows).filter((o) => !o.isSim).length >= p.LOOKAHEAD_MIN_REAL_RIVALS;
+  }
+
+  /**
+   * One-step lookahead value of the letter on auction (pool.ts), or null when
+   * it does not apply (no future auctions, or the valuation of rack + letter
+   * failed). Values rack + letter at the same alpha (the next precompute
+   * usually finds it cached).
+   */
+  private lookahead(
+    model: MatchModel,
+    counts: Counts,
+    val: Valuation,
+    open: AuctionRow,
+    li: number,
+    bagTotal: number,
+    alpha: number,
+  ): number | null {
+    model.pool.noteAuction(String(open.id), li);
+    const lambda = lookaheadLambda(this.policy.LOOKAHEAD_WEIGHT, bagTotal, this.policy.LOOKAHEAD_HORIZON);
+    if (lambda <= 0) return null;
+    const withX = new Int32Array(counts);
+    withX[li]++;
+    let vx: Valuation;
+    try {
+      vx = this.valuation(model, withX, alpha);
+    } catch (err) {
+      this.warn("lookahead valuation", err);
+      return null;
+    }
+    const w = poolWeights(this.policy.LOOKAHEAD_POOL > 0 ? model.pool.unseen() : null);
+    return lookaheadDelta(val, vx, li, w, lambda);
   }
 
   private playWords(
@@ -768,6 +864,7 @@ export class SookraBot {
     val: Valuation,
     balance: number,
     flush: boolean,
+    bagTotal?: number,
   ): number {
     if (this.index.size === 0) return 0;
     if (this.now() < model.wordBackoffUntil) return 0;
@@ -783,6 +880,8 @@ export class SookraBot {
       flush,
       alpha: val.alpha,
       realRivals: this.opponents(conn, matchId).filter((o) => !o.isSim).length,
+      bagTotal,
+      policy: this.policy,
     }).filter((w) => (model.wordFailures.get(w) ?? 0) < MAX_WORD_FAILURES);
     for (const w of words) this.submitWord(conn, matchId, model, w, flush);
     return words.length;
@@ -833,8 +932,18 @@ export class SookraBot {
     bagTotal: number,
     source: string,
     opponents: Opponent[],
+    val?: Valuation,
   ) {
     const key = String(auction.id);
+    // What the round 2 levers read about this letter on this rack, only while they are on
+    // (`val`: the table of exactly this rack the delta comes from, else nothing is known).
+    const extras: { completes7?: boolean; leaveAlpha?: number } = {};
+    if (val !== undefined) {
+      const li = letterIndex(auction.letter);
+      const mask = this.policy.COMPLETE7_PREMIUM !== 1 ? this.sevenMasks.get(val) : undefined;
+      if (mask !== undefined && li >= 0) extras.completes7 = ((mask >>> li) & 1) === 1;
+      if (this.policy.DEAD_KAPPA_SCALE !== 1) extras.leaveAlpha = val.alpha;
+    }
     let decision: BidDecision;
     try {
       decision = decideBid({
@@ -846,6 +955,8 @@ export class SookraBot {
         opponents,
         fpHistory: this.fpHistory,
         auctionsPerMatch: auctionsPerMatch(opponents.length + 1, m.startingRackSize ?? DEFAULT_RACK_SIZE),
+        policy: this.policy,
+        ...extras,
       });
     } catch (err) {
       this.warn("decideBid", err);
