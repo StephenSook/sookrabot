@@ -63,9 +63,9 @@ export const PACE_MIN_DUEL = 0.75;
 /**
  * Base kappa while pacing (in place of KAPPA, which stays the kappa of the
  * unpaced rule and of the Python cross-check), still doubled in the last
- * ENDGAME_AUCTIONS auctions.
+ * ENDGAME_AUCTIONS auctions. 3.8 (from 4) with EARLY_KAPPA_SCALE 0.55: see there.
  */
-export const PACED_KAPPA = 4;
+export const PACED_KAPPA = 3.8;
 /**
  * Early bid cut while pacing: in the first EARLY_AUCTIONS auctions of a match
  * (auction index auctionsPerMatch - 1 - bagTotal), kappa is multiplied by
@@ -90,9 +90,20 @@ export const PACED_KAPPA = 4;
  * alone gained 1.0; with two real rivals and three sims the tuned rules gained
  * 5.6 (pad-ls-code, t 3.0), 2.0 without the cut. A casual lobby can be padded
  * with sims, and an admin can enter sims into a tournament (registerSimBots).
+ *
+ * Round 3 retune on top of the one-step lookahead (db7be7e as head), paired
+ * cloud self-play, calibrated v5 rivals: EARLY_KAPPA_SCALE 0.55 with
+ * PACED_KAPPA 3.8 (from 0.4 and 4), seeds 8301 and 8401, 600 matches a field:
+ * 6-seat Vickrey (field, mixed, field/top5 with ,smart rivals; 3000 paired)
+ * +4.2 points (95% CI +3.2 to +5.1), place -0.11 (CI -0.14 to -0.08); the
+ * top-five table (1800) +3.3 (CI +2.3 to +4.4), place -0.16; 8 seats (1200)
+ * +1.7, place -0.12; 3, 4 and 5 seats +13.1, +7.3, +6.3; 6-seat first price
+ * +6.1; duels (postturing, Dante; 1200) +4.2 (CI +0.05 to +8.4). With the
+ * lookahead the 0.4 cut is too deep: 0.3 lost 2 to 9 points everywhere (seed
+ * 8101), 0.5 to 0.65 all gained at 6 seats, 0.75 gained nothing.
  */
 export const EARLY_AUCTIONS = 28;
-export const EARLY_KAPPA_SCALE = 0.4;
+export const EARLY_KAPPA_SCALE = 0.55;
 export const EARLY_MIN_REAL_RIVALS = 2;
 /** Every bot starts a match with this balance (game.ts STARTING_BALANCE). */
 export const STARTING_BALANCE = 100;
@@ -301,6 +312,36 @@ export const LOOKAHEAD_MIN_REAL_RIVALS = 2;
  */
 export const EMP_DEAD_SCALE = 0;
 
+// Round 3 knobs, off by default.
+
+/**
+ * MLOOK_M: the refined bid values the letter on auction by the multi-letter
+ * lookahead (pool.ts multiLookDelta), its mean marginal value on the rack plus
+ * m = min(MLOOK_M, floor(bagTotal x MLOOK_RATE)) more letters drawn from the
+ * unseen pool, over MLOOK_SAMPLES draws, at leave weight alpha x
+ * MLOOK_ALPHA_SCALE: a sampled estimate of the odds that the pool completes a
+ * word (7+ letters included) with this letter within the letters still to be
+ * won. MLOOK_TILT draws letter e with weight pool_e x (delta_R(e) / mean
+ * delta_R)^MLOOK_TILT (0: as the pool), since we win the letters we bid high
+ * on. Same gate as the one-step lookahead (LOOKAHEAD_WEIGHT,
+ * LOOKAHEAD_MIN_REAL_RIVALS); where m < 2 the one-step lookahead applies; with
+ * LOOKAHEAD_POOL 0 the draws come from the full bag instead. 0: off.
+ */
+export const MLOOK_M = 0;
+export const MLOOK_RATE = 0.2;
+export const MLOOK_SAMPLES = 16;
+export const MLOOK_ALPHA_SCALE = 1;
+export const MLOOK_TILT = 0;
+/**
+ * SPEND_FLOOR: every value bid (paced, Vickrey, at tables of at least
+ * SPEND_FLOOR_MIN_REAL_RIVALS real rivals) is raised by
+ * floor(SPEND_FLOOR x balance / auctions left including this one), an even
+ * share of the purse, so letters nobody else wants are bought at the
+ * runner-up price (the rival gaucho bot's tuned pace term, 0.738). 0: off.
+ */
+export const SPEND_FLOOR = 0;
+export const SPEND_FLOOR_MIN_REAL_RIVALS = 2;
+
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
  * (STARTING_BALANCE, BAG_TILES, SIM_BID_JITTER) and the network-stall bounds of
@@ -350,6 +391,13 @@ export interface Policy {
   readonly LOOKAHEAD_POOL: number;
   readonly LOOKAHEAD_MIN_REAL_RIVALS: number;
   readonly EMP_DEAD_SCALE: number;
+  readonly MLOOK_M: number;
+  readonly MLOOK_RATE: number;
+  readonly MLOOK_SAMPLES: number;
+  readonly MLOOK_ALPHA_SCALE: number;
+  readonly MLOOK_TILT: number;
+  readonly SPEND_FLOOR: number;
+  readonly SPEND_FLOOR_MIN_REAL_RIVALS: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -397,6 +445,13 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   LOOKAHEAD_POOL,
   LOOKAHEAD_MIN_REAL_RIVALS,
   EMP_DEAD_SCALE,
+  MLOOK_M,
+  MLOOK_RATE,
+  MLOOK_SAMPLES,
+  MLOOK_ALPHA_SCALE,
+  MLOOK_TILT,
+  SPEND_FLOOR,
+  SPEND_FLOOR_MIN_REAL_RIVALS,
 });
 
 // ---- Types ----
@@ -705,6 +760,19 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
     if (raised > full) {
       full = raised;
       tag += ` c7 x${p.COMPLETE7_PREMIUM}`;
+    }
+  }
+  // Round 3 lever, off by default (SPEND_FLOOR 0): an additive spend floor per auction.
+  if (
+    p.SPEND_FLOOR > 0 &&
+    paced &&
+    input.auctionType === "Vickrey" &&
+    realRivals >= p.SPEND_FLOOR_MIN_REAL_RIVALS
+  ) {
+    const add = Math.floor((p.SPEND_FLOOR * balance) / (input.bagTotal + 1));
+    if (add > 0) {
+      full += add;
+      tag += ` floor+${add}`;
     }
   }
 

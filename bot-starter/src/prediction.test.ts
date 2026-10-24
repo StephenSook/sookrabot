@@ -3,7 +3,16 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import { test } from "node:test";
 import { WordIndex, countsOf, valuate, wordReward } from "./engine.js";
-import { BAG_COUNTS, PoolTracker, lookaheadDelta, lookaheadLambda, poolWeights } from "./pool.js";
+import {
+  BAG_COUNTS,
+  PoolTracker,
+  hashSeed,
+  lookaheadDelta,
+  lookaheadLambda,
+  mulberry32,
+  multiLookDelta,
+  poolWeights,
+} from "./pool.js";
 import { DEFAULT_POLICY } from "./strategy.js";
 
 const WORDLIST = fs
@@ -103,4 +112,58 @@ test("lookahead: on and gated by default, ramps to 0 at the end", () => {
   const vu = valuate(INDEX, withU, 0.35);
   const w = poolWeights(null);
   assert.ok(lookaheadDelta(base, vu, 20, w, 1) >= 0);
+});
+
+test("multi-letter lookahead: off by default, seeded, at or above the leave floor, and m 0 values the rack alone", () => {
+  assert.equal(DEFAULT_POLICY.MLOOK_M, 0);
+  const rack = countsOf("EINST");
+  const pool = new Int32Array(BAG_COUNTS);
+  for (let i = 0; i < 26; i++) pool[i] -= rack[i];
+  const li = 0; // A
+  const a = multiLookDelta(INDEX, rack, li, pool, 6, 12, 0.35, mulberry32(hashSeed("k")));
+  const b = multiLookDelta(INDEX, rack, li, pool, 6, 12, 0.35, mulberry32(hashSeed("k")));
+  assert.equal(a, b);
+  assert.ok(a >= 0.35 * 6.38 - 1e-9);
+  const plain = valuate(INDEX, rack, 0.35).delta[li];
+  assert.ok(Math.abs(multiLookDelta(INDEX, rack, li, pool, 0, 12, 0.35, mulberry32(1)) - plain) < 1e-9);
+  // A tilt of 0 on every letter but one draws only that letter (pool permitting).
+  const tilt = new Float64Array(26);
+  tilt[17] = 1; // R
+  const onlyR = new Int32Array(rack);
+  onlyR[17] += 2;
+  const viaTilt = multiLookDelta(INDEX, rack, li, pool, 2, 3, 0.35, mulberry32(9), tilt);
+  assert.ok(Math.abs(viaTilt - valuate(INDEX, onlyR, 0.35).delta[li]) < 1e-9);
+});
+
+test("unseen pool: rivals' hidden starting tiles need no correction for the next letter's odds, only for 'ever appears'", () => {
+  // Late state: 10 auctions to come at a 6-seat table, so 25 rival starting tiles are hidden among the
+  // unseen tiles and never auctioned. Split the unseen tiles at random into those 25 and the bag
+  // (exchangeable deal): the next auctioned letter is a uniform bag tile.
+  const unseen = new Int32Array(26);
+  unseen[25] = 1; // one Z
+  unseen[4] = 12; // E
+  unseen[0] = 9; // A
+  unseen[18] = 13; // S: 35 unseen in all
+  const total = 35;
+  const bagLeft = 10;
+  const tiles: number[] = [];
+  for (let i = 0; i < 26; i++) for (let j = 0; j < unseen[i]; j++) tiles.push(i);
+  const rnd = mulberry32(2024);
+  const next = new Float64Array(26);
+  let zAppears = 0;
+  const N = 20000;
+  for (let t = 0; t < N; t++) {
+    const d = [...tiles];
+    for (let i = d.length - 1; i > 0; i--) {
+      const j = Math.floor(rnd() * (i + 1));
+      [d[i], d[j]] = [d[j], d[i]];
+    }
+    const bag = d.slice(0, bagLeft); // the rest are the rivals' hidden tiles
+    next[bag[0]]++;
+    if (bag.includes(25)) zAppears++;
+  }
+  const w = poolWeights(unseen); // what the one-step lookahead weights the next letter by
+  for (let i = 0; i < 26; i++) assert.ok(Math.abs(next[i] / N - w[i]) < 0.012, `letter ${i}`);
+  // A specific unseen tile comes up with probability bagLeft / unseen, not 1 (0.29 here).
+  assert.ok(Math.abs(zAppears / N - bagLeft / total) < 0.015);
 });

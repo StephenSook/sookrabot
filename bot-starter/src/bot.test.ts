@@ -913,18 +913,18 @@ test("duel: a cash-poor bot's paced bid is held at PACE_MIN_DUEL (the 3-game fin
   const delta = valuate(INDEX, countsOf("AEINST"), LEAVE_ALPHA).delta[letterIndex("R")];
   assert.equal(delta, 6);
   assert.equal(s.bids.length, 1);
-  assert.equal(s.bids[0].amount, BigInt(Math.floor(PACED_KAPPA * PACE_MIN_DUEL * delta))); // 18
-  assert.ok(logs.some((l) => l.includes("'R' bag 70: bid 18 (value 6.00")));
-  // With a sim seated (3 bots, 83 auctions) there is no duel floor: 4 x sqrt(40 / 71 / (100 / 83)) x 6 = 16.
+  assert.equal(s.bids[0].amount, BigInt(Math.floor(PACED_KAPPA * PACE_MIN_DUEL * delta))); // 17
+  assert.ok(logs.some((l) => l.includes("'R' bag 70: bid 17 (value 6.00")), "bid 17 logged");
+  // With a sim seated (3 bots, 83 auctions) there is no duel floor: 3.8 x sqrt(40 / 71 / (100 / 83)) x 6 = 15.6.
   // Auction index 12 is inside the early window, but one real rival is not enough for the cut (sims do not count).
   const three = setup("AEINST", 70, "R");
   three.s.balance(ME, 40);
   three.bot.refresh(three.s, MATCH);
   await settle();
-  assert.equal(three.s.bids.at(-1)!.amount, 16n);
+  assert.equal(three.s.bids.at(-1)!.amount, 15n);
 });
 
-test("early bid cut: a six-bot all-real table bids 0.4 of the paced kappa for 28 auctions; a duel is exempt", async () => {
+test("early bid cut: a six-bot all-real table bids 0.55 of the paced kappa for 28 auctions; a duel is exempt", async () => {
   // Six seats with 5-tile racks: 68 auctions. AEINST values R at 6. The lookahead is off here: this checks
   // the 5318ca6 rules it refines (the lookahead's own test follows).
   const six = setup("AEINST", 67, "R", { withSim: false, policy: { ...DEFAULT_POLICY, LOOKAHEAD_WEIGHT: 0 } });
@@ -934,20 +934,20 @@ test("early bid cut: a six-bot all-real table bids 0.4 of the paced kappa for 28
   }
   six.bot.refresh(six.s, MATCH);
   await settle();
-  // First auction (index 0), even spend: kappa 4 x 0.4 = 1.6, floor(1.6 x 6) = 9 (24 without the cut).
-  assert.equal(six.s.bids.at(-1)!.amount, 9n);
-  // Index 28 (39 auctions to come), still 100 coins: past the window, 4 x sqrt(1.7) = 5.215, so 31.
+  // First auction (index 0), even spend: kappa 3.8 x 0.55 = 2.09, floor(2.09 x 6) = 12 (22 without the cut).
+  assert.equal(six.s.bids.at(-1)!.amount, 12n);
+  // Index 28 (39 auctions to come), still 100 coins: past the window, 3.8 x sqrt(1.7) = 4.955, so 29.
   six.s.nextAuction(AUCTION + 1n, "R", 39);
   six.bot.refresh(six.s, MATCH);
   await settle();
   assert.equal(six.s.bids.at(-1)!.auctionId, AUCTION + 1n);
-  assert.equal(six.s.bids.at(-1)!.amount, 31n);
-  // A duel's first auction (88 auctions) keeps the full paced kappa: 4 x 6 = 24.
+  assert.equal(six.s.bids.at(-1)!.amount, 29n);
+  // A duel's first auction (88 auctions) keeps the full paced kappa: 3.8 x 6 = 22.8, so 22.
   const duel = setup("AEINST", 87, "R", { withSim: false });
   duel.bot.refresh(duel.s, MATCH);
   await settle();
-  assert.equal(duel.s.bids.at(-1)!.amount, 24n);
-  // So does a six-seat table of one real rival and four sims (sims do not count toward the cut): 24.
+  assert.equal(duel.s.bids.at(-1)!.amount, 22n);
+  // So does a six-seat table of one real rival and four sims (sims do not count toward the cut): 22.
   const padded = setup("AEINST", 67, "R");
   for (const id of [21n, 22n, 23n]) {
     padded.s.bots.set(id, { name: `Sim${id}`, isSimulated: true, strategy: { tag: "Cheapskate" } });
@@ -955,7 +955,7 @@ test("early bid cut: a six-bot all-real table bids 0.4 of the paced kappa for 28
   }
   padded.bot.refresh(padded.s, MATCH);
   await settle();
-  assert.equal(padded.s.bids.at(-1)!.amount, 24n);
+  assert.equal(padded.s.bids.at(-1)!.amount, 22n);
 });
 
 test("round 2 levers reach the bot: a 7+ completer bid, a dead-letter bid and held words cashed when broke or late", async () => {
@@ -968,28 +968,28 @@ test("round 2 levers reach the bot: a 7+ completer bid, a dead-letter bid and he
     }
     return t;
   };
-  // AEINST + R spells RETAINS. Index 28 (39 to come): kappa 4 x sqrt(1.7) = 5.2154, x 6 = 31; COMPLETE7_PREMIUM 2
-  // doubles it, and a cap of 40% of the balance stops the raise at 40.
-  for (const [o, want] of [[undefined, 31n], [{ COMPLETE7_PREMIUM: 2 }, 62n], [{ COMPLETE7_PREMIUM: 2, COMPLETE7_CAP_SHARE: 0.4 }, 40n]] as const) {
+  // AEINST + R spells RETAINS. Index 28 (39 to come): kappa 3.8 x sqrt(1.7) = 4.9546, x 6 = 29; COMPLETE7_PREMIUM 2
+  // doubles it (59), and a cap of 40% of the balance stops the raise at 40.
+  for (const [o, want] of [[undefined, 29n], [{ COMPLETE7_PREMIUM: 2 }, 59n], [{ COMPLETE7_PREMIUM: 2, COMPLETE7_CAP_SHARE: 0.4 }, 40n]] as const) {
     const t = six("AEINST", 39, "R", o);
     t.bot.refresh(t.s, MATCH);
     await settle();
     assert.equal(t.s.bids.at(-1)!.amount, want, JSON.stringify(o));
     // The next auction's bid goes out from the table on open, before any deferred work, premium included
-    // (index 29: kappa 4 x sqrt(100 / 39 / (100 / 68)) = 5.2818, x 6 = 31; doubled 63; capped 40).
+    // (index 29: kappa 3.8 x sqrt(100 / 39 / (100 / 68)) = 5.0177, x 6 = 30; doubled 60; capped 40).
     const k = pacedKappa(38, 100, 68);
     const plain = Math.floor(k * 6);
     const cap = Math.floor((o && "COMPLETE7_CAP_SHARE" in o ? o.COMPLETE7_CAP_SHARE : 1) * 100);
     const onOpen = o ? Math.max(plain, Math.min(Math.floor(k * 2 * 6), cap)) : plain;
-    assert.deepEqual([plain, onOpen], o === undefined ? [31, 31] : "COMPLETE7_CAP_SHARE" in o ? [31, 40] : [31, 63]);
+    assert.deepEqual([plain, onOpen], o === undefined ? [30, 30] : "COMPLETE7_CAP_SHARE" in o ? [30, 40] : [30, 60]);
     const before = t.s.bids.length;
     t.bot.onAuctionOpen(t.s, t.s.nextAuction(AUCTION + 1n, "R", 38));
     assert.equal(t.s.bids.length, before + 1, "bid on open");
     assert.equal(t.s.bids.at(-1)!.amount, BigInt(onOpen), `on open ${JSON.stringify(o)}`);
     await settle();
   }
-  // VG + B: B joins no word, so its value is its leave value, 0.35 x 6.75 = 2.3625: 5.2154 x 2.3625 = 12, x 0.5 = 6.
-  for (const [o, want] of [[undefined, 12n], [{ DEAD_KAPPA_SCALE: 0.5 }, 6n], [{ DEAD_KAPPA_SCALE: 1.5 }, 18n]] as const) {
+  // VG + B: B joins no word, so its value is its leave value, 0.35 x 6.75 = 2.3625: 4.9546 x 2.3625 = 11, x 0.5 = 5.
+  for (const [o, want] of [[undefined, 11n], [{ DEAD_KAPPA_SCALE: 0.5 }, 5n], [{ DEAD_KAPPA_SCALE: 1.5 }, 17n]] as const) {
     const t = six("VG", 39, "B", o);
     t.bot.refresh(t.s, MATCH);
     await settle();
@@ -1065,12 +1065,12 @@ test("ended matches and foreign auctions are ignored", async () => {
 test("the policy given to the constructor reaches every strategy call the bot makes", async () => {
   const P = (o: Partial<Policy>): Policy => ({ ...DEFAULT_POLICY, ...o });
   assert.equal(setup("CAT", 30).bot.policy, DEFAULT_POLICY, "no policy: the live one");
-  // decideBid: the duel spot above (40 coins, 71 to go) bids 18; PACE_MIN_DUEL 1 makes it 4 x 1 x 6.
+  // decideBid: the duel spot above (40 coins, 71 to go) bids 17; PACE_MIN_DUEL 1 makes it 3.8 x 1 x 6 = 22.8.
   const duel = setup("AEINST", 70, "R", { withSim: false, policy: P({ PACE_MIN_DUEL: 1 }) });
   duel.s.balance(ME, 40);
   duel.bot.refresh(duel.s, MATCH);
   await settle();
-  assert.equal(duel.s.bids.at(-1)!.amount, 24n);
+  assert.equal(duel.s.bids.at(-1)!.amount, 22n);
   // chooseWords: a duel cashes QINTARS at once; CASH_MIN_LEN 8 keeps it.
   const cash = setup("RETAINSQ", 30, "E", { withSim: false, policy: P({ CASH_MIN_LEN: 8 }) });
   cash.bot.refresh(cash.s, MATCH);
