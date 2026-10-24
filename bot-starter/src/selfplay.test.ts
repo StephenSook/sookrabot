@@ -268,9 +268,9 @@ test("self-play: shards merge into exactly the unsharded run", async () => {
   }
 });
 
-test("fixture v5: the 51 earlier entries are byte-identical, every v5 rival comes as -v5, -v5c, -v5u and -v5p", () => {
+test("fixture v5: the 51 earlier entries are byte-identical, every v5 rival comes as -v5, -v5c, -v5u, -v5p, -v5g", () => {
   const fixture = JSON.parse(fs.readFileSync(new URL("./fixtures/rival-models.json", import.meta.url), "utf8")).rivals;
-  const old = Object.keys(fixture).filter((n) => !/-v5[cup]?$/.test(n));
+  const old = Object.keys(fixture).filter((n) => !/-v5[cupg]?$/.test(n));
   assert.equal(old.length, 51);
   // sha256 of "name=JSON" lines of the 51 entries as they were before the v5 refit (harness-sync 405aec0).
   const hash = crypto.createHash("sha256").update(old.map((n) => `${n}=${JSON.stringify(fixture[n])}`).join("\n")).digest("hex");
@@ -278,9 +278,12 @@ test("fixture v5: the 51 earlier entries are byte-identical, every v5 rival come
   const live = JSON.parse(fs.readFileSync(new URL("./fixtures/rival-live-v5.json", import.meta.url), "utf8"));
   const stems = Object.keys(live.rivals);
   assert.equal(stems.length, 35);
-  assert.equal(Object.keys(fixture).length, 51 + 4 * 35);
+  assert.equal(Object.keys(fixture).length, 51 + 5 * 35);
   for (const stem of stems) {
-    for (const e of ["v5", "v5c", "v5u", "v5p"]) assert.ok(fixture[`${stem}-${e}`], `${stem}-${e}`);
+    for (const e of ["v5", "v5c", "v5u", "v5p", "v5g"]) assert.ok(fixture[`${stem}-${e}`], `${stem}-${e}`);
+    const g = fixture[`${stem}-v5g`];
+    assert.deepEqual(Object.keys(g.gainCells).sort(), [1, 4, 7, 10].flatMap((x) => [0, 1, 2, 3, 4].map((b) => `g${x}|${b}`)).sort());
+    assert.equal(g.rho, 0, `${stem}-v5g has no copula`);
     assert.equal(fixture[`${stem}-v5`].complete7, undefined, `${stem}-v5 is the existing format`);
     assert.equal(fixture[`${stem}-v5c`].dead, undefined, `${stem}-v5c has no dead runs`);
     assert.ok(Object.keys(fixture[`${stem}-v5u`].dead ?? {}).length >= 1, `${stem}-v5u has dead runs`);
@@ -298,7 +301,7 @@ test("fixture v5: the 51 earlier entries are byte-identical, every v5 rival come
   }
 });
 
-test("rackMasks: one scan answers which letters complete a 7+ word and which add to the greedy pack value", () => {
+test("rackMasks: one scan answers which letters complete a 7+ word and what each adds to the greedy pack value", () => {
   const index = WordIndex.fromWords(fs.readFileSync(new URL("../../spacetimedb/wordlist.txt", import.meta.url), "utf8").split("\n"));
   const bag = Object.entries(RULES.BAG).flatMap(([c, k]) => Array<string>(k).fill(c));
   let seed = 777;
@@ -309,15 +312,17 @@ test("rackMasks: one scan answers which letters complete a 7+ word and which add
   for (let r = 0; r < 30; r++) {
     const rack = Array.from({ length: 3 + Math.floor(rnd() * 9) }, () => bag[Math.floor(rnd() * bag.length)]).join("");
     const counts = countsOf(rack);
-    const [c7, use] = rackMasks(index, counts);
+    const masks = rackMasks(index, counts);
+    const [c7, use, gains] = masks;
     assert.equal(c7, sevenCompleters(index, counts), rack);
-    assert.deepEqual(rackMasks(index, countsOf(rack)), [c7, use], `${rack}: cached`);
+    assert.equal(rackMasks(index, countsOf(rack)), masks, `${rack}: cached`);
     const base = pack(counts);
     for (const letter of "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
       const plus = new Int32Array(counts);
       plus[letterIndex(letter)]++;
       const isUseful = pack(plus) > base;
       assert.equal(((use >>> letterIndex(letter)) & 1) === 1, isUseful, `${rack} + ${letter}`);
+      assert.equal(gains[letterIndex(letter)], pack(plus) - base, `${rack} + ${letter}: gain`);
       if (isUseful) useful++;
       else dead++;
     }
