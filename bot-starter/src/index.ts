@@ -18,7 +18,8 @@
 // itself can register, so this has to come from the bot's process.
 //
 // Strategy: src/strategy.ts (bids, word policy), src/engine.ts (valuation),
-// src/bot.ts (per-match loop), src/supervisor.ts (connection readiness).
+// src/bot.ts (per-match loop), src/supervisor.ts (connection readiness),
+// src/lifecycle.ts (building and replacing connection objects).
 // This file only connects and wires events. Every auction this bot sees in
 // its own matches is appended as one JSON line to
 // sookra-<BOT_NAME>.auctions.log (gitignored by *.log).
@@ -33,7 +34,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { WordIndex } from "./engine.js";
 import { SookraBot, type ConnLike } from "./bot.js";
-import { Supervisor } from "./supervisor.js";
+import { Supervisor, realScheduler } from "./supervisor.js";
+import { ConnectionLifecycle } from "./lifecycle.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -45,10 +47,6 @@ const TOKEN_PATH = path.join(process.cwd(), `.token-${BOT_NAME}`);
 const AUCTION_LOG_PATH = path.join(process.cwd(), `sookra-${BOT_NAME}.auctions.log`);
 /** Re-check running matches (and the watchdog) this often. */
 const TICK_MS = 250;
-/** Retry delay when a connection fails and the SDK will not retry it. */
-const INITIAL_RETRY_MS = 5000;
-/** Delay before building a new connection after dropping one ourselves. */
-const REPLACE_DELAY_MS = 1000;
 
 function loadToken(): string | undefined {
   try {
@@ -93,22 +91,31 @@ bot.onRecord = (rec) => {
 
 let myIdentity: Identity | null = null;
 let tickTimer: ReturnType<typeof setInterval> | null = null;
-/** The DbConnection being supervised (null while a replacement is pending). */
-let currentConn: DbConnection | null = null;
-/** Set once that connection's subscription is applied; used by the tick. */
+/** Set once the current connection's subscription is applied; used by the tick. */
 let activeConn: ConnLike | null = null;
-let restartPending = false;
 
 const supervisor = new Supervisor({
   setOnline: (online) => {
     bot.online = online;
   },
   resubscribe: () => {
-    if (currentConn) subscribe(currentConn, supervisor.conn);
+    if (lifecycle.current) subscribe(lifecycle.current, supervisor.conn);
   },
-  reconnect: (why) => replaceConnection(why),
+  reconnect: (why) => lifecycle.replace(why),
   log: (msg) => console.log(`[${BOT_NAME}] ${msg}`),
 });
+const lifecycle: ConnectionLifecycle<DbConnection> = new ConnectionLifecycle<DbConnection>(
+  supervisor,
+  {
+    build: buildConnection,
+    deactivate: () => {
+      activeConn = null;
+    },
+    log: (msg) => console.error(`[${BOT_NAME}] ${msg}`),
+    warn: (what, err) => bot.warn(what, err),
+  },
+  realScheduler,
+);
 // A word call that is never answered: replace the connection the bot acts on.
 // Dropping it fails its in-flight calls, and the new connection's rack decides
 // whether the play happened.
@@ -139,30 +146,6 @@ function logFailure(what: string) {
 
 function asConn(conn: DbConnection): ConnLike {
   return conn;
-}
-
-/** Start a fresh connection after a delay (deduplicated). */
-function restartLater(why: string, delayMs = INITIAL_RETRY_MS) {
-  if (restartPending) return;
-  restartPending = true;
-  console.error(`[${BOT_NAME}] ${why}; new connection in ${delayMs} ms`);
-  setTimeout(() => {
-    restartPending = false;
-    main();
-  }, delayMs);
-}
-
-/** Drop the current connection (stopping its automatic reconnects) and build a new one. */
-function replaceConnection(why: string) {
-  const old = currentConn;
-  currentConn = null;
-  activeConn = null;
-  restartLater(`${why}; replacing the connection`, REPLACE_DELAY_MS);
-  try {
-    old?.disconnect();
-  } catch (err) {
-    bot.warn("disconnect", err);
-  }
 }
 
 /** Subscribe (again) on a connection; readiness comes only from onApplied. */
@@ -224,12 +207,8 @@ function onApplied(conn: DbConnection, id: number) {
   bootstrapActivity(conn);
 }
 
+/** The handshake of the current connection (lifecycle.accept has checked it). */
 function onConnect(conn: DbConnection, identity: Identity, token: string, id: number) {
-  if (id !== supervisor.conn) {
-    conn.disconnect(); // superseded while connecting
-    return;
-  }
-  currentConn = conn;
   myIdentity = identity;
   saveToken(token);
   console.log(`[${BOT_NAME}] connected as ${identity.toHexString()} (connection ${id})`);
@@ -324,15 +303,17 @@ function bootstrapActivity(conn: DbConnection) {
   }
 }
 
-function main() {
-  const id = supervisor.newConnection(); // pauses the bot until this connection's subscription applies
+/** The lifecycle's build hook: a connection whose events all report `id`. */
+function buildConnection(id: number): DbConnection {
   console.log(`[${BOT_NAME}] connecting to ${DB_NAME} at ${HOST} (connection ${id})`);
-  DbConnection.builder()
+  return DbConnection.builder()
     .withUri(HOST)
     .withDatabaseName(DB_NAME)
     .withToken(BOT_TOKEN ?? loadToken())
     .withAutomaticReconnect({ minDelayMs: 1000, maxDelayMs: 10_000 })
-    .onConnect((conn, identity, token) => onConnect(conn, identity, token, id))
+    .onConnect((conn, identity, token) => {
+      if (lifecycle.accept(conn, id)) onConnect(conn, identity, token, id);
+    })
     .onAutomaticReconnect(() => {
       console.log(`[${BOT_NAME}] reconnected (connection ${id}); waiting for subscription replay`);
       supervisor.onAutomaticReconnect(id);
@@ -344,7 +325,7 @@ function main() {
             (nextAttempt !== undefined ? ` (retry ${nextAttempt} in ${nextDelayMs} ms)` : ""),
         );
         if (id === supervisor.conn && nextAttempt === undefined) {
-          restartLater("connection failed with no retry scheduled");
+          lifecycle.restartLater("connection failed with no retry scheduled");
         }
       },
     )
@@ -358,10 +339,10 @@ function main() {
       );
       if (id === supervisor.conn && nextAttempt === undefined) {
         activeConn = null;
-        restartLater("disconnected with no retry scheduled");
+        lifecycle.restartLater("disconnected with no retry scheduled");
       }
     })
     .build();
 }
 
-main();
+lifecycle.start();

@@ -8,10 +8,11 @@
 // connection. Every subscription attempt (first, retry, replay) has a
 // deadline, and so does every drop the SDK retries (from the disconnect
 // through the handshake to the replay), so the bot is never left offline
-// with nothing armed to recover it. Timers are bound to the connection id and
-// to an epoch that changes on every readiness transition, so a timer armed
-// for an earlier outage or an earlier connection can never act later, and no
-// timer ever marks the bot ready.
+// with nothing armed to recover it. Asking for a replacement retires the old
+// connection's id at once, so nothing it raises later is acted on. Timers are
+// bound to the connection id and to an epoch that changes on every readiness
+// transition, so a timer armed for an earlier outage or an earlier connection
+// can never act later, and no timer ever marks the bot ready.
 
 export interface Scheduler {
   setTimeout(fn: () => void, ms: number): unknown;
@@ -65,8 +66,14 @@ export const realScheduler: Scheduler = {
 };
 
 export class Supervisor {
-  /** Id of the current DbConnection; events from older ones are ignored. */
+  /**
+   * Id of the current DbConnection; events from older ones are ignored. It
+   * moves on as soon as a replacement is requested, before the replacement
+   * exists, so the connection being replaced can never be accepted again.
+   */
   conn = 0;
+  /** conn already moved past a connection being replaced; the next newConnection() takes it. */
+  private retired = false;
   /** Changes on every readiness transition; stale timers check it (and conn) and do nothing. */
   epoch = 0;
   ready = false;
@@ -85,7 +92,8 @@ export class Supervisor {
 
   /** A new DbConnection is about to be built; returns the id its callbacks must report. */
   newConnection(): number {
-    this.conn++;
+    if (this.retired) this.retired = false;
+    else this.conn++;
     this.resubAttempts = 0;
     this.transition(false);
     // Covers connecting and the first subscription: neither may hang forever.
@@ -137,7 +145,7 @@ export class Supervisor {
     this.resubAttempts++;
     const msg = err instanceof Error ? err.message : String(err);
     if (this.resubAttempts > MAX_RESUBSCRIBE_ATTEMPTS) {
-      this.hooks.reconnect(`subscription failed ${this.resubAttempts} times (${msg})`);
+      this.replace(`subscription failed ${this.resubAttempts} times (${msg})`);
       return;
     }
     const delay = Math.min(RESUBSCRIBE_MAX_MS, RESUBSCRIBE_BASE_MS * 2 ** (this.resubAttempts - 1));
@@ -161,8 +169,7 @@ export class Supervisor {
     if (conn !== this.conn || !this.ready || !inRunningMatch) return;
     const limit = Math.max(WATCHDOG_MIN_MS, WATCHDOG_AUCTIONS * (auctionMs > 0 ? auctionMs : 1000));
     if (this.sched.now() - this.lastAuctionAt > limit) {
-      this.transition(false);
-      this.hooks.reconnect(`no auction event for ${limit} ms during a running match`);
+      this.replace(`no auction event for ${limit} ms during a running match`);
     }
   }
 
@@ -173,8 +180,22 @@ export class Supervisor {
    */
   reportStuck(conn: number, reason: string) {
     if (conn !== this.conn || !this.ready) return;
+    this.replace(reason);
+  }
+
+  /**
+   * Pause the bot and ask for the connection to be replaced. Its id is
+   * retired first, so from now on its events (a late handshake, an applied
+   * subscription, a replay) are ignored here and in index.ts, even before the
+   * replacement is built.
+   */
+  private replace(why: string) {
+    if (!this.retired) {
+      this.conn++;
+      this.retired = true;
+    }
     this.transition(false);
-    this.hooks.reconnect(reason);
+    this.hooks.reconnect(why);
   }
 
   /**
@@ -189,7 +210,7 @@ export class Supervisor {
     this.arm(ms, true, () => {
       if (conn !== this.conn || epoch !== this.epoch || this.ready) return;
       this.expiries++;
-      this.hooks.reconnect(`no subscription applied ${ms} ms after ${after}`);
+      this.replace(`no subscription applied ${ms} ms after ${after}`);
     });
   }
 

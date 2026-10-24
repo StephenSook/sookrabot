@@ -1,7 +1,11 @@
-// Connection readiness supervisor: deterministic tests with a fake clock.
+// Connection recovery: the readiness supervisor, the connection lifecycle that
+// index.ts runs, and the SDK behaviour both rely on. Deterministic: a fake
+// clock, fake connections, and for the SDK contract fake sockets with mocked
+// timers (no network).
 
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mock, test } from "node:test";
+import { DbConnection, type DbConnectionBuilder } from "./module_bindings/index.js";
 import {
   MAX_RESUBSCRIBE_ATTEMPTS,
   REPLAY_TIMEOUT_MS,
@@ -13,6 +17,7 @@ import {
   WATCHDOG_MIN_MS,
   type Scheduler,
 } from "./supervisor.js";
+import { ConnectionLifecycle, INITIAL_RETRY_MS, REPLACE_DELAY_MS } from "./lifecycle.js";
 
 type FakeTimer = { at: number; fn: () => void; cleared: boolean };
 
@@ -375,4 +380,286 @@ test("disconnect cancels pending timers; with an SDK retry scheduled only the ou
   b.sched.advance(60_000);
   assert.equal(b.calls.resubscribe, 0);
   assert.equal(b.calls.reconnect.length, 1);
+});
+
+test("asking for a replacement retires the old id at once: its late events are ignored", () => {
+  for (const trigger of ["deadline", "subscription errors", "watchdog", "stuck call"] as const) {
+    const { sup, sched, calls } = make();
+    const a = sup.newConnection();
+    if (trigger === "deadline") {
+      sched.advance(SUBSCRIBE_TIMEOUT_MS);
+    } else {
+      sup.onApplied(a);
+      if (trigger === "subscription errors") {
+        for (let i = 0; i <= MAX_RESUBSCRIBE_ATTEMPTS; i++) sup.onSubscriptionError(a, new Error("x"));
+      } else if (trigger === "watchdog") {
+        sched.advance(WATCHDOG_MIN_MS + 1);
+        sup.watchdog(a, true, 1000);
+      } else {
+        sup.reportStuck(a, "stuck");
+      }
+    }
+    assert.equal(calls.reconnect.length, 1, trigger);
+    assert.notEqual(sup.conn, a, `${trigger}: the old id is retired before the replacement is built`);
+    const readyBefore = calls.online.filter(Boolean).length;
+    // Late events from the old connection, inside the replacement delay:
+    sup.onApplied(a);
+    sup.onAutomaticReconnect(a);
+    sup.onDisconnect(a, true);
+    sup.onSubscriptionError(a, new Error("late"));
+    sup.reportStuck(a, "late");
+    assert.equal(sup.ready, false, trigger);
+    assert.equal(calls.online.filter(Boolean).length, readyBefore, `${trigger}: never ready again on the old id`);
+    assert.equal(sched.pending(), 0, `${trigger}: nothing armed for the old id`);
+    assert.equal(calls.reconnect.length, 1, trigger);
+    assert.equal(sup.newConnection(), a + 1, `${trigger}: the replacement takes the next id, none skipped`);
+  }
+});
+
+// The connection lifecycle index.ts runs (lifecycle.ts), wired to the real
+// supervisor exactly as there. Only the SDK connection and the clock are fakes.
+
+class FakeConn {
+  disconnects = 0;
+  constructor(readonly id: number) {}
+  disconnect() {
+    this.disconnects++;
+  }
+  get running() {
+    return this.disconnects === 0;
+  }
+}
+
+function makeLifecycle() {
+  const sched = new FakeScheduler();
+  const built: FakeConn[] = [];
+  const accepted: number[] = [];
+  const sup = new Supervisor(
+    { setOnline: () => {}, resubscribe: () => {}, reconnect: (why) => lifecycle.replace(why), log: () => {} },
+    sched,
+  );
+  const lifecycle: ConnectionLifecycle<FakeConn> = new ConnectionLifecycle<FakeConn>(
+    sup,
+    {
+      build: (id) => {
+        const c = new FakeConn(id);
+        built.push(c);
+        return c;
+      },
+      deactivate: () => {},
+      log: () => {},
+      warn: () => {},
+    },
+    sched,
+  );
+  /** The SDK's onConnect for c: index.ts goes on with it only if the lifecycle accepts it. */
+  const handshake = (c: FakeConn) => {
+    if (lifecycle.accept(c, c.id)) accepted.push(c.id);
+  };
+  const running = () => built.filter((c) => c.running);
+  return { sched, sup, lifecycle, built, accepted, handshake, running };
+}
+
+test("Codex repro: a connection replaced while still connecting is disconnected at once; its late handshake is refused", () => {
+  const { sched, sup, lifecycle, built, accepted, handshake, running } = makeLifecycle();
+  lifecycle.start(); // A at t = 0; its handshake does not arrive in time
+  const a = built[0];
+  sched.advance(SUBSCRIBE_TIMEOUT_MS); // t = 10,000: A's deadline expires and replacement begins
+  assert.equal(a.disconnects, 1, "A is disconnected while still connecting");
+  assert.notEqual(sup.conn, a.id);
+  sched.advance(500);
+  handshake(a); // t = 10,500: A's handshake lands inside the replacement delay anyway
+  assert.deepEqual(accepted, [], "A is never accepted");
+  assert.equal(built.length, 1);
+  sched.advance(REPLACE_DELAY_MS - 500); // t = 11,000: B is built
+  assert.equal(built.length, 2);
+  const b = built[1];
+  handshake(b);
+  assert.deepEqual(accepted, [b.id]);
+  assert.deepEqual(running(), [b], "exactly one connection object left running");
+});
+
+test("Codex repro: handshakes that never answer leave one connection object running, never a pile", () => {
+  const { sched, lifecycle, built, running } = makeLifecycle();
+  lifecycle.start();
+  while (sched.now() < 32_000) {
+    sched.advance(250);
+    assert.ok(running().length <= 1, `at most one connection object running at ${sched.now()} ms`);
+  }
+  assert.equal(built.length, 3, "A at 0 ms, B at 11,000 ms, C at 32,000 ms (the deadline doubles)");
+  assert.deepEqual(running(), [built[2]]);
+});
+
+test("a dropped connection whose retry never finishes its handshake is stopped and replaced, end to end", () => {
+  const { sched, sup, lifecycle, built, accepted, handshake, running } = makeLifecycle();
+  lifecycle.start();
+  const a = built[0];
+  handshake(a);
+  sup.onApplied(a.id);
+  assert.equal(sup.ready, true);
+  sched.advance(60_000);
+  sup.onDisconnect(a.id, true); // t = 60,000: the SDK retries; that socket never finishes the handshake
+  sched.advance(SUBSCRIBE_TIMEOUT_MS - 1);
+  assert.equal(a.disconnects, 0);
+  sched.advance(1); // t = 70,000
+  assert.equal(a.disconnects, 1, "A and its SDK retries are stopped");
+  sched.advance(REPLACE_DELAY_MS); // t = 71,000
+  assert.equal(built.length, 2);
+  assert.deepEqual(running(), [built[1]]);
+  handshake(built[1]);
+  sup.onApplied(built[1].id);
+  assert.equal(sup.ready, true);
+  assert.deepEqual(accepted, [a.id, built[1].id]);
+});
+
+test("when the SDK gives up and index.ts restarts on its own, the old object is dropped before the next is built", () => {
+  const { sched, lifecycle, built, handshake, running } = makeLifecycle();
+  lifecycle.start();
+  const a = built[0];
+  handshake(a);
+  lifecycle.restartLater("disconnected with no retry scheduled"); // what index.ts does then
+  sched.advance(INITIAL_RETRY_MS);
+  assert.equal(built.length, 2);
+  assert.equal(a.disconnects, 1);
+  assert.deepEqual(running(), [built[1]]);
+});
+
+// The SDK behaviour the recovery above relies on, pinned against the installed
+// spacetimedb package (the dist build the bot runs): a real DbConnection over
+// fake sockets, with mocked timers. Nothing touches the network: the socket
+// factory below never opens one.
+
+class FakeSocket {
+  readonly protocol = "v2.bsatn.spacetimedb";
+  readyState = 1; // OPEN
+  closed = false;
+  private onCloseFn: (ev: CloseEvent) => void = () => {};
+  private onOpenFn: () => void = () => {};
+  private onMessageFn: (msg: { data: Uint8Array }) => void = () => {};
+  set onclose(h: (ev: CloseEvent) => void) {
+    this.onCloseFn = h;
+  }
+  set onopen(h: () => void) {
+    this.onOpenFn = h;
+  }
+  set onmessage(h: (msg: { data: Uint8Array }) => void) {
+    this.onMessageFn = h;
+  }
+  set onerror(_h: (ev: ErrorEvent) => void) {}
+  send(_msg: Uint8Array) {}
+  close() {
+    this.drop(1000);
+  }
+  open() {
+    this.onOpenFn();
+  }
+  /** The server completes the handshake: ServerMessage::InitialConnection, BSATN encoded. */
+  handshake() {
+    const token = new TextEncoder().encode("test-token");
+    const msg = new Uint8Array(1 + 32 + 16 + 4 + token.length);
+    msg[0] = 0; // variant 0: InitialConnection
+    msg[1] = 1; // identity: u256, little endian
+    msg[33] = 2; // connection id: u128, little endian
+    new DataView(msg.buffer).setUint32(49, token.length, true);
+    msg.set(token, 53);
+    this.onMessageFn({ data: msg });
+  }
+  /** The network drops the socket. */
+  drop(code = 1006) {
+    if (this.closed) return;
+    this.closed = true;
+    this.readyState = 3; // CLOSED
+    this.onCloseFn({ code, reason: "", wasClean: code === 1000 } as unknown as CloseEvent);
+  }
+}
+
+/** Let the SDK's pending promise work run (setImmediate is not mocked). */
+const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+function sdkConnection() {
+  const sockets: FakeSocket[] = [];
+  const events: string[] = [];
+  const openSocket = async () => {
+    const s = new FakeSocket();
+    sockets.push(s);
+    return s;
+  };
+  const conn: DbConnection = DbConnection.builder()
+    .withUri("ws://127.0.0.1:9") // never contacted: the socket factory is a fake
+    .withDatabaseName("contract-test")
+    .withWSFn(openSocket as unknown as Parameters<DbConnectionBuilder["withWSFn"]>[0])
+    .withAutomaticReconnect({ minDelayMs: 1000, maxDelayMs: 10_000 }) // as index.ts
+    .onConnect((c) => events.push(c === conn ? "connect (the built object)" : "connect (another object)"))
+    .onAutomaticReconnect(() => events.push("automaticReconnect"))
+    .onConnectError((_ctx, _err, next) => events.push(`connectError retry=${next}`))
+    .onDisconnect((_ctx, _err, next) => events.push(`disconnect retry=${next}`))
+    .build();
+  return { conn, sockets, events };
+}
+
+test("SDK contract: disconnect() while connecting stops the connection; a handshake that arrives anyway is never delivered", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    // Socket open, handshake not yet answered.
+    const a = sdkConnection();
+    await settle();
+    assert.equal(a.sockets.length, 1);
+    a.sockets[0].open();
+    a.conn.disconnect();
+    a.sockets[0].handshake();
+    mock.timers.tick(3_600_000);
+    await settle();
+    assert.deepEqual(a.events, ["disconnect retry=undefined"], "no connect, no retry");
+    assert.equal(a.sockets.length, 1);
+    assert.ok(a.sockets[0].closed);
+    // Socket not even created yet.
+    const b = sdkConnection();
+    b.conn.disconnect();
+    await settle();
+    b.sockets[0]?.open();
+    b.sockets[0]?.handshake();
+    mock.timers.tick(3_600_000);
+    await settle();
+    assert.deepEqual(b.events, ["disconnect retry=undefined"]);
+    assert.ok(b.sockets.every((s) => s.closed));
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("SDK contract: onConnect receives the very object build() returned", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const { conn, sockets, events } = sdkConnection();
+    await settle();
+    sockets[0].open();
+    sockets[0].handshake();
+    assert.deepEqual(events, ["connect (the built object)"]);
+    conn.disconnect();
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("SDK contract: a drop reports a scheduled retry; a retry whose handshake never completes emits nothing, ever", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const { conn, sockets, events } = sdkConnection();
+    await settle();
+    sockets[0].open();
+    sockets[0].handshake();
+    sockets[0].drop();
+    assert.deepEqual(events, ["connect (the built object)", "disconnect retry=1"]);
+    mock.timers.tick(10_000); // past the first retry delay (1000 to 1500 ms)
+    await settle();
+    assert.equal(sockets.length, 2, "the SDK opened a retry socket");
+    sockets[1].open(); // ...whose handshake never completes
+    mock.timers.tick(3_600_000);
+    await settle();
+    assert.deepEqual(events, ["connect (the built object)", "disconnect retry=1"], "no handshake timeout: silence");
+    assert.equal(sockets.length, 2);
+    conn.disconnect();
+  } finally {
+    mock.timers.reset();
+  }
 });
