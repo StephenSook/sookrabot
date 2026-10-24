@@ -25,8 +25,15 @@ export { LETTER_VALUE } from "./engine.js";
 
 /** Currency bid per point of marginal value against real bots (sim best response 4 to 4.5). */
 export const KAPPA = 4.25;
-/** Kappa is multiplied by ENDGAME_KAPPA_BOOST when fewer than this many auctions remain. */
-export const ENDGAME_AUCTIONS = 12;
+/**
+ * Kappa is multiplied by ENDGAME_KAPPA_BOOST when fewer than this many auctions remain.
+ * 8, not 12: with 12 the bot spent its last coins on letters worth only their leave
+ * value (live m625: N, N, O at 19 to 21 each). Cloud self-play (seed 101, 400
+ * matches a field): +1.1 to +1.6 points in each of ar6-top, ar6-v4, ar4-top and
+ * ar6-top-mixed (t 3.8 to 6.2), while 18 lost 0.6 to 4.8; in duels +0.0 to +0.5
+ * (seed 404, 1200 a field), the 3-game final unchanged.
+ */
+export const ENDGAME_AUCTIONS = 8;
 export const ENDGAME_KAPPA_BOOST = 2;
 /**
  * Budget pacing at tables with a real rival: kappa is multiplied by
@@ -56,12 +63,37 @@ export const PACE_MIN_DUEL = 0.75;
  * ENDGAME_AUCTIONS auctions.
  */
 export const PACED_KAPPA = 4;
+/**
+ * Early bid cut while pacing: in the first EARLY_AUCTIONS auctions of a match
+ * (auction index auctionsPerMatch - 1 - bagTotal), kappa is multiplied by
+ * EARLY_KAPPA_SCALE, at tables with at least EARLY_MIN_RIVALS rivals
+ * (2: duels are exempt). Coins not spent early raise the pacing factor
+ * later. EARLY_KAPPA_SCALE 1: off.
+ *
+ * Live, SookraBot spent 66 coins on 3.9 letters in auctions 1 to 22 (winning bid
+ * 30.7 against 14.7 to 23.2 for the top six bots), then won 1.9 letters in
+ * auctions 23 to 45. Cloud self-play (round 3, seed 404, 600 matches a field, with
+ * ENDGAME_AUCTIONS 8): +8.1 points and -0.58 places at ar6-top (t 10.6), +8.4 at
+ * ar6-v4, +22.4 at ar4-top, +22.0 at ar3-top, +10.3 against two SookraBot
+ * copies, +7.7 against rack-aware shark-policy rivals, +1.2 at 8 seats; 28 is
+ * within 1 to 2 points of 22 and 34 in every field. A cut in duels lost 31 to
+ * 63 points a game (round 1), hence EARLY_MIN_RIVALS 2.
+ */
+export const EARLY_AUCTIONS = 28;
+export const EARLY_KAPPA_SCALE = 0.4;
+export const EARLY_MIN_RIVALS = 2;
 /** Every bot starts a match with this balance (game.ts STARTING_BALANCE). */
 export const STARTING_BALANCE = 100;
 /** Tiles in the bag at the start of a match (letters.ts DEFAULT_BAG). */
 export const BAG_TILES = 98;
 /** Weight of the leave value of held tiles (sim: 0.35 best; 0 scored 107 vs 314). */
 export const LEAVE_ALPHA = 0.35;
+/**
+ * Leave decay: with fewer than LEAVE_DECAY_BAG auctions to come, the leave
+ * weight is LEAVE_ALPHA x (bagTotal + 1) / LEAVE_DECAY_BAG, since a held tile
+ * has fewer letters left to form a word with. 0 (default): no decay.
+ */
+export const LEAVE_DECAY_BAG = 0;
 /** Cash any word of at least this many letters as soon as it forms (multiplier saturates at 7). */
 export const CASH_MIN_LEN = 7;
 /**
@@ -72,6 +104,13 @@ export const CASH_MIN_LEN = 7;
  * sim-padded tables keep CASH_MIN_LEN.
  */
 export const HOLD_MIN_REAL_RIVALS = 2;
+/**
+ * Holding (HOLD_MIN_REAL_RIVALS) starts only once fewer than this many
+ * auctions are still to come; before that, words of CASH_MIN_LEN+ letters are
+ * cashed as they form, so their reward buys letters while most are still to
+ * be auctioned. 999 (default): hold for the whole match.
+ */
+export const HOLD_FROM_BAG = 999;
 /**
  * Below this balance (after cashing), also cash one word: preferably of
  * LIQUIDITY_MIN_LEN+ letters, else of any length (LIQUIDITY_FALLBACK_MIN_LEN),
@@ -100,12 +139,22 @@ export const SIM_BID_JITTER = 2;
  * whole hoard while an early one only strands the last few letters.
  */
 export const FLUSH_LEAD_MS = 3000;
-/** First-price shading: recent rival prices kept, minimum sample, quantile. */
+/**
+ * First-price shading: recent rival prices kept, minimum sample, quantile.
+ * FP_QUANTILE 0.3 and FP_NO_HISTORY_SHADE 0.4 (from 0.75 and 0.75): in every
+ * first-price field the cloud search tried, shading harder won more. Round 1.5
+ * (seed 202, 400 matches): quantile and shade 0.6 gave +7 to +11 points at
+ * ar6-top,fp tables, 0.5 gave +11 to +18, 0.4 and 0.5 gave +15 to +20, also when
+ * the rivals shade their own bids by 25%. Round 3 (seed 404, 500 matches, with the
+ * early cut and ENDGAME_AUCTIONS 8): 0.3 and 0.4 gave +24 to +31 at 6-seat
+ * first-price tables against +19 to +25 for 0.4 and 0.5. Untested against live
+ * first-price rivals; casual matches are Vickrey.
+ */
 export const FP_HISTORY_MAX = 40;
 export const FP_MIN_OBS = 5;
-export const FP_QUANTILE = 0.75;
+export const FP_QUANTILE = 0.3;
 /** First-price shading with too little price history: bid this share of the full bid. */
-export const FP_NO_HISTORY_SHADE = 0.75;
+export const FP_NO_HISTORY_SHADE = 0.4;
 /**
  * Broke rivals: when no rival can bid more than this (public balances, sim
  * rules), bid exactly their max + 1 on any letter with value. NYC's final was
@@ -139,9 +188,14 @@ export interface Policy {
   readonly PACE_MAX: number;
   readonly PACE_MIN_DUEL: number;
   readonly PACED_KAPPA: number;
+  readonly EARLY_AUCTIONS: number;
+  readonly EARLY_KAPPA_SCALE: number;
+  readonly EARLY_MIN_RIVALS: number;
   readonly LEAVE_ALPHA: number;
+  readonly LEAVE_DECAY_BAG: number;
   readonly CASH_MIN_LEN: number;
   readonly HOLD_MIN_REAL_RIVALS: number;
+  readonly HOLD_FROM_BAG: number;
   readonly LIQUIDITY_FLOOR: number;
   readonly LIQUIDITY_MIN_LEN: number;
   readonly LIQUIDITY_FALLBACK_MIN_LEN: number;
@@ -168,9 +222,14 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   PACE_MAX,
   PACE_MIN_DUEL,
   PACED_KAPPA,
+  EARLY_AUCTIONS,
+  EARLY_KAPPA_SCALE,
+  EARLY_MIN_RIVALS,
   LEAVE_ALPHA,
+  LEAVE_DECAY_BAG,
   CASH_MIN_LEN,
   HOLD_MIN_REAL_RIVALS,
+  HOLD_FROM_BAG,
   LIQUIDITY_FLOOR,
   LIQUIDITY_MIN_LEN,
   LIQUIDITY_FALLBACK_MIN_LEN,
@@ -279,6 +338,16 @@ export function paceMultiplier(
   return Math.min(p.PACE_MAX, Math.max(min ?? p.PACE_MIN, r ** p.PACE_EXPONENT));
 }
 
+/**
+ * Early bid cut (see EARLY_AUCTIONS): EARLY_KAPPA_SCALE in the first
+ * EARLY_AUCTIONS auctions of a match at tables with at least EARLY_MIN_RIVALS
+ * rivals, else 1.
+ */
+export function earlyScale(bagTotal: number, auctions: number, rivals: number, p: Policy = DEFAULT_POLICY): number {
+  if (p.EARLY_KAPPA_SCALE === 1 || rivals < p.EARLY_MIN_RIVALS) return 1;
+  return auctions - 1 - bagTotal < p.EARLY_AUCTIONS ? p.EARLY_KAPPA_SCALE : 1;
+}
+
 /** Kappa with budget pacing: PACED_KAPPA, doubled in the last ENDGAME_AUCTIONS auctions, times paceMultiplier. */
 export function pacedKappa(
   bagTotal: number,
@@ -378,7 +447,8 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
   const paced = pacingOn(simsOnly, input.auctionsPerMatch);
   const paceMin = input.opponents.length <= p.DUEL_MAX_OPPONENTS ? p.PACE_MIN_DUEL : p.PACE_MIN;
   const kappaExact = paced
-    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin, p)
+    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin, p) *
+      earlyScale(input.bagTotal, input.auctionsPerMatch!, input.opponents.length, p)
     : kappaFor(input.bagTotal, undefined, p);
   const kappa = +kappaExact.toFixed(4); // for the reason strings
   const full = Math.floor(kappaExact * input.delta);
@@ -460,9 +530,16 @@ export function shouldFlush(bagTotal: number, auctionDurationMs: number, leadMs:
   return (bagTotal + 1) * ms <= leadMs;
 }
 
-/** Leave weight for the valuation: leftovers are worthless once flushing. */
-export function alphaFor(flush: boolean, p: Policy = DEFAULT_POLICY): number {
-  return flush ? 0 : p.LEAVE_ALPHA;
+/**
+ * Leave weight for the valuation: leftovers are worthless once flushing, and
+ * worth less near the end when LEAVE_DECAY_BAG is set (bagTotal: auctions to come).
+ */
+export function alphaFor(flush: boolean, p: Policy = DEFAULT_POLICY, bagTotal?: number): number {
+  if (flush) return 0;
+  if (p.LEAVE_DECAY_BAG > 0 && bagTotal !== undefined && bagTotal + 1 < p.LEAVE_DECAY_BAG) {
+    return (p.LEAVE_ALPHA * Math.max(0, bagTotal + 1)) / p.LEAVE_DECAY_BAG;
+  }
+  return p.LEAVE_ALPHA;
 }
 
 export interface WordInput {
@@ -475,6 +552,8 @@ export interface WordInput {
   alpha?: number;
   /** Real (non-sim) rivals at the table; HOLD_MIN_REAL_RIVALS or more holds words for the flush. */
   realRivals?: number;
+  /** Auctions still to come (match_state.bag_total); holding starts below HOLD_FROM_BAG (always when absent). */
+  bagTotal?: number;
   /** Tuning constants (default DEFAULT_POLICY). */
   policy?: Policy;
 }
@@ -534,7 +613,8 @@ export function chooseWords(index: WordIndex, input: WordInput): string[] {
   const rem = new Int32Array(input.counts);
   const out: string[] = [];
   let balance = input.myBalance;
-  const hold = (input.realRivals ?? 0) >= p.HOLD_MIN_REAL_RIVALS;
+  const hold =
+    (input.realRivals ?? 0) >= p.HOLD_MIN_REAL_RIVALS && (input.bagTotal === undefined || input.bagTotal < p.HOLD_FROM_BAG);
   while (!hold) {
     const k = index.bestKey(input.cands, rem, p.CASH_MIN_LEN);
     if (k < 0) break;

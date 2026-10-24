@@ -74,6 +74,9 @@ test("fields: rack awareness, the auction rule, rival shading and warm history a
     name: "ar6@0.9,fp,shade=0.8,warm", base: "ar6", rho: 0.9, env: { auction: "FirstPrice", shade: 0.8 }, warm: true,
   });
   for (const size of [2, 3, 4, 5, 6, 7, 8]) assert.equal(parseField(`ar${size}`).base, `ar${size}`);
+  assert.deepEqual(parseField("ar6-top@0.9,smart"), {
+    name: "ar6-top@0.9,smart", base: "ar6-top", rho: 0.9, env: { auction: "Vickrey", shade: 1 }, warm: false, smart: true,
+  });
   for (const bad of ["nope", "ar9", "ar6@1", "ar6@", "ar6@0.5@0.5", "ar6,xx", "ar6,shade=0", "ar6,shade=", "ar6,warm"]) {
     assert.throws(() => parseField(bad), Error, bad);
   }
@@ -152,7 +155,9 @@ test("self-play: under first price the bot sees first-price auctions, and warm s
   const cold = await bids("ar2,fp");
   const warm = await bids("ar2,fp,warm");
   const valueRule = /\(value [\d.]+, k\d/; // the reason of a Vickrey value bid
-  const fpRule = / fp (no-history|q0\.75x\d+) k\d/;
+  const q = String(DEFAULT_POLICY.FP_QUANTILE).replace(".", "\\."); // the quantile in the reason, e.g. q0.3
+  const fpRule = new RegExp(` fp (no-history|q${q}x\\d+) k\\d`);
+  const withHistory = new RegExp(`fp q${q}x\\d+`);
   assert.ok(vickrey.filter((l) => valueRule.test(l)).length > 10, "Vickrey: value bids");
   assert.ok(vickrey.every((l) => !l.includes(" fp ")), "Vickrey: no first-price reasons");
   assert.ok(cold.filter((l) => fpRule.test(l)).length > 10, "first price: shaded value bids");
@@ -160,8 +165,8 @@ test("self-play: under first price the bot sees first-price auctions, and warm s
   assert.match(cold[0], /fp no-history/, "a cold bot has no prices yet");
   // The first 4 auctions of the 88 (bag 87 to 84) follow at most 3 results: under FP_MIN_OBS (5) prices.
   const early = (ls: string[]) => ls.filter((l) => / bag 8[4-7]: bid /.test(l));
-  assert.ok(early(cold).length > 0 && early(cold).every((l) => !/fp q0\.75x/.test(l)), "cold: no history yet");
-  assert.ok(early(warm).some((l) => /fp q0\.75x\d+/.test(l)), "warm: the first auctions already use the history");
+  assert.ok(early(cold).length > 0 && early(cold).every((l) => !withHistory.test(l)), "cold: no history yet");
+  assert.ok(early(warm).some((l) => withHistory.test(l)), "warm: the first auctions already use the history");
 });
 
 test("fixture: the old entries are kept, the v4 entries are added, and every field seats real fixture entries", () => {

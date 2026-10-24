@@ -24,14 +24,16 @@
 // call, so a variant runs the live code with those constants changed and
 // nothing else; the harness never wraps or replaces a SookraBot method.
 //
-// Fields: <name>[@<rho>][,fp][,shade=<s>][,warm]. @rho gives every fitted rival
+// Fields: <name>[@<rho>][,fp][,shade=<s>][,warm][,smart]. @rho gives every fitted rival
 // rack awareness rho (see RivalModel.rho); ,fp plays first-price auctions (the
 // winner pays its own bid; Vickrey otherwise); ,shade=s multiplies every fitted
 // rival's bid by s, rounded half to even (the fits come from Vickrey matches, so
 // under first price s < 1 models rivals shading their bids); ,warm (with fp)
 // starts each SookraBot with the price history of a burn-in match of the same
 // field, as the live bot carries it between first-price matches (without it
-// the history starts empty, as in a session's first first-price match).
+// the history starts empty, as in a session's first first-price match); ,smart
+// gives every fitted rival the shark word policy (cash each 7+ word as it forms,
+// flush when the final auction opens), a stronger, richer rival for robustness.
 // arN (N 2 to 8) is the focal bot plus N - 1 drawn -ar rivals: the 3-game
 // final is a duel, the elimination bracket runs one table from the cut down to
 // 3 bots, and a Swiss round seats tables of about the match size.
@@ -1004,7 +1006,9 @@ export type PolicyKey = keyof Policy;
 export const POLICY_KEYS = Object.keys(DEFAULT_POLICY) as PolicyKey[];
 /** Knobs that count tiles, auctions, milliseconds, rivals, observations or coins of a cap: whole numbers only. */
 const INTEGER_KEYS: ReadonlySet<PolicyKey> = new Set<PolicyKey>([
-  "ENDGAME_AUCTIONS", "CASH_MIN_LEN", "HOLD_MIN_REAL_RIVALS", "LIQUIDITY_MIN_LEN", "LIQUIDITY_FALLBACK_MIN_LEN",
+  "ENDGAME_AUCTIONS", "EARLY_AUCTIONS", "EARLY_MIN_RIVALS", "LEAVE_DECAY_BAG", "CASH_MIN_LEN", "HOLD_MIN_REAL_RIVALS",
+  "HOLD_FROM_BAG",
+  "LIQUIDITY_MIN_LEN", "LIQUIDITY_FALLBACK_MIN_LEN",
   "LIQUIDITY_TOP_K", "FLUSH_LEAD_MS", "FP_HISTORY_MAX", "FP_MIN_OBS", "BROKE_RIVAL_MAX_BID", "DUEL_MAX_OPPONENTS",
   "DUEL_RESERVE_WINDOW",
 ]);
@@ -1473,9 +1477,16 @@ export interface FieldSpec {
    * as the live bot carries its history from one first-price match to the next.
    */
   warm: boolean;
+  /**
+   * Robustness (,smart): every fitted rival plays the shark word policy, cashing each 7+ word as
+   * it forms and flushing when the final auction opens, so its rewards come back as coins during
+   * the match (the fitted top rivals score 20 to 35 below live; this makes them richer and stronger).
+   * Absent unless set.
+   */
+  smart?: boolean;
 }
 
-/** "<name>[@<rho>][,fp][,vickrey][,shade=<s>][,warm]" (see the header). */
+/** "<name>[@<rho>][,fp][,vickrey][,shade=<s>][,warm][,smart]" (see the header). */
 export function parseField(text: string): FieldSpec {
   const [head, ...mods] = text.split(",");
   const [base, rhoText, ...extra] = head.split("@");
@@ -1489,24 +1500,32 @@ export function parseField(text: string): FieldSpec {
   let auction: AuctionKind = "Vickrey";
   let shade = 1;
   let warm = false;
+  let smart = false;
   for (const mod of mods) {
     if (mod === "fp") auction = "FirstPrice";
     else if (mod === "vickrey") auction = "Vickrey";
     else if (mod === "warm") warm = true;
+    else if (mod === "smart") smart = true;
     else if (mod.startsWith("shade=")) {
       shade = Number(mod.slice("shade=".length));
       if (mod === "shade=" || !(shade > 0 && Number.isFinite(shade))) throw new Error(`shade must be a number > 0: ${mod}`);
-    } else throw new Error(`unknown field modifier ${mod} in ${text} (fp, vickrey, shade=<s>, warm)`);
+    } else throw new Error(`unknown field modifier ${mod} in ${text} (fp, vickrey, shade=<s>, warm, smart)`);
   }
   if (warm && auction !== "FirstPrice") throw new Error(`field ${text}: warm carries first-price history; add fp`);
-  return { name: text, base, rho, env: { auction, shade }, warm };
+  return { name: text, base, rho, env: { auction, shade }, warm, ...(smart ? { smart: true } : {}) };
 }
 
 /** The seats of match `ms` of this field, with the focal SookraBot playing `policy`. */
 function fieldSeats(field: FieldSpec, policy: Policy, ms: number): SeatSpec[] {
   const specs = FIELDS[field.base].seats(sookra("SookraBot", policy), mulberry32(mix(ms, STREAM.field)));
   const rho = field.rho;
-  return rho === undefined ? specs : specs.map((s) => (s.kind === "fitted" ? { ...s, model: { ...s.model, rho } } : s));
+  if (rho === undefined && !field.smart) return specs;
+  return specs.map((s): SeatSpec => {
+    if (s.kind !== "fitted") return s;
+    let model: RivalModel = rho === undefined ? s.model : { ...s.model, rho };
+    if (field.smart) model = { ...model, policy: "shark", minLen: undefined, sharkLen: undefined };
+    return { ...s, model };
+  });
 }
 
 // ---- statistics ----
@@ -2144,7 +2163,7 @@ export async function calibrate5(
 
 function list() {
   for (const [k, f] of Object.entries(FIELDS)) console.log(`${k.padEnd(16)} ${f.about}`);
-  console.log("field modifiers: <field>[@<rho>][,fp][,vickrey][,shade=<s>][,warm]   e.g. ar6@0.9,fp,shade=0.8,warm");
+  console.log("field modifiers: <field>[@<rho>][,fp][,vickrey][,shade=<s>][,warm][,smart]   e.g. ar6@0.9,fp,shade=0.8,warm");
   console.log("variants: head, or NAME=value joined by +, NAME one of (default):");
   for (const k of POLICY_KEYS) console.log(`  ${k.padEnd(28)} ${DEFAULT_POLICY[k]}${INTEGER_KEYS.has(k) ? "  (whole number)" : ""}`);
   console.log("rival modifiers (validate5 [matches] [seed] [rho|-] [v5k|v5c|v5] [mod+mod...]):");

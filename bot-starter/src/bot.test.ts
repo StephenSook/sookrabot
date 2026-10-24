@@ -915,12 +915,13 @@ test("duel: a cash-poor bot's paced bid is held at PACE_MIN_DUEL (the 3-game fin
   assert.equal(s.bids.length, 1);
   assert.equal(s.bids[0].amount, BigInt(Math.floor(PACED_KAPPA * PACE_MIN_DUEL * delta))); // 18
   assert.ok(logs.some((l) => l.includes("'R' bag 70: bid 18 (value 6.00")));
-  // With a sim seated (3 bots, 83 auctions) there is no duel floor: 4 x sqrt(40 / 71 / (100 / 83)) x 6 = 16.
+  // With a sim seated (3 bots, 83 auctions) there is no duel floor: 4 x sqrt(40 / 71 / (100 / 83)) = 2.74,
+  // and auction index 12 is inside EARLY_AUCTIONS, so x EARLY_KAPPA_SCALE 0.4: 6 (16 without the cut).
   const three = setup("AEINST", 70, "R");
   three.s.balance(ME, 40);
   three.bot.refresh(three.s, MATCH);
   await settle();
-  assert.equal(three.s.bids.at(-1)!.amount, 16n);
+  assert.equal(three.s.bids.at(-1)!.amount, 6n);
 });
 
 test("sims-only table bids up to the sim cap", async () => {
