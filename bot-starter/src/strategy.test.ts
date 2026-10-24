@@ -23,14 +23,17 @@ import {
   DUEL_MAX_OPPONENTS,
   DUEL_RESERVE_PER_AUCTION,
   DUEL_RESERVE_WINDOW,
+  ENDGAME_KAPPA_BOOST,
   FLUSH_LEAD_MS,
   KAPPA,
+  LEAVE_ALPHA,
   LIQUIDITY_FALLBACK_MIN_LEN,
   LIQUIDITY_FLOOR,
   HOLD_MIN_REAL_RIVALS,
   PACED_KAPPA,
   PACE_MAX,
   PACE_MIN,
+  PACE_MIN_DUEL,
   type Opponent,
   auctionsPerMatch,
   chooseWords,
@@ -40,6 +43,7 @@ import {
   maxPossibleBid,
   maxSimBid,
   paceMultiplier,
+  pacedKappa,
   shouldFlush,
 } from "./strategy.js";
 
@@ -306,6 +310,37 @@ test("decideBid: final letter, no value, kappa, endgame boost, balance cap", () 
   assert.equal(decideBid({ ...base, bagTotal: 11, myBalance: -5 }).amount, 0);
 });
 
+test("budget pacing in a duel: the factor stops at PACE_MIN_DUEL, not PACE_MIN", () => {
+  assert.equal(PACE_MIN_DUEL, 0.75);
+  assert.ok(PACE_MIN < PACE_MIN_DUEL && PACE_MIN_DUEL < 1);
+  // The floor is a parameter of the factor (PACE_MIN by default); the ceiling is shared.
+  assert.equal(paceMultiplier(0, 30, 88), PACE_MIN);
+  assert.equal(paceMultiplier(0, 30, 88, PACE_MIN_DUEL), PACE_MIN_DUEL);
+  assert.equal(paceMultiplier(100, 87, 88, PACE_MIN_DUEL), 1);
+  assert.equal(paceMultiplier(1000, 1, 88, PACE_MIN_DUEL), PACE_MAX);
+  assert.equal(paceMultiplier(50, 10, undefined, PACE_MIN_DUEL), 1); // match length unknown: pacing off
+  // pacedKappa: PACED_KAPPA, doubled in the last ENDGAME_AUCTIONS auctions, times the factor.
+  assert.equal(pacedKappa(30, 100, 68), PACED_KAPPA * paceMultiplier(100, 30, 68));
+  assert.equal(pacedKappa(11, 100, 68), PACED_KAPPA * ENDGAME_KAPPA_BOOST * paceMultiplier(100, 11, 68));
+  assert.equal(pacedKappa(70, 40, 88, PACE_MIN_DUEL), PACED_KAPPA * PACE_MIN_DUEL);
+  // 40 coins with 71 auctions to go: r = 40 / 71 / (100 / 88) = 0.496, sqrt(r) = 0.704.
+  assert.equal(Math.floor(pacedKappa(70, 40, 88) * 6), 16); // what the PACE_MIN floor gives
+  const spot = { letter: "S", delta: 6, bagTotal: 70, auctionType: "Vickrey" as const, myBalance: 40 };
+  const rival: Opponent[] = [{ isSim: false, balance: 100 }];
+  // Duel (88 auctions): held at 0.75, kappa 4 x 0.75 = 3, so 18 (the duel reserve of 10 does not bind).
+  assert.equal(decideBid({ ...spot, opponents: rival, auctionsPerMatch: 88 }).amount, 18);
+  // First price shades the same paced bid: floor(18 x 0.75) = 13 with no price history.
+  assert.equal(decideBid({ ...spot, auctionType: "FirstPrice", opponents: rival, auctionsPerMatch: 88 }).amount, 13);
+  // Two rivals (83 auctions) get no duel floor: 4 x sqrt(40 / 71 / (100 / 83)) = 2.74, so 16.
+  assert.equal(decideBid({ ...spot, opponents: [...rival, ...rival], auctionsPerMatch: 83 }).amount, 16);
+  // Above the floor a duel is paced like any table: the first auction is 4 x 6 = 24.
+  assert.equal(decideBid({ ...spot, bagTotal: 87, myBalance: 100, opponents: rival, auctionsPerMatch: 88 }).amount, 24);
+  // A sims-only duel and a broke rival keep their own rules.
+  const sim: Opponent[] = [{ isSim: true, strategy: "Aggressive", balance: 100 }];
+  assert.equal(decideBid({ ...spot, opponents: sim, auctionsPerMatch: 88 }).amount, maxSimBid("Aggressive", "S", 100) + 1);
+  assert.equal(decideBid({ ...spot, opponents: [{ isSim: false, balance: 1 }], auctionsPerMatch: 88 }).amount, 2);
+});
+
 test("maxSimBid follows the module's sim rule with +2 jitter", () => {
   assert.equal(maxSimBid("Aggressive", "E", 100), 7);
   assert.equal(maxSimBid("Aggressive", "S", 100), 5);
@@ -485,6 +520,42 @@ test("chooseWords: with HOLD_MIN_REAL_RIVALS real rivals, words wait for the flu
   assert.equal(liq.length, 1);
   assert.ok(liq[0].length >= 5);
   assert.ok(play("RETAINSQ", 100, true, 5).includes("QINTARS")); // the flush plays everything
+});
+
+test("match 123: 10 coins, a 6-letter word in hand, 46 auctions left: cash it, then pace the bids", () => {
+  // Live m123 (Vickrey, 68 auctions; LetterShark, four sims and us), from SookraBot's auction log. At
+  // kappa 4.25 the bot paid 110 coins for 12 letters by auction 17. After auction 22 it held 10 coins and
+  // the rack JUTTEDVG with 46 auctions to come; it cashed JUTTED (+35), was down to 3 coins by auction 42
+  // and won none of the last 26 letters (LetterShark won 23 of them).
+  const counts = countsOf("JUTTEDVG");
+  const words = (realRivals: number) =>
+    chooseWords(INDEX, { counts, cands: INDEX.scan(counts, true), myBalance: 10, flush: false, realRivals });
+  assert.deepEqual(words(1), ["JUTTED"]); // the live table: one real rival
+  assert.deepEqual(words(5), ["JUTTED"]); // all-real tables hold words, but not the liquidity word
+  assert.equal(wordReward("JUTTED"), 35);
+  // The engine reproduces the logged marginal values: G on JUTTEDV 1.943, K on VG (after the cash) 3.374.
+  const g = valuate(INDEX, countsOf("JUTTEDV"), LEAVE_ALPHA).delta[letterIndex("G")];
+  const k = valuate(INDEX, countsOf("VG"), LEAVE_ALPHA).delta[letterIndex("K")];
+  assert.ok(Math.abs(g - 1.943) < 5e-4 && Math.abs(k - 3.374) < 5e-4, `G ${g}, K ${k}`);
+  const table: Opponent[] = [
+    { isSim: false, balance: 56 }, // LetterShark
+    { isSim: true, strategy: "ValueBidder", balance: 100 },
+    { isSim: true, strategy: "Aggressive", balance: 102 },
+    { isSim: true, strategy: "Aggressive", balance: 100 },
+    { isSim: true, strategy: "Cheapskate", balance: 100 },
+  ];
+  const bid = (letter: string, delta: number, bagTotal: number, myBalance: number, opponents = table, auctions?: number) =>
+    decideBid({ letter, delta, bagTotal, auctionType: "Vickrey", myBalance, opponents, auctionsPerMatch: auctions }).amount;
+  // Auction 22 (G): 16 coins for 47 auctions, 0.23 of the starting rate per auction. The live bid at
+  // kappa 4.25 was 8; paced, the factor bottoms out at PACE_MIN (kappa 2): 3.
+  assert.equal(bid("G", 1.943, 46, 16), 8);
+  assert.equal(bid("G", 1.943, 46, 16, table, 68), 3);
+  // Auction 23 (K), after the cash: 45 coins for 46 auctions, kappa 4 x sqrt(0.665) = 3.26: 11, not 14.
+  assert.equal(bid("K", 3.374, 45, 45), 14);
+  assert.equal(bid("K", 3.374, 45, 45, table, 68), 11);
+  // The same spot in a final (a duel vs LetterShark, 88 auctions): the factor, 0.547, is held at
+  // PACE_MIN_DUEL (kappa 3), so 5 rather than 4, inside the duel cap of 16 - 10 reserved = 6.
+  assert.equal(bid("G", 1.943, 46, 16, [table[0]], 88), 5);
 });
 
 // ---- speed ----

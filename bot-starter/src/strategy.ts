@@ -35,6 +35,17 @@ export const PACE_EXPONENT = 0.5;
 export const PACE_MIN = 0.5;
 export const PACE_MAX = 3;
 /**
+ * The pacing floor in a duel (at most DUEL_MAX_OPPONENTS rivals, as in the
+ * 3-game final), in place of PACE_MIN: with one rival every letter we skip
+ * is that rival's, so a cash-poor bot keeps bidding 3/4 of the paced kappa
+ * (the duel reserve still holds back the last coins). Paired self-play vs
+ * the PACE_MIN floor (selfplay.ts compare, seed 2718, 2000 duels a field):
+ * score margin up in 8 of 9 duel fields, e.g. +3.3 vs LetterShark (seeds
+ * 2718 and 1618, win rate 73.2% to 74.4%), +9.7 vs code, +9.5 vs Yezi-ar;
+ * flat vs code-ar (+0.5, t 0.2). PACE_MIN_DUEL = PACE_MIN restores one floor.
+ */
+export const PACE_MIN_DUEL = 0.75;
+/**
  * Base kappa while pacing (in place of KAPPA, which stays the kappa of the
  * unpaced rule and of the Python cross-check), still doubled in the last
  * ENDGAME_AUCTIONS auctions.
@@ -180,11 +191,25 @@ export function auctionsPerMatch(seats: number, startingRackSize: number): numbe
   return Math.max(1, BAG_TILES - startingRackSize * seats);
 }
 
-/** Budget pacing multiplier on kappa (see PACE_EXPONENT); 1 when the match length is unknown. */
-export function paceMultiplier(balance: number, bagTotal: number, auctions: number | undefined): number {
+/**
+ * Budget pacing multiplier on kappa (see PACE_EXPONENT), clamped to
+ * min..PACE_MAX (min: PACE_MIN, or PACE_MIN_DUEL in a duel); 1 when the
+ * match length is unknown.
+ */
+export function paceMultiplier(
+  balance: number,
+  bagTotal: number,
+  auctions: number | undefined,
+  min = PACE_MIN,
+): number {
   if (auctions === undefined || !(auctions > 0) || !(bagTotal >= 0)) return 1;
   const r = Math.max(0, balance) / (bagTotal + 1) / (STARTING_BALANCE / auctions);
-  return Math.min(PACE_MAX, Math.max(PACE_MIN, r ** PACE_EXPONENT));
+  return Math.min(PACE_MAX, Math.max(min, r ** PACE_EXPONENT));
+}
+
+/** Kappa with budget pacing: PACED_KAPPA, doubled in the last ENDGAME_AUCTIONS auctions, times paceMultiplier. */
+export function pacedKappa(bagTotal: number, balance: number, auctions: number | undefined, min = PACE_MIN): number {
+  return kappaFor(bagTotal, PACED_KAPPA) * paceMultiplier(balance, bagTotal, auctions, min);
 }
 
 /** Highest bid this opponent can place right now (real bots: their whole balance). */
@@ -214,7 +239,8 @@ export function duelReserve(opponentCount: number, bagTotal: number): number {
  *    rules): bid exactly their max + 1, the minimum that wins;
  *  - sims-only table (Vickrey): min(floor(SIM_ONLY_KAPPA * delta), max sim bid + 1);
  *  - otherwise floor(kappa * delta), kappa doubled in the last 12 auctions
- *    and multiplied by the budget pacing factor (paceMultiplier);
+ *    and multiplied by the budget pacing factor (pacedKappa; its floor is
+ *    PACE_MIN_DUEL in a duel, PACE_MIN otherwise);
  *  - first price (you pay your own bid): shade to min(full bid, estimated
  *    price to win), where the estimate is max(max sim bid + 1, FP_QUANTILE
  *    of recent real-rival winning prices for letters of the same face value
@@ -271,10 +297,12 @@ function valueBid(input: BidInput, rivalCap: number, balance: number): BidDecisi
     : 0;
   const simsOnly = input.opponents.length > 0 && sims.length === input.opponents.length;
   const paced = pacingOn(simsOnly, input.auctionsPerMatch);
-  const pace = paced ? paceMultiplier(balance, input.bagTotal, input.auctionsPerMatch) : 1;
-  const base = kappaFor(input.bagTotal, paced ? PACED_KAPPA : KAPPA);
-  const kappa = +(base * pace).toFixed(4);
-  const full = Math.floor(base * pace * input.delta);
+  const paceMin = input.opponents.length <= DUEL_MAX_OPPONENTS ? PACE_MIN_DUEL : PACE_MIN;
+  const kappaExact = paced
+    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin)
+    : kappaFor(input.bagTotal);
+  const kappa = +kappaExact.toFixed(4); // for the reason strings
+  const full = Math.floor(kappaExact * input.delta);
 
   let amount: number;
   let reason: string;

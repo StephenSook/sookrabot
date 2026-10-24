@@ -19,9 +19,9 @@ import {
   TRANSPORT_BACKOFF_MS,
   WORD_LATENCY_WINDOW,
 } from "./bot.js";
-import { WordIndex, countsOf, letterIndex, wordReward } from "./engine.js";
+import { WordIndex, countsOf, letterIndex, valuate, wordReward } from "./engine.js";
 import { ConnectionLifecycle } from "./lifecycle.js";
-import { maxSimBid } from "./strategy.js";
+import { LEAVE_ALPHA, PACED_KAPPA, PACE_MIN_DUEL, maxSimBid } from "./strategy.js";
 import { Supervisor, type Scheduler } from "./supervisor.js";
 
 const INDEX = WordIndex.fromWords(
@@ -901,6 +901,25 @@ test("duel: a rival going broke drops the bid to the minimum that wins", async (
   await settle();
   assert.equal(s.bids.length, 2);
   assert.equal(s.bids[1].amount, 1n);
+});
+
+test("duel: a cash-poor bot's paced bid is held at PACE_MIN_DUEL (the 3-game final)", async () => {
+  // Two seats with 5-tile racks: 88 auctions. 40 coins with 71 to go is r = 0.496 (sqrt 0.704), held at 0.75.
+  const { s, bot, logs } = setup("AEINST", 70, "R", { withSim: false });
+  s.balance(ME, 40);
+  bot.refresh(s, MATCH);
+  await settle();
+  const delta = valuate(INDEX, countsOf("AEINST"), LEAVE_ALPHA).delta[letterIndex("R")];
+  assert.equal(delta, 6);
+  assert.equal(s.bids.length, 1);
+  assert.equal(s.bids[0].amount, BigInt(Math.floor(PACED_KAPPA * PACE_MIN_DUEL * delta))); // 18
+  assert.ok(logs.some((l) => l.includes("'R' bag 70: bid 18 (value 6.00")));
+  // With a sim seated (3 bots, 83 auctions) there is no duel floor: 4 x sqrt(40 / 71 / (100 / 83)) x 6 = 16.
+  const three = setup("AEINST", 70, "R");
+  three.s.balance(ME, 40);
+  three.bot.refresh(three.s, MATCH);
+  await settle();
+  assert.equal(three.s.bids.at(-1)!.amount, 16n);
 });
 
 test("sims-only table bids up to the sim cap", async () => {
