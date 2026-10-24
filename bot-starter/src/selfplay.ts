@@ -1050,6 +1050,15 @@ export const RIVAL_MODS: Record<string, { about: string; apply: (m: RivalModel, 
     apply: (m, x) => (m.policy === "hazard" ? { ...m, minLen: Math.max(m.minLen ?? 2, x) } : m),
     arg: true,
   },
+  hzc0: {
+    about: "hzc0=d: a hazard rival's play hazard intercept c0 plus d (it cashes words sooner)",
+    apply: (m, x) => (m.policy === "hazard" && m.hazard ? { ...m, hazard: { ...m.hazard, c0: m.hazard.c0 + x } } : m),
+    arg: true,
+  },
+  sk7: {
+    about: "hazard rivals cash every 7+ word as it forms (sharkLen 7) before the hazard step",
+    apply: (m) => (m.policy === "hazard" ? { ...m, sharkLen: 7 } : m),
+  },
   noc7: {
     about: "no complete7 bids: every bid from the regular cells",
     apply: (m) => ({ ...m, complete7: undefined }),
