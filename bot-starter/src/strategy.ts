@@ -175,7 +175,12 @@ export const FLUSH_LEAD_MS = 3000;
  */
 export const FP_HISTORY_MAX = 40;
 export const FP_MIN_OBS = 5;
-export const FP_QUANTILE = 0.3;
+/**
+ * FP_QUANTILE 0.2 (from 0.3), round 3 on top of the early-cut retune: first-price fields, seeds 9201
+ * and 9602, 500 to 600 matches each: +4.3 to +7.6 points at 2 to 6 seats (each CI above zero, also
+ * against rivals shading by 0.8), +0.3 to +1.0 at 8 seats (CI includes zero); 0.4 lost 1.4 to 6.2.
+ */
+export const FP_QUANTILE = 0.2;
 /** First-price shading with too little price history: bid this share of the full bid. */
 export const FP_NO_HISTORY_SHADE = 0.4;
 /**
@@ -325,13 +330,45 @@ export const EMP_DEAD_SCALE = 0;
  * delta_R)^MLOOK_TILT (0: as the pool), since we win the letters we bid high
  * on. Same gate as the one-step lookahead (LOOKAHEAD_WEIGHT,
  * LOOKAHEAD_MIN_REAL_RIVALS); where m < 2 the one-step lookahead applies; with
- * LOOKAHEAD_POOL 0 the draws come from the full bag instead. 0: off.
+ * LOOKAHEAD_POOL 0 the draws come from the full bag instead. MLOOK_SCALE
+ * multiplies the value it returns (it runs above the one-step values, so this
+ * matches spend only where it applies). 0: off.
+ *
+ * Round 3 settings, on by default: MLOOK_M 3, MLOOK_RATE 1 (three letters ahead until the last two
+ * auctions), MLOOK_SAMPLES 32, MLOOK_SCALE 0.75. Paired cloud self-play against the early-cut build
+ * (f773eff), calibrated v5 rivals, 600 matches a field: seed 9301 (alone) and 9601 (with the spite
+ * and first-price settings below; those touch only duels and first price): 6-seat field and mixed
+ * +10.3 to +11.3 points, place -0.07 to -0.13; top-five table +7.0 to +8.4, place -0.11 to -0.17;
+ * ,smart top five +7.1; 3 seats +26 to +27, 4 seats +21 to +22, 5 seats +13 to +17; 7 seats +4.0
+ * to +4.9, place -0.09;
+ * 8 seats +1.7 to +2.7 (place -0.06 and -0.01, CIs include zero); padded pad-ls-code +17.5. A
+ * spend control (PACED_KAPPA 3.23, the same 0.85 bid cut without the lookahead) gained +1.1 at 6
+ * seats and lost 1.8 at 8, so the gain is the multi-letter value, not spending less. At m 12 and
+ * rate 0.2 it lost (seed 8201); 16 samples gained 1 to 2.3 points less than 32 (seed 9301). It costs
+ * about 20 ms of CPU per auction on a CI runner (32 samples), after the instant bid has gone out.
  */
-export const MLOOK_M = 0;
-export const MLOOK_RATE = 0.2;
-export const MLOOK_SAMPLES = 16;
+export const MLOOK_M = 3;
+export const MLOOK_RATE = 1;
+export const MLOOK_SAMPLES = 32;
 export const MLOOK_ALPHA_SCALE = 1;
 export const MLOOK_TILT = 0;
+export const MLOOK_SCALE = 0.75;
+/** EARLY_RAMP 1: the early cut ramps linearly up to 1 over the window instead of a step (earlyScale). 0: step. */
+export const EARLY_RAMP = 0;
+/**
+ * SPITE_ALPHA: in a Vickrey duel (the 3-game final), when the rival's predicted bid on the letter
+ * (median of its bids seen this match on letters of the same face, at least SPITE_MIN_OBS of them) is
+ * above ours, bid ours + SPITE_ALPHA x (predicted - ours), capped at SPITE_CAP x ours, tapering to 0
+ * over the last SPITE_HORIZON auctions: our bid is the rival's price, so it pays more (Brandt,
+ * Sandholm and Shoham 2007). 0: off. Round 3, on: alpha 0.5, cap 2, 2 observations. Duel fields
+ * (postturing, Dante, guesser, Doppio, Nijello, james, LetterShark, Yezi), seeds 9001 and 9401, 800
+ * a field: score margin +5.2 (CI +2.7 to +7.6, n 5600) and +5.4 (CI +3.0 to +7.8, n 6400), wins +1
+ * point; alpha 1 lost 11.6. Gated to two-seat Vickrey tables, so nothing else changes.
+ */
+export const SPITE_ALPHA = 0.5;
+export const SPITE_CAP = 2;
+export const SPITE_HORIZON = 15;
+export const SPITE_MIN_OBS = 2;
 /**
  * SPEND_FLOOR: every value bid (paced, Vickrey, at tables of at least
  * SPEND_FLOOR_MIN_REAL_RIVALS real rivals) is raised by
@@ -396,6 +433,12 @@ export interface Policy {
   readonly MLOOK_SAMPLES: number;
   readonly MLOOK_ALPHA_SCALE: number;
   readonly MLOOK_TILT: number;
+  readonly MLOOK_SCALE: number;
+  readonly EARLY_RAMP: number;
+  readonly SPITE_ALPHA: number;
+  readonly SPITE_CAP: number;
+  readonly SPITE_HORIZON: number;
+  readonly SPITE_MIN_OBS: number;
   readonly SPEND_FLOOR: number;
   readonly SPEND_FLOOR_MIN_REAL_RIVALS: number;
 }
@@ -450,6 +493,12 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   MLOOK_SAMPLES,
   MLOOK_ALPHA_SCALE,
   MLOOK_TILT,
+  MLOOK_SCALE,
+  EARLY_RAMP,
+  SPITE_ALPHA,
+  SPITE_CAP,
+  SPITE_HORIZON,
+  SPITE_MIN_OBS,
   SPEND_FLOOR,
   SPEND_FLOOR_MIN_REAL_RIVALS,
 });
@@ -494,6 +543,8 @@ export interface BidInput {
    * when COMPLETE7_PREMIUM is on; absent: unknown, no premium.
    */
   completes7?: boolean;
+  /** Predicted bid of a duel rival on this letter (SPITE_ALPHA); absent: unknown, no spite. */
+  rivalBidHint?: number;
   /**
    * Leave weight of the valuation the delta comes from (Valuation.alpha), for
    * isDeadLetter. Read only when DEAD_KAPPA_SCALE is on; absent: never dead.
@@ -571,9 +622,13 @@ export function earlyScale(
   window = EARLY_AUCTIONS,
   scale = EARLY_KAPPA_SCALE,
   minRealRivals = EARLY_MIN_REAL_RIVALS,
+  ramp = 0,
 ): number {
   if (scale === 1 || realRivals < minRealRivals) return 1;
-  return auctions - 1 - bagTotal < window ? scale : 1;
+  const idx = auctions - 1 - bagTotal;
+  if (!(idx < window)) return 1;
+  // EARLY_RAMP: the cut eases linearly from `scale` at the first auction to 1 at the end of the window.
+  return ramp > 0 ? scale + ((1 - scale) * Math.max(0, idx)) / window : scale;
 }
 
 /** Kappa with budget pacing: PACED_KAPPA, doubled in the last ENDGAME_AUCTIONS auctions, times paceMultiplier. */
@@ -702,6 +757,26 @@ export function decideBid(input: BidInput): BidDecision {
   } else {
     ({ amount, reason } = valueBid(input, rivalCap, balance, p));
   }
+  // Round 3 lever, off by default (SPITE_ALPHA 0): in a Vickrey duel, when the rival is predicted to outbid us,
+  // raise our bid (its price) toward its predicted bid, capped at SPITE_CAP x our own bid, tapering to 0 over
+  // the last SPITE_HORIZON auctions (coins drained at the end are worth nothing).
+  const hint = input.rivalBidHint;
+  if (
+    p.SPITE_ALPHA > 0 &&
+    hint !== undefined &&
+    input.auctionType === "Vickrey" &&
+    input.opponents.length === 1 &&
+    !input.opponents[0].isSim &&
+    amount > 0 &&
+    hint > amount
+  ) {
+    const a = p.SPITE_ALPHA * Math.min(1, input.bagTotal / Math.max(1, p.SPITE_HORIZON));
+    const spite = Math.min(Math.floor(amount + a * (hint - amount)), Math.floor(p.SPITE_CAP * amount), rivalCap);
+    if (spite > amount) {
+      amount = spite;
+      reason += ` spite ${hint}`;
+    }
+  }
   // The duel reserve applies to every branch, the broke-rival one included.
   const reserve = duelReserve(input.opponents.length, input.bagTotal, p);
   if (reserve > 0) {
@@ -736,6 +811,7 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
         p.EARLY_AUCTIONS,
         p.EARLY_KAPPA_SCALE,
         p.EARLY_MIN_REAL_RIVALS,
+        p.EARLY_RAMP,
       )
     : kappaFor(input.bagTotal, undefined, p);
   const simsOnlyVickrey = simsOnly && input.auctionType === "Vickrey";

@@ -114,8 +114,8 @@ test("lookahead: on and gated by default, ramps to 0 at the end", () => {
   assert.ok(lookaheadDelta(base, vu, 20, w, 1) >= 0);
 });
 
-test("multi-letter lookahead: off by default, seeded, at or above the leave floor, and m 0 values the rack alone", () => {
-  assert.equal(DEFAULT_POLICY.MLOOK_M, 0);
+test("multi-letter lookahead: on by default (3 letters), seeded, at or above the leave floor, and m 0 values the rack alone", () => {
+  assert.equal(DEFAULT_POLICY.MLOOK_M, 3);
   const rack = countsOf("EINST");
   const pool = new Int32Array(BAG_COUNTS);
   for (let i = 0; i < 26; i++) pool[i] -= rack[i];
