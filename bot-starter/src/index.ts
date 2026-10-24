@@ -20,9 +20,18 @@
 // Strategy: src/strategy.ts (bids, word policy), src/engine.ts (valuation),
 // src/bot.ts (per-match loop), src/supervisor.ts (connection readiness),
 // src/lifecycle.ts (building and replacing connection objects).
+// src/subscriptions.ts (what the client cache holds).
 // This file only connects and wires events. Every auction this bot sees in
 // its own matches is appended as one JSON line to
 // sookra-<BOT_NAME>.auctions.log (gitignored by *.log).
+//
+// SUBSCRIBE_ALL=1 goes back to subscribing to every table (the old,
+// CPU-heavy cache) in case the targeted subscriptions misbehave.
+//
+// Observer mode, for measuring: `OBSERVE_BOT_ID=<id> BOT_NAME=<scratch name>
+// npm start` connects with a fresh anonymous identity (no token is read or
+// saved), subscribes as if it were bot <id>, and runs the bot loop with
+// reducers that do nothing: it never joins a lobby, bids or plays.
 
 import {
   DbConnection,
@@ -36,6 +45,7 @@ import { WordIndex } from "./engine.js";
 import { SookraBot, type ConnLike } from "./bot.js";
 import { Supervisor, realScheduler } from "./supervisor.js";
 import { ConnectionLifecycle } from "./lifecycle.js";
+import { GAME_WINDOW_MS, REFLOOR_IDLE_MS, TargetedSubscription, type Subscriber } from "./subscriptions.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -43,6 +53,12 @@ const BOT_NAME = process.env.BOT_NAME ?? "bot";
 const BOT_TOKEN = process.env.BOT_TOKEN; // from the website, first run only
 const BOT_NONCE = process.env.BOT_NONCE; // from the CLI, first run only
 const TOURNAMENT_ID = process.env.TOURNAMENT_ID;
+const SUBSCRIBE_ALL = process.env.SUBSCRIBE_ALL === "1";
+const OBSERVE_BOT_ID = process.env.OBSERVE_BOT_ID ? BigInt(process.env.OBSERVE_BOT_ID) : null;
+if (OBSERVE_BOT_ID !== null && (BOT_TOKEN || BOT_NONCE || TOURNAMENT_ID)) {
+  console.error(`[${BOT_NAME}] observer mode takes no BOT_TOKEN, BOT_NONCE or TOURNAMENT_ID`);
+  process.exit(1);
+}
 const TOKEN_PATH = path.join(process.cwd(), `.token-${BOT_NAME}`);
 const AUCTION_LOG_PATH = path.join(process.cwd(), `sookra-${BOT_NAME}.auctions.log`);
 /** Re-check running matches (and the watchdog) this often. */
@@ -128,9 +144,34 @@ process.on("uncaughtException", (err) => bot.warn("uncaught", err));
 process.on("unhandledRejection", (err) => bot.warn("unhandled rejection", err));
 
 function resolveMyBotId(conn: DbConnection): bigint | null {
+  if (OBSERVE_BOT_ID !== null) return OBSERVE_BOT_ID;
   if (!myIdentity) return null;
   const cred = conn.db.botCredential.identity.find(myIdentity);
   return cred ? cred.botId : null;
+}
+
+/** Match ids of every match the bot sat in, from the cached seats. */
+function seatMatchIds(db: ConnLike["db"], botId: bigint): bigint[] {
+  const out: bigint[] = [];
+  for (const p of db.matchParticipant.iter()) if (p.botId === botId) out.push(p.matchId);
+  return out;
+}
+
+/** The targeted subscriptions of each connection (absent with SUBSCRIBE_ALL). */
+const plans = new WeakMap<DbConnection, TargetedSubscription>();
+
+/** Move the current connection's window up to our newer matches and a later game-wide span. */
+function refloor(why: string) {
+  const conn = lifecycle.current;
+  const plan = conn ? plans.get(conn) : undefined;
+  if (!conn || !plan || bot.myBotId === null) return;
+  try {
+    if (plan.refloor(seatMatchIds(conn.db, bot.myBotId), Date.now())) {
+      console.log(`[${BOT_NAME}] re-flooring the subscription window (${why})`);
+    }
+  } catch (err) {
+    bot.warn("re-floor", err);
+  }
 }
 
 // A reducer call fails when the module refuses it, often for an expected
@@ -144,29 +185,80 @@ function logFailure(what: string) {
     );
 }
 
+/** Observer mode: the same cache, with reducers that do nothing. One object per connection. */
+const observerConns = new WeakMap<DbConnection, ConnLike>();
 function asConn(conn: DbConnection): ConnLike {
-  return conn;
+  if (OBSERVE_BOT_ID === null) return conn;
+  let c = observerConns.get(conn);
+  if (!c) {
+    c = {
+      db: conn.db,
+      reducers: { submitBid: () => Promise.resolve(), submitWord: () => Promise.resolve() },
+    };
+    observerConns.set(conn, c);
+  }
+  return c;
 }
 
-/** Subscribe (again) on a connection; readiness comes only from onApplied. */
+function subscriptionError(id: number, err: unknown) {
+  console.error(`[${BOT_NAME}] subscription error: ${err instanceof Error ? err.message : String(err)}`);
+  supervisor.onSubscriptionError(id, err ?? new Error("subscription error"));
+}
+
+/** Subscribe (again) on a connection; readiness comes only from onReady. */
 function subscribe(conn: DbConnection, id: number) {
-  conn
-    .subscriptionBuilder()
-    .onApplied(() => onApplied(conn, id))
-    .onError((ctx) => {
-      const event = (ctx as { event?: unknown }).event;
-      console.error(`[${BOT_NAME}] subscription error: ${event instanceof Error ? event.message : String(event)}`);
-      supervisor.onSubscriptionError(id, event ?? new Error("subscription error"));
-    })
-    .subscribeToAllTables();
+  if (SUBSCRIBE_ALL) {
+    conn
+      .subscriptionBuilder()
+      .onApplied(() => {
+        if (id !== supervisor.conn) return; // a connection we already replaced
+        console.log(`[${BOT_NAME}] subscription applied (connection ${id}, all tables)`);
+        onBaseApplied(conn, id, null);
+      })
+      .onError((ctx) => subscriptionError(id, (ctx as { event?: unknown }).event))
+      .subscribeToAllTables();
+    return;
+  }
+  if (!myIdentity) return; // subscribe runs only after the handshake
+  // A resubscribe: the earlier attempt reports nothing more, and its rows stay
+  // until this one is ready (so rows in both are never removed and re-inserted).
+  const previous = plans.get(conn);
+  previous?.quiesce();
+  const subscriber: Subscriber = (queries, onApplied, onError) =>
+    conn
+      .subscriptionBuilder()
+      .onApplied(() => onApplied())
+      .onError((ctx) => onError((ctx as { event?: unknown }).event ?? new Error("subscription error")))
+      .subscribe(queries);
+  const plan: TargetedSubscription = new TargetedSubscription(
+    subscriber,
+    { identityHex: myIdentity.toHexString(), observeBotId: OBSERVE_BOT_ID ?? undefined },
+    {
+      onBaseApplied: () => onBaseApplied(conn, id, plan),
+      onReady: () => {
+        previous?.stop();
+        onReady(conn, id);
+      },
+      onError: (err) => subscriptionError(id, err),
+      log: (msg) => console.log(`[${BOT_NAME}] ${msg}`),
+    },
+  );
+  plans.set(conn, plan);
+  plan.start();
 }
 
-/** First subscription, a resubscribe, or a reconnect replay. */
-function onApplied(conn: DbConnection, id: number) {
+/**
+ * The bot-independent part of the cache is applied (first time, a
+ * resubscribe, or a reconnect replay): resolve our bot id, possibly after
+ * claiming a nonce, then open the window on it (a replay finds it open).
+ */
+function onBaseApplied(conn: DbConnection, id: number, plan: TargetedSubscription | null) {
   if (id !== supervisor.conn) return; // a connection we already replaced
-  console.log(`[${BOT_NAME}] subscription applied (connection ${id})`);
+  const next = () => {
+    if (plan === null) onReady(conn, id);
+    else plan.openWindow(bot.myBotId!, seatMatchIds(conn.db, bot.myBotId!), Date.now());
+  };
 
-  // Resolve our bot id, possibly after claiming a nonce.
   bot.myBotId = resolveMyBotId(conn);
   if (bot.myBotId === null) {
     if (BOT_NONCE) {
@@ -176,6 +268,7 @@ function onApplied(conn: DbConnection, id: number) {
         .catch(logFailure("claiming the credential"));
       // Wait briefly for the credential to land; check again.
       setTimeout(() => {
+        if (id !== supervisor.conn) return;
         bot.myBotId = resolveMyBotId(conn);
         if (bot.myBotId === null) {
           console.error(
@@ -187,8 +280,7 @@ function onApplied(conn: DbConnection, id: number) {
         console.log(
           `[${BOT_NAME}] claimed credential for bot '${row?.name ?? "?"}' (id ${bot.myBotId})`,
         );
-        supervisor.onApplied(id);
-        bootstrapActivity(conn);
+        next();
       }, 1000);
       return;
     } else {
@@ -198,10 +290,26 @@ function onApplied(conn: DbConnection, id: number) {
       process.exit(1);
     }
   }
+  next();
+}
 
+/** Everything the bot reads is cached (first time, a resubscribe, or a reconnect replay). */
+function onReady(conn: DbConnection, id: number) {
+  if (id !== supervisor.conn || bot.myBotId === null) return;
+  const plan = plans.get(conn);
+  if (plan) {
+    const f = plan.floors;
+    console.log(
+      `[${BOT_NAME}] subscription applied (connection ${id}): our matches from m${f?.mine}, ` +
+        `cache ${conn.db.matchState.count()} matches, ${conn.db.matchParticipant.count()} seats, ` +
+        `${conn.db.auction.count()} auctions, ${conn.db.auctionResult.count()} results`,
+    );
+  }
   const row = conn.db.bot.id.find(bot.myBotId);
   console.log(
-    `[${BOT_NAME}] acting as bot '${row?.name ?? "?"}' (id ${bot.myBotId})`,
+    OBSERVE_BOT_ID !== null
+      ? `[${BOT_NAME}] observing bot '${row?.name ?? "?"}' (id ${bot.myBotId}); reducers disabled`
+      : `[${BOT_NAME}] acting as bot '${row?.name ?? "?"}' (id ${bot.myBotId})`,
   );
   supervisor.onApplied(id);
   bootstrapActivity(conn);
@@ -210,7 +318,7 @@ function onApplied(conn: DbConnection, id: number) {
 /** The handshake of the current connection (lifecycle.accept has checked it). */
 function onConnect(conn: DbConnection, identity: Identity, token: string, id: number) {
   myIdentity = identity;
-  saveToken(token);
+  if (OBSERVE_BOT_ID === null) saveToken(token);
   console.log(`[${BOT_NAME}] connected as ${identity.toHexString()} (connection ${id})`);
 
   subscribe(conn, id);
@@ -250,6 +358,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string, id: nu
         bot.onMatchEnded(c, neu.id);
         console.log(`[${BOT_NAME}] match ${neu.id} ended; rejoining lobby`);
         joinLobby(conn);
+        refloor(`match ${neu.id} ended`);
       }
     }
   });
@@ -257,7 +366,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string, id: nu
 
 function joinLobby(conn: DbConnection) {
   try {
-    if (bot.myBotId === null) return;
+    if (bot.myBotId === null || OBSERVE_BOT_ID !== null) return;
     if (bot.runningMatches(asConn(conn)).length > 0) return;
     const openLobby = Array.from(conn.db.lobby.iter()).find(
       (l) => l.status.tag === "Open",
@@ -296,6 +405,11 @@ function bootstrapActivity(conn: DbConnection) {
         const running = bot.runningMatches(c);
         const ms = running.length > 0 ? Number(c.db.matchState.id.find(running[0])?.auctionDurationMs ?? 1000) : 1000;
         supervisor.watchdog(supervisor.conn, running.length > 0, ms);
+        // Between matches, keep the game-wide part of the window from growing.
+        const floors = lifecycle.current ? plans.get(lifecycle.current)?.floors : undefined;
+        if (running.length === 0 && floors && Date.now() - GAME_WINDOW_MS - floors.gameSinceMs >= REFLOOR_IDLE_MS) {
+          refloor("idle");
+        }
       } catch (err) {
         bot.warn("watchdog", err);
       }
@@ -309,7 +423,7 @@ function buildConnection(id: number): DbConnection {
   return DbConnection.builder()
     .withUri(HOST)
     .withDatabaseName(DB_NAME)
-    .withToken(BOT_TOKEN ?? loadToken())
+    .withToken(OBSERVE_BOT_ID !== null ? undefined : (BOT_TOKEN ?? loadToken()))
     .withAutomaticReconnect({ minDelayMs: 1000, maxDelayMs: 10_000 })
     .onConnect((conn, identity, token) => {
       if (lifecycle.accept(conn, id)) onConnect(conn, identity, token, id);
