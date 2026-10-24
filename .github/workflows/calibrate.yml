@@ -20,7 +20,7 @@
 #   gh workflow run calibrate.yml --repo StephenSook/sookrabot --ref round2-harness \
 #     -f matches=864 -f seed=1 -f rhos="- 0.7 -:shark" -f entries=v5c
 #   gh workflow run calibrate.yml --repo StephenSook/sookrabot --ref round2-harness \
-#     -f matches=576 -f seed=11 -f rhos="0.8" -f entries=v5u -f rounds=6
+#     -f matches=864 -f seed=21 -f rhos="0.7:bidx=0.7" -f entries=v5g -f rounds=6 -f update=secant
 name: calibrate
 run-name: "calibrate ${{ inputs.entries }} x${{ inputs.matches }} seed ${{ inputs.seed }}: ${{ inputs.rhos }} (fit rounds ${{ inputs.rounds }})"
 
@@ -48,9 +48,14 @@ on:
         default: v4c
         type: string
       rounds:
-        description: "0 validates; N > 0 fits per-rival bid scales in N rounds (calibrate5; entries v5u or v5c, configurations gamma[:mod+mod])"
+        description: "0 validates; N > 0 fits per-rival bid scales in N rounds (calibrate5; entries v5c to v5g, configurations gamma[:mod+mod])"
         required: false
         default: "0"
+        type: string
+      update:
+        description: "calibrate5 scale update: ratio (every rival) or secant (the top rivals)"
+        required: false
+        default: ratio
         type: string
 
 permissions:
@@ -73,9 +78,11 @@ jobs:
           RHOS: ${{ inputs.rhos }}
           ENTRIES: ${{ inputs.entries }}
           ROUNDS: ${{ inputs.rounds }}
+          UPDATE: ${{ inputs.update }}
         run: |
           fail() { echo "::error::$1"; exit 1; }
           [[ "$ROUNDS" =~ ^[0-9]{1,2}$ ]] && (( ROUNDS <= 20 )) || fail "rounds: 0 to 20, got '$ROUNDS'"
+          [[ "$UPDATE" == ratio || "$UPDATE" == secant ]] || fail "update: ratio or secant, got '$UPDATE'"
           [[ "$MATCHES" =~ ^[1-9][0-9]{0,4}$ ]] && (( MATCHES <= 20000 )) || fail "matches: 1 to 20000, got '$MATCHES'"
           [[ "$SEED" =~ ^[0-9]{1,9}$ ]] || fail "seed: a whole number from 0 to 999999999, got '$SEED'"
           case "$ENTRIES" in
@@ -144,6 +151,7 @@ jobs:
           ENTRIES: ${{ inputs.entries }}
           MODE: ${{ needs.plan.outputs.mode }}
           ROUNDS: ${{ inputs.rounds }}
+          UPDATE: ${{ inputs.update }}
         run: |
           rho=${CONFIG%%:*}
           mods=""
@@ -155,7 +163,7 @@ jobs:
           out="$RUNNER_TEMP/calib/$MODE-$GITHUB_RUN_ID-$ENTRIES-rho-$label.jsonl"
           start=$(date +%s)
           if [[ "$MODE" == calibrate5 ]]; then
-            npx tsx src/selfplay.ts calibrate5 "$ROUNDS" "$MATCHES" "$SEED" "$ENTRIES" "${mods:--}" "$rho" > "$out"
+            npx tsx src/selfplay.ts calibrate5 "$ROUNDS" "$MATCHES" "$SEED" "$ENTRIES" "${mods:--}" "$rho" "$UPDATE" > "$out"
           elif [[ "$MODE" == validate5 ]]; then
             npx tsx src/selfplay.ts validate5 "$MATCHES" "$SEED" "$rho" "$ENTRIES" "$mods" > "$out"
           else

@@ -9,7 +9,7 @@
 //   npx tsx src/selfplay.ts validate [matches] [seed]
 //   npx tsx src/selfplay.ts validate4 [matches] [seed] [rho|-] [v4c|v4]
 //   npx tsx src/selfplay.ts validate5 [matches] [seed] [rho|-] [v5k|v5p|v5u|v5c|v5] [mod+mod...]
-//   npx tsx src/selfplay.ts calibrate5 [rounds] [matches] [seed] [v5p|v5u|v5c] [mod+mod...|-] [gamma]
+//   npx tsx src/selfplay.ts calibrate5 [rounds] [matches] [seed] [v5g|v5p|v5u|v5c] [mod+mod...|-] [gamma] [ratio|secant]
 //   npx tsx src/selfplay.ts list
 //
 // GitHub Actions runs compare in parallel shards (.github/workflows/selfplay.yml)
@@ -2000,25 +2000,33 @@ function scaleBids(m: RivalModel, s: number): RivalModel {
 
 /**
  * Fits per-rival bid scales so the replayed live tables (validate5) give each rival its live score:
- * `rounds` rounds of n matches (round r plays seed + 1000 r), every rival's bids (cells, complete7 and
- * dead runs of its `base` entry, after `mods`) times its scale; after a round each rival's scale is
- * multiplied by (live score / simulated score)^gamma and clamped to [0.5, 2] (a rival scoring under 20
- * live keeps 1). One line per round: the scales it played, the errors, and the scales for the next round.
- * The last line's scales are the fit (copy them to V5_CALIBRATION.bidScale, then validate5 v5k on a fresh
- * seed).
+ * `rounds` rounds of n matches (round r plays seed + 1000 r), every rival's bids (cells, complete7, dead
+ * runs and gainCells of its `base` entry, after `mods`) times its scale. update "ratio": after a round
+ * each rival's scale is multiplied by (live score / simulated score)^gamma, clamped to [0.5, 2] (a rival
+ * scoring under 20 live keeps 1); this assumes a higher bid level raises a rival's score, which the v5
+ * replays contradict (run 40090375596 diverged). update "secant": only the top rivals (V5_TOP) move,
+ * each by a damped secant step (gamma times the full step) on its own last two (scale, error) pairs,
+ * else (first round, or a flat slope) a probe of 15% against the error's sign (lower bids for a short
+ * rival), every step at most 25% and the scale kept in
+ * [0.4, 1.6]; an error under 2 points keeps the scale. One line per round: the scales it played, the
+ * errors, and the scales for the next round. The last line's scales are the fit (copy them to
+ * V5_CALIBRATION.bidScale, then validate5 v5k on a fresh seed).
  */
 export async function calibrate5(
   rounds: number, n: number, seed: number, base: "v5c" | "v5u" | "v5p" | "v5g" = "v5u", mods = "", gamma = 0.8,
+  update: "ratio" | "secant" = "ratio",
 ): Promise<Record<string, unknown>[]> {
   if (!(Number.isInteger(rounds) && rounds > 0 && rounds <= 20)) throw new Error(`rounds must be 1 to 20, got ${rounds}`);
   if (!(Number.isInteger(n) && n > 0)) throw new Error(`matches must be a whole number > 0, got ${n}`);
   if (!Number.isInteger(seed)) throw new Error(`seed must be a whole number, got ${seed}`);
   if (!["v5c", "v5u", "v5p", "v5g"].includes(base)) throw new Error(`base must be v5c, v5u, v5p or v5g, got ${base}`);
   if (!(gamma > 0 && gamma <= 2)) throw new Error(`gamma must be in (0, 2], got ${gamma}`);
+  if (update !== "ratio" && update !== "secant") throw new Error(`update must be ratio or secant, got ${update}`);
   const modList = parseRivalMods(mods);
   const { rivals: live } = liveV5();
   const index = loadIndex();
   const scales: Record<string, number> = Object.fromEntries(Object.keys(live).map((s) => [s, 1]));
+  const prev: Record<string, { s: number; e: number }> = {};
   const out: Record<string, unknown>[] = [];
   for (let round = 0; round < rounds; round++) {
     const played = { ...scales };
@@ -2028,15 +2036,32 @@ export async function calibrate5(
     for (const [stem, a] of acc) {
       const sim = a[RS.score] / a[RS.seats];
       err[stem] = r1(sim - live[stem].score);
-      if (live[stem].score < 20) continue;
-      const next = played[stem] * (live[stem].score / Math.max(sim, 1)) ** gamma;
-      scales[stem] = +Math.min(2, Math.max(0.5, next)).toFixed(3);
+      if (update === "ratio") {
+        if (live[stem].score < 20) continue;
+        const next = played[stem] * (live[stem].score / Math.max(sim, 1)) ** gamma;
+        scales[stem] = +Math.min(2, Math.max(0.5, next)).toFixed(3);
+        continue;
+      }
+      if (!V5_TOP.includes(stem)) continue;
+      const s = played[stem];
+      const e = sim - live[stem].score;
+      let next = s;
+      if (Math.abs(e) >= 2) {
+        const p = prev[stem];
+        const slope = p && p.s !== s ? (e - p.e) / (s - p.s) : NaN;
+        // A secant step when the last two rounds give a slope of some size (either sign), else a probe
+        // against the error's sign (lower bids for a short rival: the replays so far show that direction).
+        next = Number.isFinite(slope) && Math.abs(slope) > 2 ? s - (gamma * e) / slope : s * (e < 0 ? 0.85 : 1.15);
+        next = Math.min(s * 1.25, Math.max(s * 0.75, next));
+      }
+      prev[stem] = { s, e };
+      scales[stem] = +Math.min(1.6, Math.max(0.4, next)).toFixed(3);
     }
     const abs = (keys: string[]) => keys.filter((k) => k in err).map((k) => Math.abs(err[k]));
     const top = abs(V5_TOP);
     const all = abs(Object.keys(err));
     out.push({
-      kind: "calibrate5", round, base, mods: modList.join("+"), gamma, matches: n, seed: seed + 1000 * round,
+      kind: "calibrate5", round, base, mods: modList.join("+"), gamma, update, matches: n, seed: seed + 1000 * round,
       meanAbsTop: r1(top.reduce((x, y) => x + y, 0) / top.length), maxAbsTop: r1(Math.max(...top)),
       meanAbsAll: r1(all.reduce((x, y) => x + y, 0) / all.length), simMinusLive: err, played, next: { ...scales },
     });
@@ -2045,7 +2070,6 @@ export async function calibrate5(
 }
 
 function list() {
-
   for (const [k, f] of Object.entries(FIELDS)) console.log(`${k.padEnd(16)} ${f.about}`);
   console.log("field modifiers: <field>[@<rho>][,fp][,vickrey][,shade=<s>][,warm]   e.g. ar6@0.9,fp,shade=0.8,warm");
   console.log("variants: head, or NAME=value joined by +, NAME one of (default):");
@@ -2098,7 +2122,8 @@ async function main() {
   } else if (mode === "calibrate5") {
     const base = (pos[3] ?? "v5u") as "v5c" | "v5u" | "v5p" | "v5g";
     const gamma = pos[5] === undefined ? 0.8 : Number(pos[5]);
-    for (const s of await calibrate5(Number(pos[0] ?? 6), Number(pos[1] ?? 576), Number(pos[2] ?? 1), base, pos[4] ?? "", gamma)) {
+    const update = (pos[6] ?? "ratio") as "ratio" | "secant";
+    for (const s of await calibrate5(Number(pos[0] ?? 6), Number(pos[1] ?? 576), Number(pos[2] ?? 1), base, pos[4] ?? "", gamma, update)) {
       console.log(JSON.stringify(s));
     }
   } else if (mode === "list") {
