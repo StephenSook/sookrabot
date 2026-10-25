@@ -1025,9 +1025,10 @@ test("FP_SURPLUS: the first-price bid maximizes (value - b) x G(b), floored at t
     }).amount;
   assert.equal(poor({}, {}), 2);
   assert.equal(poor({ FP_SURPLUS: 1 }, {}), 2);
-  // Duel: the reserve (10 coins at 40 to come) caps the search at max(balance - 10, balance / 41).
-  const duelOpp = { opponents: [{ isSim: false, balance: 100 }], myBalance: 30, auctionsPerMatch: 88, delta: 60 };
-  // Uncapped, the search would pick 51 and the reserve clamp would submit 20; capped, it keeps the floor.
+  // Duel: the reserve (10 coins at 40 to come) caps the search at max(balance - 10, balance / 41) = 40.
+  const duelOpp = { opponents: [{ isSim: false, balance: 100 }], myBalance: 50, auctionsPerMatch: 88, delta: 60 };
+  // Capped at the balance only, the search would pick 50 and the reserve clamp would submit 40 (same win
+  // chance as 2, less surplus); capped at the reserve too, it keeps the floor.
   assert.equal(poor({}, duelOpp), 2);
   assert.equal(poor({ FP_SURPLUS: 1 }, duelOpp), 2);
   // Vickrey is untouched.
