@@ -1009,6 +1009,18 @@ test("FP_SURPLUS: the first-price bid maximizes (value - b) x G(b), floored at t
   assert.match(hi.reason, /surplus/);
   // A letter worth little keeps the head bid (the floor).
   assert.equal(bid({ FP_SURPLUS: 1 }, 2).amount, bid({}, 2).amount);
+  // The search stops at what can be spent (Codex review, finals-patch): balance 10 with prices [1, 50 x4]
+  // must not pick 51 and be clamped to 10 (same win chance as the head bid 2, less surplus).
+  const poor = (o: Partial<Policy>, x: Partial<Parameters<typeof decideBid>[0]>) =>
+    decideBid({
+      letter: "S", delta: 60, bagTotal: 40, auctionType: "FirstPrice", myBalance: 10, opponents: REAL, auctionsPerMatch: 68,
+      fpHistory: [1, 50, 50, 50, 50].map((paid) => ({ face: 1, paid })), policy: withPolicy(o), ...x,
+    }).amount;
+  assert.equal(poor({}, {}), 2);
+  assert.equal(poor({ FP_SURPLUS: 1 }, {}), 2);
+  // Duel: the reserve (10 coins at 40 to come) caps the search at max(balance - 10, balance / 41).
+  const duelOpp = { opponents: [{ isSim: false, balance: 100 }], myBalance: 30, auctionsPerMatch: 88, delta: 60 };
+  assert.ok(poor({ FP_SURPLUS: 1 }, duelOpp) <= 20);
   // Vickrey is untouched.
   const v = (o: Partial<Policy>) =>
     decideBid({ letter: "S", delta: 12, bagTotal: 40, auctionType: "Vickrey", myBalance: 100, opponents: REAL, auctionsPerMatch: 68, policy: withPolicy(o) });

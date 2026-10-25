@@ -1123,3 +1123,24 @@ test("lookahead: refines the bid at an all-real Vickrey table, never in a duel o
   assert.equal(duelOn.s.bids.at(-1)!.amount, duelOff.s.bids.at(-1)!.amount);
   assert.ok(!duelOn.logs.some((l) => l.includes("table+look")));
 });
+
+test("FP_LOOKAHEAD: the lookahead runs at an all-real first-price table only with the knob on", async () => {
+  const fpSeated = (o: Partial<Policy>) => {
+    const t = setup("AEINST", 39, "R", { withSim: false, policy: { ...DEFAULT_POLICY, ...o } });
+    for (let k = 0; k < 4; k++) {
+      const id = 11n + BigInt(k);
+      t.s.bots.set(id, { name: `Rival${id}`, isSimulated: false, strategy: { tag: "Human" } });
+      t.s.participants.push({ matchId: MATCH, botId: id, balance: 100n, score: 0n });
+    }
+    t.s.matchStates.set(MATCH, { ...t.s.matchStates.get(MATCH)!, auctionType: { tag: "FirstPrice" } });
+    return t;
+  };
+  const off = fpSeated({ FP_LOOKAHEAD: 0 });
+  off.bot.refresh(off.s, MATCH);
+  await settle();
+  assert.ok(!off.logs.some((l) => l.includes("table+look")), "first price, knob off: no lookahead");
+  const on = fpSeated({ FP_LOOKAHEAD: 1 });
+  on.bot.refresh(on.s, MATCH);
+  await settle();
+  assert.ok(on.logs.some((l) => l.includes("table+look")), "first price, knob on: lookahead source logged");
+});

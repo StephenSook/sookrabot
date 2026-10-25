@@ -967,7 +967,10 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
     amount = Math.min(full, target);
     // Finals knob (FP_SURPLUS, off by default): maximize expected surplus against the observed prices.
     if (p.FP_SURPLUS > 0 && obs.length >= p.FP_MIN_OBS) {
-      const best = surplusBid(full, obs, amount, Math.min(full, rivalCap));
+      // Search only bids that can be submitted: the balance and decideBid's duel-reserve cap bind later.
+      const reserve = duelReserve(input.opponents.length, input.bagTotal, p);
+      const spendCap = reserve > 0 ? Math.max(balance - reserve, Math.floor(balance / (input.bagTotal + 1))) : balance;
+      const best = surplusBid(full, obs, amount, Math.min(full, rivalCap, spendCap));
       if (best > amount) {
         amount = best;
         reason += ` surplus ${best}`;
