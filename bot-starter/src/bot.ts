@@ -843,7 +843,9 @@ export class SookraBot {
     const p = this.policy;
     if (!(p.LOOKAHEAD_WEIGHT > 0)) return false;
     if (p.LOOKAHEAD_MIN_REAL_RIVALS <= 0) return true;
-    if (m.auctionType.tag !== "Vickrey") return false;
+    // FP_LOOKAHEAD (finals knob, off by default) opens the same gate at first-price tables.
+    const typeOk = m.auctionType.tag === "Vickrey" || (p.FP_LOOKAHEAD > 0 && m.auctionType.tag === "FirstPrice");
+    if (!typeOk) return false;
     return this.opponentsFrom(conn, rows).filter((o) => !o.isSim).length >= p.LOOKAHEAD_MIN_REAL_RIVALS;
   }
 

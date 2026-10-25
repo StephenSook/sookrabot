@@ -385,6 +385,39 @@ export const SPITE_MIN_OBS = 2;
 export const SPEND_FLOOR = 0;
 export const SPEND_FLOOR_MIN_REAL_RIVALS = 2;
 
+// Finals knobs (2026-10-24 evening), each off by default, so DEFAULT_POLICY plays exactly as 9f1faba.
+
+/**
+ * ALLIN_LAST: at the last auction a real bot can still use (bagTotal 1: the match ends inside the
+ * transaction that closes the bagTotal 0 auction, game.ts closeAuction), coins are worth nothing
+ * afterwards, so any letter with positive value is bid min(balance, richest rival's balance + 1) in
+ * either auction type, with no duel reserve. Only at tables with no sim seated (a sim can still use
+ * the final letter, and the final-letter deny bid needs coins). 0: off.
+ */
+export const ALLIN_LAST = 0;
+/**
+ * FP_LOOKAHEAD: the one-step and multi-letter lookaheads (bot.ts lookaheadOn) also run in
+ * first-price auctions at tables with at least LOOKAHEAD_MIN_REAL_RIVALS real rivals. 0: off
+ * (Vickrey only).
+ */
+export const FP_LOOKAHEAD = 0;
+/**
+ * FP_SURPLUS: with at least FP_MIN_OBS same-face first-price prices, the bid is the b in
+ * [current shaded bid, min(full bid, rival cap)] that maximizes (full - b) x G(b), G the empirical
+ * chance that b beats the rivals' top bid (share of same-face rival winning prices below b, half
+ * of those equal to it). The current FP_QUANTILE target stays the floor, so a letter worth many
+ * coins to the rack is no longer capped like a filler. 0: off.
+ */
+export const FP_SURPLUS = 0;
+/**
+ * EARLY_LEN_SEATS: at tables of at least this many seats, the early-cut window is
+ * round(EARLY_AUCTIONS x auctions per match / EARLY_REF_AUCTIONS) instead of EARLY_AUCTIONS, so the
+ * cut covers the same share of a shorter match (28 auctions of 68 at 6 seats). 0: off.
+ */
+export const EARLY_LEN_SEATS = 0;
+/** Auctions in the 6-seat match EARLY_AUCTIONS was tuned on (98 - 5 x 6). */
+export const EARLY_REF_AUCTIONS = 68;
+
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
  * (STARTING_BALANCE, BAG_TILES, SIM_BID_JITTER) and the network-stall bounds of
@@ -447,6 +480,10 @@ export interface Policy {
   readonly SPITE_MIN_OBS: number;
   readonly SPEND_FLOOR: number;
   readonly SPEND_FLOOR_MIN_REAL_RIVALS: number;
+  readonly ALLIN_LAST: number;
+  readonly FP_LOOKAHEAD: number;
+  readonly FP_SURPLUS: number;
+  readonly EARLY_LEN_SEATS: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -507,6 +544,10 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   SPITE_MIN_OBS,
   SPEND_FLOOR,
   SPEND_FLOOR_MIN_REAL_RIVALS,
+  ALLIN_LAST,
+  FP_LOOKAHEAD,
+  FP_SURPLUS,
+  EARLY_LEN_SEATS,
 });
 
 // ---- Types ----
@@ -579,6 +620,35 @@ function quantile(xs: number[], q: number): number {
   const s = [...xs].sort((a, b) => a - b);
   const pos = Math.min(s.length - 1, Math.max(0, Math.ceil(q * s.length) - 1));
   return s[pos];
+}
+
+/**
+ * FP_SURPLUS bid: the b in [lo, hi] maximizing (value - b) x G(b), with G(b) the share of `prices`
+ * (rivals' winning first-price bids) below b, counting those equal to b as half (a random tie).
+ * Ties in expected surplus keep the lower bid. Returns lo when hi < lo.
+ */
+export function surplusBid(value: number, prices: readonly number[], lo: number, hi: number): number {
+  const n = prices.length;
+  let best = lo;
+  if (n === 0 || !(hi > lo)) return best;
+  const win = (b: number) => {
+    let below = 0;
+    let equal = 0;
+    for (const x of prices) {
+      if (x < b) below++;
+      else if (x === b) equal++;
+    }
+    return (below + 0.5 * equal) / n;
+  };
+  let bestU = (value - lo) * win(lo);
+  for (let b = lo + 1; b <= hi; b++) {
+    const u = (value - b) * win(b);
+    if (u > bestU + 1e-9) {
+      bestU = u;
+      best = b;
+    }
+  }
+  return best;
 }
 
 /** Kappa `base` (default the policy's KAPPA), times ENDGAME_KAPPA_BOOST in the last ENDGAME_AUCTIONS auctions. */
@@ -757,6 +827,15 @@ export function decideBid(input: BidInput): BidDecision {
   const rivalCap = rivalMax + 1;
   let amount: number;
   let reason: string;
+  // Finals knob (ALLIN_LAST, off by default): coins are worthless after the last playable auction.
+  const allIn =
+    p.ALLIN_LAST > 0 &&
+    input.bagTotal === 1 &&
+    input.opponents.length > 0 &&
+    input.opponents.every((o) => !o.isSim);
+  if (allIn) {
+    return { amount: clamp(rivalCap), reason: `all-in last (cap ${rivalCap})` };
+  }
   if (rivalMax <= p.BROKE_RIVAL_MAX_BID) {
     amount = rivalCap;
     reason = `rivals broke (max ${rivalMax})`;
@@ -807,6 +886,11 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
   const paceMin = input.opponents.length <= p.DUEL_MAX_OPPONENTS ? p.PACE_MIN_DUEL : p.PACE_MIN;
   // The early cut counts real rivals only, as HOLD_MIN_REAL_RIVALS does (bot.ts).
   const realRivals = input.opponents.filter((o) => !o.isSim).length;
+  // Finals knob (EARLY_LEN_SEATS, off by default): the early window scales with match length at big tables.
+  const earlyWindow =
+    p.EARLY_LEN_SEATS > 0 && paced && input.opponents.length + 1 >= p.EARLY_LEN_SEATS
+      ? Math.round((p.EARLY_AUCTIONS * input.auctionsPerMatch!) / EARLY_REF_AUCTIONS)
+      : p.EARLY_AUCTIONS;
   // paced implies auctionsPerMatch is a positive number (pacingOn).
   const kappaRule = paced
     ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin, p) *
@@ -814,7 +898,7 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
         input.bagTotal,
         input.auctionsPerMatch!,
         realRivals,
-        p.EARLY_AUCTIONS,
+        earlyWindow,
         p.EARLY_KAPPA_SCALE,
         p.EARLY_MIN_REAL_RIVALS,
         p.EARLY_RAMP,
@@ -881,6 +965,14 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
       reason = `fp no-history k${kappa}`;
     }
     amount = Math.min(full, target);
+    // Finals knob (FP_SURPLUS, off by default): maximize expected surplus against the observed prices.
+    if (p.FP_SURPLUS > 0 && obs.length >= p.FP_MIN_OBS) {
+      const best = surplusBid(full, obs, amount, Math.min(full, rivalCap));
+      if (best > amount) {
+        amount = best;
+        reason += ` surplus ${best}`;
+      }
+    }
   } else {
     amount = full;
     reason = `k${kappa}`;
