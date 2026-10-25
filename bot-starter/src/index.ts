@@ -407,8 +407,17 @@ function joinLobby(conn: DbConnection) {
   }
 }
 
-/** Tournament ids each connection already asked to register for (the reducer is idempotent; this keeps the log quiet). */
+/**
+ * Tournament ids each connection has a registration for, or one in flight (the
+ * reducer is idempotent; this keeps the log quiet). A refused or failed call
+ * clears its id and is retried AUTO_REGISTER_RETRY_MS later, at most
+ * AUTO_REGISTER_TRIES times per process and tournament, while the tournament
+ * still reads Registration on the current connection.
+ */
 const autoRegistered = new WeakMap<DbConnection, Set<string>>();
+const autoRegisterTries = new Map<string, number>();
+const AUTO_REGISTER_RETRY_MS = 5000;
+const AUTO_REGISTER_TRIES = 12;
 
 /** Register for `t` if it is taking registrations (AUTO_REGISTER, no TOURNAMENT_ID). */
 function autoRegister(conn: DbConnection, t: { id: bigint; status: { tag: string } }) {
@@ -419,12 +428,23 @@ function autoRegister(conn: DbConnection, t: { id: bigint; status: { tag: string
     if (!asked) autoRegistered.set(conn, (asked = new Set()));
     const key = String(t.id);
     if (asked.has(key)) return;
+    const tries = autoRegisterTries.get(key) ?? 0;
+    if (tries >= AUTO_REGISTER_TRIES) return;
+    autoRegisterTries.set(key, tries + 1);
     asked.add(key);
-    console.log(`[${BOT_NAME}] tournament ${key} is taking registrations; registering`);
+    console.log(`[${BOT_NAME}] tournament ${key} is taking registrations; registering (try ${tries + 1})`);
     conn.reducers
       .registerForTournament({ tournamentId: t.id })
       .then(() => console.log(`[${BOT_NAME}] registered for tournament ${key}`))
-      .catch(logFailure(`registering for tournament ${key}`));
+      .catch((err: unknown) => {
+        logFailure(`registering for tournament ${key}`)(err);
+        asked.delete(key);
+        setTimeout(() => {
+          if (lifecycle.current !== conn) return; // a newer connection registers itself on bootstrap
+          const row = conn.db.tournament.id.find(t.id);
+          if (row) autoRegister(conn, row);
+        }, AUTO_REGISTER_RETRY_MS);
+      });
   } catch (err) {
     bot.warn("auto-register", err);
   }
