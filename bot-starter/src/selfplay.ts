@@ -1106,6 +1106,7 @@ const INTEGER_KEYS: ReadonlySet<PolicyKey> = new Set<PolicyKey>([
   "LIQUIDITY_TOP_K", "FLUSH_LEAD_MS", "FP_HISTORY_MAX", "FP_MIN_OBS", "BROKE_RIVAL_MAX_BID", "DUEL_MAX_OPPONENTS",
   "DUEL_RESERVE_WINDOW", "CASH_BROKE_AUCTIONS", "MLOOK_M", "MLOOK_SAMPLES",
   "SPEND_FLOOR_MIN_REAL_RIVALS", "SPITE_HORIZON", "SPITE_MIN_OBS",
+  "EARLY_HV_AUCTIONS", "LATE_COMMON_AUCTIONS", "COMMIT7",
 ]);
 
 export interface Variant {
@@ -1138,6 +1139,7 @@ export function parseVariant(name: string): Variant {
     if (INTEGER_KEYS.has(key) && !Number.isInteger(value)) throw new Error(`${key} counts whole units, got ${m[2]}`);
     if (key === "FP_QUANTILE" && !(value > 0 && value <= 1)) throw new Error(`FP_QUANTILE must be in (0, 1], got ${m[2]}`);
     if (key === "COMPLETE7_PREMIUM" && !(value >= 1)) throw new Error(`COMPLETE7_PREMIUM raises bids: 1 (off) or more, got ${m[2]}`);
+    if (key === "COMMIT7" && !(value === 0 || value === 1)) throw new Error(`COMMIT7 is a switch: 0 (off) or 1, got ${m[2]}`);
     if (key === "COMPLETE7_CAP_SHARE" && !(value > 0 && value <= 1)) {
       throw new Error(`COMPLETE7_CAP_SHARE is a share of the balance in (0, 1], got ${m[2]}`);
     }

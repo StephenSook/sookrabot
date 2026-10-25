@@ -1076,3 +1076,155 @@ test("EARLY_LEN_SEATS: at 7+ seats the early-cut window is round(28 x auctions /
     assert.equal(bid(on, 4, idx), bid({}, 4, idx));
   }
 });
+
+// ---- field knobs: EARLY_HV_FLOOR, LATE_COMMON_CAP, COMMIT7 (all off by default) ----
+
+test("field knobs are off in DEFAULT_POLICY, and their inputs then change nothing", () => {
+  assert.equal(DEFAULT_POLICY.EARLY_HV_FLOOR, 0);
+  assert.equal(DEFAULT_POLICY.EARLY_HV_AUCTIONS, 23);
+  assert.equal(DEFAULT_POLICY.LATE_COMMON_CAP, 0);
+  assert.equal(DEFAULT_POLICY.LATE_COMMON_AUCTIONS, 22);
+  assert.equal(DEFAULT_POLICY.COMMIT7, 0);
+  const spots = [
+    { letter: "H", delta: 2, bagTotal: 67, auctionsPerMatch: 68 }, // early, high value
+    { letter: "Q", delta: 3, bagTotal: 50, auctionsPerMatch: 68 },
+    { letter: "E", delta: 6, bagTotal: 10, auctionsPerMatch: 68 }, // late, common
+    { letter: "D", delta: 6, bagTotal: 21, auctionsPerMatch: 68 },
+    { letter: "S", delta: 5, bagTotal: 30, auctionsPerMatch: 68 },
+    { letter: "E", delta: 3, bagTotal: 1, auctionsPerMatch: 68 }, // ALLIN_LAST
+  ];
+  for (const spot of spots) {
+    for (const auctionType of ["Vickrey", "FirstPrice"] as const) {
+      const base = { ...spot, auctionType, myBalance: 100, opponents: REAL };
+      const plain = decideBid(base);
+      for (const extras of [{ usable: true, completesWord: false }, { usable: false, completesWord: true }, { usable: true }]) {
+        assert.deepEqual(decideBid({ ...base, ...extras }), plain, `${JSON.stringify(spot)} ${auctionType}`);
+        assert.deepEqual(decideBid({ ...base, ...extras, policy: DEFAULT_POLICY }), plain);
+      }
+    }
+  }
+  // Words: a hold table holds RETAINSQ whatever the bag position (COMMIT7 0).
+  const counts = countsOf("RETAINSQ");
+  for (const bag of [undefined, 0, 1, 20, 40, 67]) {
+    assert.deepEqual(
+      chooseWords(INDEX, { counts, cands: INDEX.scan(counts, true), myBalance: 100, flush: false, realRivals: 5, bagTotal: bag }),
+      [],
+      `bag ${bag}`,
+    );
+  }
+});
+
+test("EARLY_HV_FLOOR: an early high-value letter is bid at least the floor x its early median price, paced, never lowered", () => {
+  const bid = (o: Partial<Policy>, x: Partial<Parameters<typeof decideBid>[0]> = {}) =>
+    decideBid({
+      letter: "H", delta: 2, bagTotal: 67, auctionType: "Vickrey", myBalance: 100, opponents: REAL,
+      auctionsPerMatch: 68, ...x, policy: withPolicy(o),
+    });
+  const on = { EARLY_HV_FLOOR: 1 };
+  assert.equal(strategy.EARLY_HV_PRICE.H, 23);
+  // First auction, even spend: head bids floor(3.8 x 0.7 x 2) = 5; the floor raises it to 1 x 23.
+  assert.deepEqual(bid({}), { amount: 5, reason: "k2.66" });
+  assert.deepEqual(bid(on), { amount: 23, reason: "k2.66 hv-floor 23" });
+  assert.equal(bid({ EARLY_HV_FLOOR: 0.5 }).amount, 11);
+  // A useful H already bid above the floor keeps its bid: floor(2.66 x 10) = 26.
+  assert.deepEqual(bid(on, { delta: 10 }), bid({}, { delta: 10 }));
+  // Spent ahead of pace (40 coins with 61 auctions to come): the floor shrinks by the pacing factor 0.668, so 15.
+  assert.equal(bid({}, { myBalance: 40, bagTotal: 60 }).amount, 3);
+  assert.equal(bid(on, { myBalance: 40, bagTotal: 60 }).amount, 15);
+  // The window: auction index 22 (45 to come) is floored, index 23 (44 to come) is not.
+  assert.equal(bid(on, { bagTotal: 45 }).amount, 23);
+  assert.deepEqual(bid(on, { bagTotal: 44 }), bid({}, { bagTotal: 44 }));
+  assert.equal(bid({ EARLY_HV_FLOOR: 1, EARLY_HV_AUCTIONS: 45 }, { bagTotal: 44 }).amount, 23);
+  // K J X Q Z only when the rack has a use for the letter: Q's early median is 34.
+  for (const usable of [undefined, false]) assert.deepEqual(bid(on, { letter: "Q", usable }), bid({}, { letter: "Q" }), `Q ${usable}`);
+  assert.equal(bid(on, { letter: "Q", usable: true }).amount, 34);
+  for (const L of "FVWY") assert.equal(bid(on, { letter: L }).amount, strategy.EARLY_HV_PRICE[L], L);
+  // Other letters are untouched.
+  for (const L of "EBCDMPS") assert.deepEqual(bid(on, { letter: L, usable: true }), bid({}, { letter: L }), L);
+  // The rival cap still binds (richest rival 10: 11), and so does the balance.
+  const poor = Array.from({ length: 5 }, () => ({ isSim: false, balance: 10 }));
+  assert.equal(bid(on, { opponents: poor }).amount, 11);
+  assert.equal(bid(on, { myBalance: 9 }).amount, 9);
+  // First price: the floor applies to the shaded bid (no history: 40% of 5 = 2).
+  assert.equal(bid({}, { auctionType: "FirstPrice" }).amount, 2);
+  assert.equal(bid(on, { auctionType: "FirstPrice" }).amount, 23);
+  // Duels, sim-padded tables and unpaced bids are exempt.
+  const duel = { opponents: [{ isSim: false, balance: 100 }], bagTotal: 87, auctionsPerMatch: 88 };
+  assert.deepEqual(bid(on, duel), bid({}, duel));
+  const padded = [REAL[0], ...Array.from({ length: 4 }, () => ({ isSim: true, strategy: "Cheapskate" as const, balance: 100 }))];
+  assert.deepEqual(bid(on, { opponents: padded }), bid({}, { opponents: padded }));
+  assert.deepEqual(bid(on, { auctionsPerMatch: undefined }), bid({}, { auctionsPerMatch: undefined }));
+});
+
+test("LATE_COMMON_CAP: a late common letter that completes no word is capped at the cap x its median price", () => {
+  const bid = (o: Partial<Policy>, x: Partial<Parameters<typeof decideBid>[0]> = {}) =>
+    decideBid({
+      letter: "E", delta: 6, bagTotal: 10, auctionType: "Vickrey", myBalance: 100, opponents: REAL,
+      auctionsPerMatch: 68, completesWord: false, ...x, policy: withPolicy(o),
+    });
+  const on = { LATE_COMMON_CAP: 1.5 };
+  // 100 coins with 11 auctions left: kappa 3.8 x 2.486 = 9.448, x 6 = 56; capped at floor(1.5 x 11) = 16.
+  assert.deepEqual(bid({}), { amount: 56, reason: "k9.448" });
+  assert.deepEqual(bid(on), { amount: 16, reason: "k9.448 late-cap 16" });
+  assert.equal(bid({ LATE_COMMON_CAP: 1 }).amount, 11);
+  // A letter that completes a word the bot would play, or an unknown one, is not capped.
+  assert.deepEqual(bid(on, { completesWord: true }), bid({}));
+  assert.deepEqual(bid(on, { completesWord: undefined }), bid({}));
+  // A bid already under the cap stays: floor(9.448 x 1) = 9.
+  assert.equal(bid(on, { delta: 1 }).amount, 9);
+  // Each common letter by its own median (D 14: 21), other letters are untouched.
+  for (const [L, med] of Object.entries(strategy.LATE_COMMON_PRICE)) assert.equal(bid(on, { letter: L }).amount, Math.floor(1.5 * med), L);
+  for (const L of "BCFHMPKQZ") assert.deepEqual(bid(on, { letter: L }), bid({}, { letter: L }), L);
+  // The window: 21 auctions to come is capped, 22 is not.
+  assert.equal(bid(on, { bagTotal: 21 }).amount, 16);
+  assert.deepEqual(bid(on, { bagTotal: 22 }), bid({}, { bagTotal: 22 }));
+  // The last two auctions keep their own rules: ALLIN_LAST at 1, the final letter at 0.
+  assert.deepEqual(bid(on, { bagTotal: 1 }), bid({}, { bagTotal: 1 }));
+  assert.equal(bid(on, { bagTotal: 1 }).amount, 100);
+  assert.deepEqual(bid(on, { bagTotal: 0 }), bid({}, { bagTotal: 0 }));
+  // First price caps the shaded bid (no history: 40% of 56 = 22).
+  assert.equal(bid({}, { auctionType: "FirstPrice" }).amount, 22);
+  assert.equal(bid(on, { auctionType: "FirstPrice" }).amount, 16);
+  // Duels and sim-padded tables are exempt.
+  const duel = { opponents: [{ isSim: false, balance: 100 }], auctionsPerMatch: 88 };
+  assert.deepEqual(bid(on, duel), bid({}, duel));
+  const padded = [REAL[0], ...Array.from({ length: 4 }, () => ({ isSim: true, strategy: "Cheapskate" as const, balance: 100 }))];
+  assert.deepEqual(bid(on, { opponents: padded }), bid({}, { opponents: padded }));
+});
+
+test("commonCompleterMask: common letters whose packing takes a word that needs exactly that letter", () => {
+  const mask = (rack: string, keep = LEAVE_ALPHA) => {
+    const c = countsOf(rack);
+    return strategy.commonCompleterMask(INDEX, INDEX.scan(c, true), c, keep);
+  };
+  const letters = (m: number) => [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ"].filter((_, i) => ((m >>> i) & 1) === 1).join("");
+  // AINSTR + E spells RETAINS (and more 7s with A, D, G, L, O, S, T, U); AINSTR + I or N or R makes no 7 the packing takes.
+  assert.equal(letters(mask("AINSTR")), "ADEGLOSTU");
+  assert.equal(mask("EEEEE"), 0, "no word within one tile");
+  // At the leave weight a short word does not beat its tiles' leave value; at 0 (the flush) it is taken.
+  assert.equal(mask("CT"), 0);
+  assert.equal(letters(mask("CT", 0)), "AEIOU");
+  // Only the letters of LATE_COMMON_PRICE are checked: a consonant-only rack is completed by the vowels.
+  assert.equal(letters(mask("BCDFGHM")), "AEIOU");
+});
+
+test("COMMIT7: a table that holds words cashes 7+ letter words as they form; the flush and liquidity are unchanged", () => {
+  const play = (rack: string, myBalance: number, o: Partial<Policy>, bagTotal?: number, realRivals = 5, flush = false) => {
+    const counts = countsOf(rack);
+    return chooseWords(INDEX, {
+      counts, cands: INDEX.scan(counts, true), myBalance, flush, realRivals, bagTotal, policy: withPolicy(o),
+    });
+  };
+  const on = { COMMIT7: 1 };
+  assert.deepEqual(play("RETAINSQ", 100, {}, 40), []);
+  for (const bag of [undefined, 67, 40, 10, 2]) assert.deepEqual(play("RETAINSQ", 100, on, bag), ["QINTARS"], `bag ${bag}`);
+  // Every 7+ word, best first, as at a table that does not hold (the same choices as HOLD_FROM_BAG 0).
+  assert.deepEqual(play("QINTARSJUKEBOX", 100, on, 40), ["JUKEBOX", "QINTARS"]);
+  assert.deepEqual(play("QINTARSJUKEBOX", 100, on, 40), play("QINTARSJUKEBOX", 100, { HOLD_FROM_BAG: 0 }, 40));
+  // Shorter words stay held; the liquidity word still goes when broke (JUTTED, 35 coins).
+  assert.deepEqual(play("JUTTEDVG", 100, on, 40), []);
+  assert.deepEqual(play("JUTTEDVG", 10, on, 40), ["JUTTED"]);
+  // A duel already cashes 7s; the flush plays the whole packing either way.
+  assert.deepEqual(play("RETAINSQ", 100, on, 40, 1), play("RETAINSQ", 100, {}, 40, 1));
+  assert.deepEqual(play("RETAINSQ", 100, on, 0, 5, true), play("RETAINSQ", 100, {}, 0, 5, true));
+});

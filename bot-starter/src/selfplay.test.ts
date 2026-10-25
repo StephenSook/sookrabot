@@ -66,6 +66,17 @@ test("variants: every policy knob can be named, and restating all of them is hea
   assert.equal(Object.keys(all.overrides).length, POLICY_KEYS.length);
 });
 
+test("variants: the field knobs by name, within their ranges", () => {
+  assert.deepEqual(
+    parseVariant("EARLY_HV_FLOOR=1+LATE_COMMON_CAP=1.5+COMMIT7=1").overrides,
+    { EARLY_HV_FLOOR: 1, LATE_COMMON_CAP: 1.5, COMMIT7: 1 },
+  );
+  assert.equal(parseVariant("EARLY_HV_AUCTIONS=30+LATE_COMMON_AUCTIONS=15").policy.LATE_COMMON_AUCTIONS, 15);
+  for (const bad of ["COMMIT7=2", "COMMIT7=0.5", "EARLY_HV_AUCTIONS=22.5", "LATE_COMMON_AUCTIONS=1.5", "EARLY_HV_FLOOR=-1"]) {
+    assert.throws(() => parseVariant(bad), Error, bad);
+  }
+});
+
 test("variants: the round 2 levers by name, within their ranges", () => {
   for (const k of ["COMPLETE7_PREMIUM", "COMPLETE7_CAP_SHARE", "CASH_BROKE_BALANCE", "CASH_BROKE_AUCTIONS", "DEAD_KAPPA_SCALE"]) {
     assert.ok(POLICY_KEYS.includes(k as (typeof POLICY_KEYS)[number]), k);

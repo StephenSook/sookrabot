@@ -31,11 +31,14 @@ import {
   type PricePoint,
   type SimStrategy,
   DEFAULT_POLICY,
+  LATE_COMMON_PRICE,
   alphaFor,
   auctionsPerMatch,
   chooseWords,
+  commonCompleterMask,
   decideBid,
   flushLeadMs,
+  isDeadLetter,
   sevenCompleterMask,
   shouldFlush,
 } from "./strategy.js";
@@ -300,6 +303,8 @@ export class SookraBot {
    * COMPLETE7_PREMIUM is on, so the bid on an auction's open stays a lookup.
    */
   private readonly sevenMasks = new WeakMap<Valuation, number>();
+  /** Per valuation table, the common letters that complete a word on its rack (commonCompleterMask), only while LATE_COMMON_CAP is on. */
+  private readonly commonMasks = new WeakMap<Valuation, number>();
   /** EMP_DEAD_SCALE's table (empirical.ts), or undefined while that knob is off. */
   private readonly deadValue: Float64Array | undefined;
 
@@ -483,6 +488,7 @@ export class SookraBot {
     }
     // valuate packs with keepWeight alpha (its "leave" mode), so the mask counts the same packing.
     if (this.policy.COMPLETE7_PREMIUM !== 1) this.sevenMasks.set(v, sevenCompleterMask(this.index, v.cands, counts, v.alpha));
+    if (this.policy.LATE_COMMON_CAP > 0) this.commonMasks.set(v, commonCompleterMask(this.index, v.cands, counts, v.alpha));
     model.vals.set(key, v);
     while (model.vals.size > VAL_CACHE_MAX) {
       const oldest = model.vals.keys().next().value;
@@ -1014,7 +1020,9 @@ export class SookraBot {
     const key = String(auction.id);
     // What the round 2 levers read about this letter on this rack, only while they are on
     // (`val`: the table of exactly this rack the delta comes from, else nothing is known).
-    const extras: { completes7?: boolean; leaveAlpha?: number; rivalBidHint?: number } = {};
+    const extras: {
+      completes7?: boolean; leaveAlpha?: number; rivalBidHint?: number; usable?: boolean; completesWord?: boolean;
+    } = {};
     if (this.policy.SPITE_ALPHA > 0) {
       // The duel rival's predicted bid on this letter: the median of its bids seen on letters of the same face.
       const face = LETTER_VALUE[auction.letter] ?? 1;
@@ -1026,6 +1034,13 @@ export class SookraBot {
       const mask = this.policy.COMPLETE7_PREMIUM !== 1 ? this.sevenMasks.get(val) : undefined;
       if (mask !== undefined && li >= 0) extras.completes7 = ((mask >>> li) & 1) === 1;
       if (this.policy.DEAD_KAPPA_SCALE !== 1 || this.policy.DEAD_LATE_BAG > 0) extras.leaveAlpha = val.alpha;
+      // Field knobs: whether the table's own packing uses the letter (the delta may carry a lookahead term),
+      // and whether a common letter completes a word in it.
+      if (this.policy.EARLY_HV_FLOOR > 0 && li >= 0) extras.usable = !isDeadLetter(auction.letter, val.delta[li], val.alpha);
+      const common = this.policy.LATE_COMMON_CAP > 0 ? this.commonMasks.get(val) : undefined;
+      if (common !== undefined && li >= 0 && Object.prototype.hasOwnProperty.call(LATE_COMMON_PRICE, auction.letter)) {
+        extras.completesWord = ((common >>> li) & 1) === 1;
+      }
     }
     let decision: BidDecision;
     try {

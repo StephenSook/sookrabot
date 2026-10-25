@@ -1144,3 +1144,61 @@ test("FP_LOOKAHEAD: the lookahead runs at an all-real first-price table only wit
   await settle();
   assert.ok(on.logs.some((l) => l.includes("table+look")), "first price, knob on: lookahead source logged");
 });
+
+test("field knobs reach the bot: an early high-value floor, a late common-letter cap and 7+ words cashed as they form", async () => {
+  // Six seats (68 auctions), all real; the lookahead is off so each bid is the table's value bid.
+  const six = (rack: string, bagTotal: number, letter: string, o?: Partial<Policy>) => {
+    const t = setup(rack, bagTotal, letter, { withSim: false, policy: { ...DEFAULT_POLICY, LOOKAHEAD_WEIGHT: 0, ...(o ?? {}) } });
+    for (const id of [11n, 12n, 13n, 14n]) {
+      t.s.bots.set(id, { name: `Rival${id}`, isSimulated: false, strategy: { tag: "Human" } });
+      t.s.participants.push({ matchId: MATCH, botId: id, balance: 100n, score: 0n });
+    }
+    return t;
+  };
+  const bidOf = async (rack: string, bagTotal: number, letter: string, o?: Partial<Policy>) => {
+    const t = six(rack, bagTotal, letter, o);
+    t.bot.refresh(t.s, MATCH);
+    await settle();
+    return t.s.bids.at(-1)?.amount;
+  };
+  // First auction: VG + H is worth only its leave value (0.35 x 8.61 = 3.01), so head bids floor(2.66 x 3.01) = 8;
+  // EARLY_HV_FLOOR 1 raises it to H's early median, 23. Q on VG has no use, so it is not floored.
+  assert.equal(await bidOf("VG", 67, "H"), 8n);
+  assert.equal(await bidOf("VG", 67, "H", { EARLY_HV_FLOOR: 1 }), 23n);
+  assert.equal(await bidOf("VG", 67, "Q", { EARLY_HV_FLOOR: 1 }), await bidOf("VG", 67, "Q"));
+  // EIN + K spells KINE, a use for the K: floored at K's early median, 26.
+  const kine = valuate(INDEX, countsOf("EIN"), LEAVE_ALPHA).delta[letterIndex("K")];
+  assert.ok(Math.floor(PACED_KAPPA * 0.7 * kine) < 26, `K on EIN ${kine}`);
+  assert.equal(await bidOf("EIN", 67, "K", { EARLY_HV_FLOOR: 1 }), 26n);
+  // The next auction's bid goes out from the precomputed table on open, floor included.
+  const open = six("VG", 67, "H", { EARLY_HV_FLOOR: 1 });
+  open.bot.refresh(open.s, MATCH);
+  await settle();
+  open.bot.onAuctionOpen(open.s, open.s.nextAuction(AUCTION + 1n, "W", 66));
+  assert.equal(open.s.bids.at(-1)!.amount, 20n, "W floored on open");
+  await settle();
+  // Ten auctions to come with 100 coins (kappa 9.448): a fifth E on EEEEE completes no word, so head's 22 is
+  // capped at floor(1.5 x 11) = 16; AINSTR + E spells RETAINS, so its bid (56) is not capped.
+  assert.equal(await bidOf("EEEEE", 10, "E"), 22n);
+  assert.equal(await bidOf("EEEEE", 10, "E", { LATE_COMMON_CAP: 1.5 }), 16n);
+  assert.equal(await bidOf("AINSTR", 10, "E"), 56n);
+  assert.equal(await bidOf("AINSTR", 10, "E", { LATE_COMMON_CAP: 1.5 }), 56n);
+  // COMMIT7: RETAINSQ is held for the flush by default and cashed at once with the knob.
+  for (const [o, want] of [[undefined, []], [{ COMMIT7: 1 }, ["QINTARS"]]] as const) {
+    const t = six("RETAINSQ", 39, "E", o);
+    t.bot.refresh(t.s, MATCH);
+    await settle();
+    assert.deepEqual(t.s.words, want, JSON.stringify(o));
+  }
+  // In a duel none of the three changes a decision.
+  for (const o of [{ EARLY_HV_FLOOR: 1 }, { LATE_COMMON_CAP: 1.5 }, { COMMIT7: 1 }]) {
+    for (const [rack, bag, letter] of [["VG", 87, "H"], ["EEEEE", 10, "E"], ["RETAINSQ", 39, "E"]] as const) {
+      const on = setup(rack, bag, letter, { withSim: false, policy: { ...DEFAULT_POLICY, ...o } });
+      const off = setup(rack, bag, letter, { withSim: false });
+      on.bot.refresh(on.s, MATCH);
+      off.bot.refresh(off.s, MATCH);
+      await settle();
+      assert.deepEqual([on.s.bids, on.s.words], [off.s.bids, off.s.words], `${JSON.stringify(o)} ${rack}`);
+    }
+  }
+});

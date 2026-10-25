@@ -495,6 +495,58 @@ export const DEAD_LATE_BAG = 0;
 export const ENDGAME_SMALL_SEATS = 6;
 export const ENDGAME_BOOST_SMALL = 1;
 
+// Field knobs (2026-10-24 night, branch field-knobs), off by default. From the live server data of 1,492
+// six-seat matches, 8:34 to 11:34 PM (scrabblebot-calhacks13-analysis/field-2026-10-24-night), where
+// SookraBot placed 15th of 73 bots by mean place (2.98; top ten 2.37).
+
+/**
+ * EARLY_HV_FLOOR: in the first EARLY_HV_AUCTIONS auctions of a match (auction index auctions - 1 -
+ * bagTotal), at paced tables with at least EARLY_MIN_REAL_RIVALS real rivals (duels exempt, as for the
+ * early cut), a high-value letter is bid at least floor(EARLY_HV_FLOOR x EARLY_HV_PRICE[letter] x
+ * min(1, pacing factor)): F H V W Y always (EARLY_HV_ALWAYS), K J X Q Z only when the rack's packing has a
+ * use for it (BidInput.usable: its table delta is above its own leave value). The pacing factor
+ * (paceMultiplier, the budget rule every value bid follows) shrinks the floor once the bot has spent ahead
+ * of an even pace; the rival cap and the balance still bind after it, and it never lowers a bid. 0: off.
+ * Live: SookraBot spent 19.5% of its coins in auctions 1 to 23 (top ten 22 to 50%, mean 31%) and won 0.23
+ * high-value tiles a match there against 0.72, at the same price per tile; high-value tiles won correlate
+ * -0.79 with place across bots.
+ */
+export const EARLY_HV_FLOOR = 0;
+export const EARLY_HV_AUCTIONS = 23;
+/** Median price paid per high-value letter in auctions 1 to 23 of those matches (won auctions, all bots, 332 to 723 a letter). */
+export const EARLY_HV_PRICE: Readonly<Record<string, number>> = Object.freeze({
+  F: 21, H: 23, V: 19, W: 20, Y: 23, K: 26, J: 34, X: 36, Q: 34, Z: 46,
+});
+/** The EARLY_HV_PRICE letters EARLY_HV_FLOOR floors whatever the rack; the rest need a use in it. */
+export const EARLY_HV_ALWAYS = "FHVWY";
+/**
+ * LATE_COMMON_CAP: in the last LATE_COMMON_AUCTIONS auctions (bagTotal below it), at the same tables as
+ * EARLY_HV_FLOOR, the bid on a vowel or a 1 to 2 point consonant (LATE_COMMON_PRICE) is capped at
+ * floor(LATE_COMMON_CAP x its median price), unless the letter completes a word the bot would play
+ * (BidInput.completesWord, from commonCompleterMask: the greedy packing of rack + letter, which is what
+ * the flush plays, takes a word that needs exactly that letter). Unknown (no table of exactly this rack):
+ * no cap. The last two auctions keep their own rules: ALLIN_LAST at bagTotal 1 and the final-letter rule
+ * at 0 decide before any value bid. 0: off. Live, auctions 47 to 68: SookraBot's winning bids averaged
+ * 18.83 on vowels (top ten 14.90) and 21.27 on the other 1 to 2 point consonants (16.94), and 11.6% of its
+ * late wins paid over 1.5x the letter's median (top ten 5.5%).
+ */
+export const LATE_COMMON_CAP = 0;
+export const LATE_COMMON_AUCTIONS = 22;
+/** Median price paid per letter over the whole window of those matches (won auctions, all bots). */
+export const LATE_COMMON_PRICE: Readonly<Record<string, number>> = Object.freeze({
+  A: 11, E: 11, I: 10, O: 10, U: 10, L: 11, N: 11, R: 11, S: 12, T: 10, D: 14, G: 13,
+});
+/**
+ * COMMIT7: at a table that holds words for the flush (HOLD_MIN_REAL_RIVALS), words of CASH_MIN_LEN (7) or
+ * more letters are cashed as they form, as at tables that do not hold: the length multiplier stops growing
+ * at 7, so holding a 7 for a longer word gains no multiplier, and the reward buys letters while auctions
+ * remain. Liquidity words and the flush are unchanged. The same word choices as HOLD_FROM_BAG 0 wherever
+ * the bag position is known. 0: off. Live: SookraBot played 0.03 seven-letter words a match before
+ * half-time (top ten 0.47) and 0.60 words of 8+ letters (0.35), and scored 2.8% of its points in the first
+ * half (31%).
+ */
+export const COMMIT7 = 0;
+
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
  * (STARTING_BALANCE, BAG_TILES, SIM_BID_JITTER) and the network-stall bounds of
@@ -565,6 +617,11 @@ export interface Policy {
   readonly DEAD_LATE_BAG: number;
   readonly ENDGAME_SMALL_SEATS: number;
   readonly ENDGAME_BOOST_SMALL: number;
+  readonly EARLY_HV_FLOOR: number;
+  readonly EARLY_HV_AUCTIONS: number;
+  readonly LATE_COMMON_CAP: number;
+  readonly LATE_COMMON_AUCTIONS: number;
+  readonly COMMIT7: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -633,6 +690,11 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   DEAD_LATE_BAG,
   ENDGAME_SMALL_SEATS,
   ENDGAME_BOOST_SMALL,
+  EARLY_HV_FLOOR,
+  EARLY_HV_AUCTIONS,
+  LATE_COMMON_CAP,
+  LATE_COMMON_AUCTIONS,
+  COMMIT7,
 });
 
 // ---- Types ----
@@ -682,6 +744,16 @@ export interface BidInput {
    * isDeadLetter. Read only when DEAD_KAPPA_SCALE is on; absent: never dead.
    */
   leaveAlpha?: number;
+  /**
+   * The rack's packing has a use for this letter (its table delta is above its own leave value). Read
+   * only by EARLY_HV_FLOOR, for K J X Q Z; absent: unknown, no floor on those.
+   */
+  usable?: boolean;
+  /**
+   * This letter completes a word in the packing of rack + letter (commonCompleterMask). Read only by
+   * LATE_COMMON_CAP; absent: unknown, no cap.
+   */
+  completesWord?: boolean;
 }
 
 export interface BidDecision {
@@ -862,6 +934,30 @@ export function sevenCompleterMask(index: WordIndex, cands: Candidates, counts: 
 }
 
 /**
+ * Letters of LATE_COMMON_PRICE that complete a word on this rack, for LATE_COMMON_CAP (bit i for letter
+ * i): the greedy packing of rack + that letter (WordIndex.pack, keepWeight as the valuation packs) takes a
+ * word that needs exactly that letter as its one extra tile (scan's tag). `cands` is scan(counts, true),
+ * as in a Valuation. At most one packing per common letter.
+ */
+export function commonCompleterMask(index: WordIndex, cands: Candidates, counts: Counts, keepWeight: number): number {
+  const tagged = new Map<number, number>();
+  let needs = 0;
+  for (let i = 0; i < cands.n; i++) {
+    const e = cands.extra[i];
+    if (e < 0) continue;
+    tagged.set(cands.keys[i], e);
+    needs |= 1 << e;
+  }
+  let mask = 0;
+  for (const letter of Object.keys(LATE_COMMON_PRICE)) {
+    const i = letterIndex(letter);
+    if (i < 0 || ((needs >>> i) & 1) === 0) continue;
+    if (index.pack(cands, counts, i, keepWeight).keys.some((k) => tagged.get(k) === i)) mask |= 1 << i;
+  }
+  return mask >>> 0;
+}
+
+/**
  * Bid rule, in order:
  *  - final letter (bagTotal 0): a real bot can never play it, but a sim that
  *    wins it plays a word before the match ends (game.ts closeAuction), and
@@ -882,6 +978,10 @@ export function sevenCompleterMask(index: WordIndex, cands: Candidates, counts: 
  *    (completes7) kappa x COMPLETE7_PREMIUM, the raise stopping at
  *    COMPLETE7_CAP_SHARE x the balance; neither applies at a sims-only
  *    Vickrey table;
+ *  - field knobs, off by default, at paced tables of EARLY_MIN_REAL_RIVALS or
+ *    more real rivals: a floor on early high-value letters (EARLY_HV_FLOOR)
+ *    and a cap on late common letters that complete no word (LATE_COMMON_CAP),
+ *    both applied after first-price shading and before the rival cap;
  *  - first price (you pay your own bid): shade to min(full bid, estimated
  *    price to win), where the estimate is max(max sim bid + 1, FP_QUANTILE
  *    of recent real-rival winning prices for letters of the same face value
@@ -1092,6 +1192,33 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
   }
   reason += tag;
 
+  // Field knobs (EARLY_HV_FLOOR, LATE_COMMON_CAP; off by default), at paced tables of EARLY_MIN_REAL_RIVALS or
+  // more real rivals, so duels, sims-only and sim-padded tables are untouched. After first-price shading, before
+  // the rival cap; the duel reserve and the balance clamp in decideBid still follow.
+  const fieldGate = paced && realRivals >= p.EARLY_MIN_REAL_RIVALS;
+  if (p.EARLY_HV_FLOOR > 0 && fieldGate && apm - 1 - input.bagTotal < p.EARLY_HV_AUCTIONS) {
+    const price = EARLY_HV_PRICE[input.letter];
+    const wanted = EARLY_HV_ALWAYS.includes(input.letter) || input.usable === true;
+    if (price !== undefined && wanted) {
+      const pace = Math.min(1, paceMultiplier(balance, input.bagTotal, apm, paceMin, p));
+      const floorBid = Math.floor(p.EARLY_HV_FLOOR * price * pace);
+      if (floorBid > amount) {
+        amount = floorBid;
+        reason += ` hv-floor ${floorBid}`;
+      }
+    }
+  }
+  if (p.LATE_COMMON_CAP > 0 && fieldGate && input.bagTotal < p.LATE_COMMON_AUCTIONS && input.completesWord === false) {
+    const median = LATE_COMMON_PRICE[input.letter];
+    if (median !== undefined) {
+      const cap = Math.floor(p.LATE_COMMON_CAP * median);
+      if (amount > cap) {
+        amount = cap;
+        reason += ` late-cap ${cap}`;
+      }
+    }
+  }
+
   if (amount > rivalCap) {
     amount = rivalCap;
     reason += ` rival-cap ${rivalCap}`;
@@ -1240,7 +1367,8 @@ export function chooseWords(index: WordIndex, input: WordInput): string[] {
   // HOLD_FROM_BAG (999 or more: off, so no bag position can reach it) cashes 7+ words while at least that
   // many auctions are still to come.
   const cashEarly = p.HOLD_FROM_BAG < 999 && input.bagTotal !== undefined && input.bagTotal >= p.HOLD_FROM_BAG;
-  const hold = (input.realRivals ?? 0) >= p.HOLD_MIN_REAL_RIVALS && !cashEarly;
+  // Field knob (COMMIT7, off by default): a hold table cashes CASH_MIN_LEN+ words as they form.
+  const hold = (input.realRivals ?? 0) >= p.HOLD_MIN_REAL_RIVALS && !cashEarly && !(p.COMMIT7 > 0);
   // CASH_WHEN_BROKE (0 and 0: off): late in the match every held CASH_MIN_LEN+ word is cashed, and
   // while broke the best one at a time until the balance is back at CASH_BROKE_BALANCE.
   const late = p.CASH_BROKE_AUCTIONS > 0 && input.bagTotal !== undefined && input.bagTotal < p.CASH_BROKE_AUCTIONS;
