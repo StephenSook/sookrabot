@@ -481,6 +481,19 @@ export const TIME_TILT = 0;
  * 0: off.
  */
 export const DEAD_LATE_BAG = 0;
+/**
+ * ENDGAME_SMALL_SEATS: at tables of at most this many seats (the whole table, us included), the endgame
+ * boost is ENDGAME_BOOST_SMALL instead of ENDGAME_KAPPA_BOOST; bigger tables keep ENDGAME_KAPPA_BOOST. 0: off.
+ *
+ * On at 6 with ENDGAME_BOOST_SMALL 1 (no endgame boost at 6 seats or fewer). Calibrated self-play
+ * (,cal,xpack,rx=1.2), ENDGAME_KAPPA_BOOST 1 against 2 on top of FLUSH_LEAD_MS 2000, mean place, 95% CI:
+ * 6-seat field -0.046 (-0.082 to -0.010, n 480, seed 20004), top five -0.075 (-0.121 to -0.029), and in
+ * the seed 20002 stack -0.043; 4 seats -0.006 (-0.015 to +0.003, +0.4 points); Dante duel 0.000. At 8
+ * seats it lost: +0.058 (-0.033 to +0.150) and +0.12 against the same stack without it, hence the gate;
+ * 7 seats and up keep the boost of 2 and play exactly as before.
+ */
+export const ENDGAME_SMALL_SEATS = 6;
+export const ENDGAME_BOOST_SMALL = 1;
 
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
@@ -550,6 +563,8 @@ export interface Policy {
   readonly EARLY_LEN_SEATS: number;
   readonly TIME_TILT: number;
   readonly DEAD_LATE_BAG: number;
+  readonly ENDGAME_SMALL_SEATS: number;
+  readonly ENDGAME_BOOST_SMALL: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -616,6 +631,8 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   EARLY_LEN_SEATS,
   TIME_TILT,
   DEAD_LATE_BAG,
+  ENDGAME_SMALL_SEATS,
+  ENDGAME_BOOST_SMALL,
 });
 
 // ---- Types ----
@@ -962,8 +979,14 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
       ? Math.round((p.EARLY_AUCTIONS * input.auctionsPerMatch!) / EARLY_REF_AUCTIONS)
       : p.EARLY_AUCTIONS;
   // paced implies auctionsPerMatch is a positive number (pacingOn).
+  // ENDGAME_SMALL_SEATS: small tables use ENDGAME_BOOST_SMALL in the endgame (only kappa reads the boost).
+  const seats = input.opponents.length + 1;
+  const pk: Policy =
+    p.ENDGAME_SMALL_SEATS > 0 && seats <= p.ENDGAME_SMALL_SEATS && p.ENDGAME_BOOST_SMALL !== p.ENDGAME_KAPPA_BOOST
+      ? { ...p, ENDGAME_KAPPA_BOOST: p.ENDGAME_BOOST_SMALL }
+      : p;
   const kappaRule = paced
-    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin, p) *
+    ? pacedKappa(input.bagTotal, balance, input.auctionsPerMatch, paceMin, pk) *
       earlyScale(
         input.bagTotal,
         input.auctionsPerMatch!,
@@ -973,7 +996,7 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
         p.EARLY_MIN_REAL_RIVALS,
         p.EARLY_RAMP,
       )
-    : kappaFor(input.bagTotal, undefined, p);
+    : kappaFor(input.bagTotal, undefined, pk);
   const simsOnlyVickrey = simsOnly && input.auctionType === "Vickrey";
   // Round 2 levers (off by default: DEAD_KAPPA_SCALE 1, COMPLETE7_PREMIUM 1); tag marks them in the reason.
   const deadGateOpen =

@@ -83,8 +83,14 @@ test("budget pacing: kappa scales with the balance left per remaining auction", 
   assert.equal(bid(60, 20), Math.floor(PACED_KAPPA * paceMultiplier(60, 20, 68) * 6));
   const endgame = decideBid({
     letter: "S", delta: 1, bagTotal: 5, auctionType: "Vickrey", myBalance: 30, opponents: real, auctionsPerMatch: 68,
+    policy: withPolicy({ ENDGAME_SMALL_SEATS: 0 }),
   }).amount;
   assert.equal(endgame, Math.floor(PACED_KAPPA * 2 * paceMultiplier(30, 5, 68) * 1)); // endgame boost kept (14)
+  // The live policy (ENDGAME_SMALL_SEATS 6, ENDGAME_BOOST_SMALL 1) drops the boost at this 6-seat table (7).
+  const small = decideBid({
+    letter: "S", delta: 1, bagTotal: 5, auctionType: "Vickrey", myBalance: 30, opponents: real, auctionsPerMatch: 68,
+  }).amount;
+  assert.equal(small, Math.floor(PACED_KAPPA * 1 * paceMultiplier(30, 5, 68) * 1));
   // Without a match length (as in the rules below and the Python cross-check) the unpaced KAPPA rule holds.
   assert.equal(
     decideBid({ letter: "S", delta: 6, bagTotal: 40, auctionType: "Vickrey", myBalance: 100, opponents: real }).amount,
@@ -327,7 +333,11 @@ test("decideBid: final letter, no value, kappa, endgame boost, balance cap", () 
   assert.equal(kappaFor(7), KAPPA * 2);
   assert.equal(kappaFor(11), KAPPA);
   assert.equal(decideBid({ ...base, bagTotal: 11 }).amount, 25);
-  assert.equal(decideBid({ ...base, bagTotal: 7 }).amount, 51);
+  // ENDGAME_SMALL_SEATS 6: no endgame boost at this 6-seat table; a 7-seat table keeps the boost of 2.
+  assert.equal(decideBid({ ...base, bagTotal: 7 }).amount, 25);
+  const seven = { ...base, opponents: Array.from({ length: 6 }, () => ({ isSim: false, balance: 100 })) };
+  assert.equal(decideBid({ ...seven, bagTotal: 7 }).amount, 51);
+  assert.equal(decideBid({ ...seven, bagTotal: 8 }).amount, 25);
   assert.equal(decideBid({ ...base, bagTotal: 7, myBalance: 20 }).amount, 20);
   assert.equal(decideBid({ ...base, bagTotal: 7, myBalance: -5 }).amount, 0);
 });
@@ -707,7 +717,9 @@ test("policy: DEFAULT_POLICY holds each tuning constant under its own name, froz
 test("policy: each bid knob set in the policy moves decideBid as its constant does", () => {
   // The numbers below were worked out with PACED_KAPPA 4, the early cut off, ENDGAME_AUCTIONS 12 and first-price
   // quantile and shade 0.75 (the defaults before the 2026-10-24 strategy search); each override applies on top.
-  const BASE: Partial<Policy> = { PACED_KAPPA: 4, EARLY_KAPPA_SCALE: 1, ENDGAME_AUCTIONS: 12, FP_QUANTILE: 0.75, FP_NO_HISTORY_SHADE: 0.75 };
+  const BASE: Partial<Policy> = {
+    PACED_KAPPA: 4, EARLY_KAPPA_SCALE: 1, ENDGAME_AUCTIONS: 12, FP_QUANTILE: 0.75, FP_NO_HISTORY_SHADE: 0.75, ENDGAME_SMALL_SEATS: 0,
+  };
   const bid = (o: Partial<Policy>, x: Partial<Parameters<typeof decideBid>[0]> = {}) =>
     decideBid({
       letter: "S", delta: 5, bagTotal: 40, auctionType: "Vickrey", myBalance: 100, opponents: REAL,
@@ -729,6 +741,10 @@ test("policy: each bid knob set in the policy moves decideBid as its constant do
   assert.equal(bid({}, late), 7);
   assert.equal(bid({ ENDGAME_AUCTIONS: 8 }, late), 3);
   assert.equal(bid({ ENDGAME_KAPPA_BOOST: 3 }, late), 11);
+  // ENDGAME_SMALL_SEATS: a table this small (6 seats) uses ENDGAME_BOOST_SMALL, a bigger one the boost.
+  assert.equal(bid({ ENDGAME_SMALL_SEATS: 6 }, late), bid({ ENDGAME_KAPPA_BOOST: 1 }, late));
+  assert.equal(bid({ ENDGAME_SMALL_SEATS: 5 }, late), 7);
+  assert.equal(bid({ ENDGAME_SMALL_SEATS: 6, ENDGAME_BOOST_SMALL: 3 }, late), 11);
   // KAPPA is the unpaced kappa (no match length; the live bot always passes one).
   assert.equal(bid({}, { auctionsPerMatch: undefined }), Math.floor(KAPPA * 5));
   assert.equal(bid({ KAPPA: 3 }, { auctionsPerMatch: undefined }), 15);
