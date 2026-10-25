@@ -272,23 +272,23 @@ test("final auction: flushes the whole packing; denies the letter only when a si
   assert.equal(noSim.s.bids.length, 0);
 });
 
-test("1000 ms auctions: flush starts 2 auctions before the end, and those letters still get bids", async () => {
-  // Flush plays SAX (10) and leaves C, T; an O then makes COT (5).
-  const { s, bot, logs } = setup("CATSX", 2, "O");
+test("1000 ms auctions: flush starts 1 auction before the end, and those letters still get bids", async () => {
+  // FLUSH_LEAD_MS 2000: the flush runs at bag 1 and bag 0. It plays SAX (10) and leaves C, T; an O then makes COT (5).
+  const { s, bot, logs } = setup("CATSX", 1, "O");
   bot.refresh(s, MATCH);
   await settle();
   assert.deepEqual(s.words, ["SAX"]);
   // Leave value 0 while flushing: the O is worth exactly COT's 5 points (the amount is paced).
-  assert.ok(logs.some((l) => /'O' bag 2: bid \d+ \(value 5\.00,/.test(l)));
+  assert.ok(logs.some((l) => /'O' bag 1: bid \d+ \(value 5\.00,/.test(l)));
   assert.ok(s.bids.length >= 1 && s.bids.every((b) => b.amount > 0n));
   assert.ok(logs.some((l) => l.includes("m1 start: 3 bots (1 real rivals, 1 sims)")));
-  // Three auctions out it still hoards.
-  const early = setup("CATSX", 3, "O");
+  // Two auctions out it still hoards.
+  const early = setup("CATSX", 2, "O");
   early.bot.refresh(early.s, MATCH);
   await settle();
   assert.deepEqual(early.s.words, []);
-  // 250 ms auctions flush from 11 auctions out.
-  const short = setup("CAT", 11, "S", { durationMs: 250 });
+  // 250 ms auctions flush from 7 auctions out.
+  const short = setup("CAT", 7, "S", { durationMs: 250 });
   short.bot.refresh(short.s, MATCH);
   await settle();
   assert.equal(short.s.words.length, 1);

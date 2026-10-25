@@ -166,8 +166,21 @@ export const SIM_BID_JITTER = 2;
  * last 3 auctions at 1000 ms and the last 12 at 250 ms: the live starter log
  * had 70 of 1,027 bids refused "Auction closed", and a late flush loses the
  * whole hoard while an early one only strands the last few letters.
+ *
+ * 2000 (from 3000, branch wordplay): the last 2 auctions at 1000 ms. Live on
+ * Render the receive lag is about 60 ms with no late bid (30 matches, margin
+ * min 723 ms), and flushLeadMs still lengthens the lead after any stall (a
+ * 500 ms stall or more flushes 3 auctions out again). Paired self-play against
+ * c13519b on the live-calibrated harness (,cal,xpack,rx=1.2), mean place
+ * difference with 95% CI: 6-seat field -0.019 (-0.030 to -0.007, n 800, seed
+ * 20001) and -0.046 (-0.074 to -0.018, n 500, seed 20002), top-five table
+ * -0.030 (-0.046 to -0.014, n 800), 8 seats -0.048 (-0.084 to -0.012, n 250),
+ * Dante duel -0.008 (-0.016 to -0.001, n 600, +3.8 points), 4 seats no place
+ * change (+1.1 points, n 50); live replay of the word policy on the 248
+ * recorded matches +0.15 points (-0.02 to +0.33). 1000 gained a little more
+ * (-0.026 and -0.048) but leaves one auction of margin for the whole hoard.
  */
-export const FLUSH_LEAD_MS = 3000;
+export const FLUSH_LEAD_MS = 2000;
 /**
  * First-price shading: recent rival prices kept, minimum sample, quantile.
  * FP_QUANTILE 0.3 and FP_NO_HISTORY_SHADE 0.4 (from 0.75 and 0.75): in every

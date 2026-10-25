@@ -567,16 +567,19 @@ test("liquidity: a broke bot cashes a short word rather than bid 0 forever (Code
 });
 
 test("shouldFlush: always at the final auction, earlier for short auctions", () => {
-  assert.equal(FLUSH_LEAD_MS, 3000);
+  assert.equal(FLUSH_LEAD_MS, 2000);
   assert.equal(shouldFlush(0, 1000), true);
-  assert.equal(shouldFlush(2, 1000), true);
-  assert.equal(shouldFlush(3, 1000), false);
-  assert.equal(shouldFlush(11, 250), true);
-  assert.equal(shouldFlush(12, 250), false);
+  assert.equal(shouldFlush(1, 1000), true);
+  assert.equal(shouldFlush(2, 1000), false);
+  assert.equal(shouldFlush(7, 250), true);
+  assert.equal(shouldFlush(8, 250), false);
   assert.equal(shouldFlush(0, 10000), true);
   assert.equal(shouldFlush(1, 10000), false);
-  assert.equal(shouldFlush(2, 0), true); // unknown duration is treated as 1000 ms
-  assert.equal(shouldFlush(3, 0), false);
+  assert.equal(shouldFlush(1, 0), true); // unknown duration is treated as 1000 ms
+  assert.equal(shouldFlush(2, 0), false);
+  // The 3000 ms lead the bot shipped with until wordplay, as an explicit argument.
+  assert.equal(shouldFlush(2, 1000, 3000), true);
+  assert.equal(shouldFlush(3, 1000, 3000), false);
 });
 
 test("flushLeadMs: unchanged under normal jitter, longer after a stall, skew-proof, capped", () => {
