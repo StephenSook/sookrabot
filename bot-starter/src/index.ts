@@ -424,6 +424,33 @@ function autoRegister(conn: DbConnection, t: { id: bigint; status: { tag: string
   }
 }
 
+/**
+ * A redeploy that overlaps the old process (Render starts the new instance
+ * and stops the old one about two minutes later) ends with the old socket's
+ * disconnect, which sets our credential's `connected` to false while this
+ * process is connected: the tournament and admin pages then list the bot as
+ * offline. Seen live after the 22:49 UTC deploy of 2026-10-24 (connected
+ * false from 22:51:50 on). Fix: early in the process's life, between matches,
+ * replace our own connection once so the module sees a fresh connect.
+ */
+const PROCESS_STARTED_AT = Date.now();
+const HEAL_WINDOW_MS = 15 * 60_000;
+const HEAL_GAP_MS = 60_000;
+let healsLeft = 2;
+let lastHealAt = 0;
+
+function healOfflineFlag() {
+  const conn = lifecycle.current;
+  if (OBSERVE_BOT_ID !== null || myIdentity === null || !bot.online || conn === null) return;
+  const now = Date.now();
+  if (now - PROCESS_STARTED_AT > HEAL_WINDOW_MS || healsLeft <= 0 || now - lastHealAt < HEAL_GAP_MS) return;
+  const cred = conn.db.botCredential.identity.find(myIdentity);
+  if (!cred || cred.connected) return;
+  healsLeft--;
+  lastHealAt = now;
+  supervisor.reportStuck(supervisor.conn, "our credential reads offline (an older process with our token disconnected)");
+}
+
 function bootstrapActivity(conn: DbConnection) {
   if (TOURNAMENT_ID) {
     conn.reducers
@@ -451,6 +478,7 @@ function bootstrapActivity(conn: DbConnection) {
         if (running.length === 0 && floors && Date.now() - GAME_WINDOW_MS - floors.gameSinceMs >= REFLOOR_IDLE_MS) {
           refloor("idle");
         }
+        if (running.length === 0) healOfflineFlag();
       } catch (err) {
         bot.warn("watchdog", err);
       }
