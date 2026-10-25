@@ -882,7 +882,9 @@ export function decideBid(input: BidInput): BidDecision {
   const rivalCap = rivalMax + 1;
   let amount: number;
   let reason: string;
-  // Finals knob (ALLIN_LAST, off by default): coins are worthless after the last playable auction.
+  // Finals knob (ALLIN_LAST, on since 18b3203; 0 restores 9f1faba): coins are worthless after the last
+  // playable auction. The trigger is the delta as given, which at a lookahead table can carry a small
+  // lookahead term on a letter with no immediate use; such a win costs only coins worth nothing by then.
   const allIn =
     p.ALLIN_LAST > 0 &&
     input.bagTotal === 1 &&
