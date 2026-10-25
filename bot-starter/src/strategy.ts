@@ -451,6 +451,17 @@ export const EARLY_LEN_SEATS = 0;
 /** Auctions in the 6-seat match EARLY_AUCTIONS was tuned on (98 - 5 x 6). */
 export const EARLY_REF_AUCTIONS = 68;
 
+// Word-play and timing knobs (2026-10-24 night, branch wordplay), off by default. Measured in the
+// live-calibrated harness (selfplay.ts field modifier ,cal; see the knob notes for each result).
+
+/**
+ * TIME_TILT: at paced tables with at least EARLY_MIN_REAL_RIVALS real rivals, kappa times
+ * 1 + TIME_TILT x (1 - 2 x idx / (auctions - 1)), idx the auction index (0 first): spend more early
+ * and less late (live SookraBot spends 31.7 / 61.8 / 79.8 coins early / mid / late, the winners about
+ * 73 / 58 / 54, and every bot earns about twice as many points a coin early as late). 0: off.
+ */
+export const TIME_TILT = 0;
+
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
  * (STARTING_BALANCE, BAG_TILES, SIM_BID_JITTER) and the network-stall bounds of
@@ -517,6 +528,7 @@ export interface Policy {
   readonly FP_LOOKAHEAD: number;
   readonly FP_SURPLUS: number;
   readonly EARLY_LEN_SEATS: number;
+  readonly TIME_TILT: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -581,6 +593,7 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   FP_LOOKAHEAD,
   FP_SURPLUS,
   EARLY_LEN_SEATS,
+  TIME_TILT,
 });
 
 // ---- Types ----
@@ -947,7 +960,14 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
     !simsOnlyVickrey &&
     input.leaveAlpha !== undefined &&
     isDeadLetter(input.letter, input.delta, input.leaveAlpha);
-  const kappaExact = dead ? kappaRule * p.DEAD_KAPPA_SCALE : kappaRule;
+  // Word-play knob (TIME_TILT, off by default): a linear tilt of kappa from early to late.
+  const apm = input.auctionsPerMatch ?? 0;
+  const tilt =
+    p.TIME_TILT !== 0 && paced && apm > 1 && realRivals >= p.EARLY_MIN_REAL_RIVALS
+      ? Math.max(0.1, 1 + p.TIME_TILT * (1 - (2 * Math.max(0, apm - 1 - input.bagTotal)) / (apm - 1)))
+      : 1;
+  const kappaTilted = kappaRule * tilt;
+  const kappaExact = dead ? kappaTilted * p.DEAD_KAPPA_SCALE : kappaTilted;
   const kappa = +kappaExact.toFixed(4); // for the reason strings
   let full = Math.floor(kappaExact * input.delta);
   let tag = dead ? ` dead x${p.DEAD_KAPPA_SCALE}` : "";

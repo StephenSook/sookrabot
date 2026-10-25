@@ -249,6 +249,10 @@ interface LognormalBid {
 interface RivalModel {
   botId: number;
   policy: "shark" | "hazard" | "shark-noflush";
+  /** Calibration (field modifier ,xpack): the flush plays the optimal packing (packExact) instead of the greedy one. */
+  xpack?: boolean;
+  /** Calibration (field modifier ,rx=<s>): every word's reward (score and coins) times s, rounded half to even. */
+  rewardX?: number;
   hazard: { c0: number; c1: number } | null;
   bid: SurvivalBid | LognormalBid;
   /** Robustness option: clock blocks by auction index (1-50, 51-58, 59-63, 64+) instead of auctions left. */
@@ -348,6 +352,53 @@ const RIVALS: Record<string, RivalModel> = JSON.parse(
 ).rivals;
 
 const VCLASS: Record<number, string> = { 1: "v1", 2: "v2", 3: "v3", 4: "v4", 5: "v5+", 8: "v5+", 10: "v5+" };
+
+// ---- live bid calibration (field modifier ,cal) ----
+//
+// The live price to beat, M (the highest of the rival bids, seen from SookraBot's seat), by letter group and
+// phase, from the 248 live matches of the winners teardown (2026-10-24, matches 12292 to 14430). The fitted
+// rivals underbid it (SookraBot wins 16 letters at 12 in the harness against 12.4 at 14 live), so ,cal passes
+// every fitted rival's bid through a monotone map per group x phase: bid -> map(bid), capped at the balance.
+// M is a max over rivals and the map is increasing, so map(max) = max(map): the knots are the quantiles of
+// the harness M (x) against the live M (y), refitted by `calib` until the two agree (fixtures/bidcal-live.json).
+
+/** Letter group of the teardown tables. */
+export function letterGroup(c: string): string {
+  return "AEIOU".includes(c) ? "vowel" : c === "S" ? "S" : "LNRT".includes(c) ? "LNRT" : "DG".includes(c) ? "DG"
+    : "BCMP".includes(c) ? "BCMP" : "FHVWY".includes(c) ? "FHVWY" : "KJXQZ";
+}
+/** Phase of auction k (1-based) of `auctions`, on the 68-auction clock: early rounds 0-22, mid 23-45, late 46-67. */
+export function phaseOf(k: number, auctions: number): string {
+  const r = auctions > 1 ? ((k - 1) * 67) / (auctions - 1) : 0;
+  return r <= 22.5 ? "early" : r <= 45.5 ? "mid" : "late";
+}
+export interface BidCal {
+  /** Per "group|phase": increasing [harness bid, live bid] knots; linear between, slope 1 past the last. */
+  knots: Record<string, [number, number][]>;
+}
+/** A fitted rival's bid after the calibration map (0 stays 0; a positive bid stays at least 1). */
+export function calBid(cal: BidCal, letter: string, k: number, auctions: number, amt: number, balance: number): number {
+  if (amt <= 0) return amt;
+  const ks = cal.knots[`${letterGroup(letter)}|${phaseOf(k, auctions)}`];
+  if (!ks || ks.length === 0) return amt;
+  let y: number;
+  if (amt <= ks[0][0]) y = ks[0][0] > 0 ? (amt * ks[0][1]) / ks[0][0] : ks[0][1];
+  else if (amt >= ks[ks.length - 1][0]) y = ks[ks.length - 1][1] + (amt - ks[ks.length - 1][0]);
+  else {
+    let i = 1;
+    while (ks[i][0] < amt) i++;
+    const [x0, y0] = ks[i - 1];
+    const [x1, y1] = ks[i];
+    y = x1 > x0 ? y0 + ((amt - x0) * (y1 - y0)) / (x1 - x0) : y1;
+  }
+  return Math.max(1, Math.min(balance, roundHalfEven(y)));
+}
+const BIDCAL_FIXTURE = new URL("./fixtures/bidcal-live.json", import.meta.url);
+/** The ,cal map: SELFPLAY_BIDCAL (a file, for calib's refits) or fixtures/bidcal-live.json. */
+function loadBidCal(): BidCal {
+  const file = process.env.SELFPLAY_BIDCAL ? path.resolve(process.env.SELFPLAY_BIDCAL) : fileURLToPath(BIDCAL_FIXTURE);
+  return JSON.parse(fs.readFileSync(file, "utf8")) as BidCal;
+}
 
 /** Clock block by auctions still to come (idx 1-50, 51-58, 59-63, 64-67 of a 68-auction match). */
 function blockOf(bagLeft: number): number {
@@ -455,6 +506,10 @@ interface Seat {
   regimes?: number[];
   /** Points scored by when the word was played: 0-22, 23-45, 46-60, 61-66, 67+ auctions closed (validate5). */
   phasePts: number[];
+  /** Length of each word played, in order (calib). */
+  wordLens: number[];
+  /** Auctions closed when the last word was played (calib). */
+  lastWord: number | null;
 }
 
 /**
@@ -644,11 +699,14 @@ class Table {
       if ((seat.rack.get(String.fromCharCode(65 + i)) ?? 0) < need[i]) return false;
     }
     for (const c of word) seat.rack.set(c, seat.rack.get(c)! - 1);
-    const r = wordReward(word);
+    const rx = seat.spec.kind === "fitted" ? seat.spec.model.rewardX : undefined;
+    const r = rx !== undefined ? roundHalfEven(wordReward(word) * rx) : wordReward(word);
     seat.balance += r;
     seat.score += r;
     seat.words++;
     if (word.length >= 7) seat.sevens++;
+    seat.wordLens.push(word.length);
+    seat.lastWord = this.closed;
     seat.phasePts[this.closed <= 22 ? 0 : this.closed <= 45 ? 1 : this.closed <= 60 ? 2 : this.closed <= 66 ? 3 : 4] += r;
     if (seat.firstWord === null) seat.firstWord = this.closed;
     return true;
@@ -678,7 +736,8 @@ function rivalAct(table: Table, seat: Seat, m: RivalModel, bagLeft: number, fina
   const counts = countsOf(seat.rack);
   const cands = index.scan(counts, false);
   const flush = () => {
-    for (const k of index.pack(cands, counts, -1).keys) table.playKey(seat, k);
+    const packed = m.xpack ? index.packExact(cands, counts, -1, 0, 200000) : index.pack(cands, counts, -1);
+    for (const k of packed.keys) table.playKey(seat, k);
   };
   const sevens = () => {
     for (;;) {
@@ -745,6 +804,10 @@ export interface SeatResult {
   regimes?: number[];
   /** Points by when they were scored: 0-22, 23-45, 46-60, 61-66, 67+ auctions closed. */
   phasePts: number[];
+  /** Length of each word played, in order. */
+  wordLens: number[];
+  /** Auctions closed when the last word was played (null: none). */
+  lastWord: number | null;
 }
 
 /** How a match is played: the auction rule and the fitted rivals' bid scale. */
@@ -752,6 +815,8 @@ export interface MatchEnv {
   auction: AuctionKind;
   /** Every fitted rival's bid times this, rounded half to even (1: as fitted). */
   shade: number;
+  /** Field modifier ,cal: the live bid calibration map, applied to every fitted rival's bid after shade. */
+  cal?: BidCal;
 }
 export const VICKREY: MatchEnv = { auction: "Vickrey", shade: 1 };
 
@@ -769,6 +834,8 @@ export interface MatchOpts {
   fpHistory?: readonly (readonly PricePoint[] | null)[];
   /** Count each fitted seat's auctions by letter regime (SeatResult.regimes; validate5). */
   regimes?: boolean;
+  /** Called once per auction: the best rival bid M seen from seat 0, seat 0's bid, and what seat 0 paid if it won. */
+  mTrace?: (t: { k: number; auctions: number; letter: string; M: number; mine: number; won: boolean; paid: number }) => void;
 }
 
 /**
@@ -832,6 +899,8 @@ export async function playMatch(
     wonLetters: new Int32Array(26),
     sevens: 0,
     phasePts: [0, 0, 0, 0, 0],
+    wordLens: [],
+    lastWord: null,
   }));
   const botRows = new Map<bigint, BotRow>();
   for (const s of seats) {
@@ -914,6 +983,7 @@ export async function playMatch(
         const q = !c7 && !special && (m.rho ?? 0) > 0 && bagLeft > 0 ? rackRank(index, s, letter) : 0.5;
         let amt = rivalBid(m, s.bidRng, letter, bagLeft, s.balance, auctions, q, c7, gain);
         if (env.shade !== 1 && amt > 0) amt = Math.max(0, Math.min(roundHalfEven(amt * env.shade), s.balance));
+        if (env.cal && amt > 0) amt = calBid(env.cal, letter, k, auctions, amt, s.balance);
         amounts.set(s, amt);
       }
     }
@@ -977,6 +1047,10 @@ export async function playMatch(
         }
       }
     }
+    if (opts.mTrace) {
+      const M = Math.max(0, ...seats.slice(1).map((o) => amounts.get(o)!));
+      opts.mTrace({ k, auctions, letter, M, mine: amounts.get(seats[0])!, won: w === 0, paid: w === 0 ? paid : 0 });
+    }
     const result: AuctionResultRow = {
       auctionId,
       matchId: MATCH,
@@ -1014,6 +1088,8 @@ export async function playMatch(
       wonLetters: [...s.wonLetters].map((k, i) => String.fromCharCode(65 + i).repeat(k)).join(""),
       ...(s.regimes ? { regimes: [...s.regimes] } : {}),
       phasePts: [...s.phasePts],
+      wordLens: [...s.wordLens],
+      lastWord: s.lastWord,
     })),
   };
 }
@@ -1512,6 +1588,10 @@ export interface FieldSpec {
    * Absent unless set.
    */
   smart?: boolean;
+  /** Calibration (,xpack): every fitted rival flushes the optimal packing. */
+  xpack?: boolean;
+  /** Calibration (,rx=<s>): every fitted rival's word rewards times s. */
+  rx?: number;
 }
 
 /** "<name>[@<rho>][,fp][,vickrey][,shade=<s>][,warm][,smart]" (see the header). */
@@ -1529,29 +1609,43 @@ export function parseField(text: string): FieldSpec {
   let shade = 1;
   let warm = false;
   let smart = false;
+  let cal: BidCal | undefined;
+  let xpack = false;
+  let rx: number | undefined;
   for (const mod of mods) {
     if (mod === "fp") auction = "FirstPrice";
     else if (mod === "vickrey") auction = "Vickrey";
     else if (mod === "warm") warm = true;
     else if (mod === "smart") smart = true;
+    else if (mod === "cal") cal = loadBidCal();
+    else if (mod === "xpack") xpack = true;
+    else if (mod.startsWith("rx=")) {
+      rx = Number(mod.slice(3));
+      if (!(rx > 0 && Number.isFinite(rx))) throw new Error(`rx must be a number > 0: ${mod}`);
+    }
     else if (mod.startsWith("shade=")) {
       shade = Number(mod.slice("shade=".length));
       if (mod === "shade=" || !(shade > 0 && Number.isFinite(shade))) throw new Error(`shade must be a number > 0: ${mod}`);
-    } else throw new Error(`unknown field modifier ${mod} in ${text} (fp, vickrey, shade=<s>, warm, smart)`);
+    } else throw new Error(`unknown field modifier ${mod} in ${text} (fp, vickrey, shade=<s>, warm, smart, cal, xpack, rx=<s>)`);
   }
   if (warm && auction !== "FirstPrice") throw new Error(`field ${text}: warm carries first-price history; add fp`);
-  return { name: text, base, rho, env: { auction, shade }, warm, ...(smart ? { smart: true } : {}) };
+  return {
+    name: text, base, rho, env: { auction, shade, ...(cal ? { cal } : {}) }, warm, ...(smart ? { smart: true } : {}),
+    ...(xpack ? { xpack: true } : {}), ...(rx !== undefined ? { rx } : {}),
+  };
 }
 
 /** The seats of match `ms` of this field, with the focal SookraBot playing `policy`. */
 function fieldSeats(field: FieldSpec, policy: Policy, ms: number): SeatSpec[] {
   const specs = FIELDS[field.base].seats(sookra("SookraBot", policy), mulberry32(mix(ms, STREAM.field)));
   const rho = field.rho;
-  if (rho === undefined && !field.smart) return specs;
+  if (rho === undefined && !field.smart && !field.xpack && field.rx === undefined) return specs;
   return specs.map((s): SeatSpec => {
     if (s.kind !== "fitted") return s;
     let model: RivalModel = rho === undefined ? s.model : { ...s.model, rho };
     if (field.smart) model = { ...model, policy: "shark", minLen: undefined, sharkLen: undefined };
+    if (field.xpack) model = { ...model, xpack: true };
+    if (field.rx !== undefined) model = { ...model, rewardX: field.rx };
     return { ...s, model };
   });
 }
@@ -1724,7 +1818,7 @@ function loadIndex(): WordIndex {
 /** sha256 (first 12 hex) of everything a self-play result depends on. */
 function codeHash(): string {
   const h = crypto.createHash("sha256");
-  for (const f of ["bot.ts", "strategy.ts", "engine.ts", "selfplay.ts", "fixtures/rival-models.json", "fixtures/rival-live-v5.json"]) {
+  for (const f of ["bot.ts", "strategy.ts", "engine.ts", "selfplay.ts", "fixtures/rival-models.json", "fixtures/rival-live-v5.json", "fixtures/bidcal-live.json"]) {
     h.update(f);
     h.update(fs.readFileSync(new URL(`./${f}`, import.meta.url)));
   }
@@ -2199,6 +2293,79 @@ function list() {
   console.log(`v5k calibration: ${JSON.stringify(V5_CALIBRATION)}`);
 }
 
+/**
+ * calib: the harness's live-comparable numbers for one field and variant. The best rival bid M seen from
+ * the focal seat, by letter group and phase (quantiles 0.05 to 0.95, as live_targets.py computes the live
+ * ones), and the focal bot's place, firsts, score, letters won, coins by phase, word lengths and endgame.
+ */
+export async function calib(fieldText: string, n: number, seed: number, variantName = "head"): Promise<Record<string, unknown>> {
+  const field = parseField(fieldText);
+  const variant = parseVariant(variantName);
+  const index = loadIndex();
+  const cells = new Map<string, number[]>();
+  const coins = [0, 0, 0];
+  const winsByPhase = [0, 0, 0];
+  const winsByGroup = new Map<string, number>();
+  const acc = { place: 0, first: 0, score: 0, won: 0, paid: 0, words: 0, w7: 0, w3: 0, endRack: 0, rivalScore: 0, bestRival: 0, rivalWon: 0, lastWord: 0, lastIn67: 0, afterLast: 0, balance: 0 };
+  let nw = 0;
+  for (let i = 0; i < n; i++) {
+    const ms = mix(seed, i);
+    const wins: number[] = [];
+    const res = await playMatch(index, fieldSeats(field, variant.policy, ms), ms, field.env, {
+      mTrace: (t) => {
+        const key = `${letterGroup(t.letter)}|${phaseOf(t.k, t.auctions)}`;
+        let xs = cells.get(key);
+        if (!xs) cells.set(key, (xs = []));
+        xs.push(t.M);
+        if (t.won) {
+          const ph = phaseOf(t.k, t.auctions);
+          coins[ph === "early" ? 0 : ph === "mid" ? 1 : 2] += t.paid;
+          winsByPhase[ph === "early" ? 0 : ph === "mid" ? 1 : 2]++;
+          winsByGroup.set(letterGroup(t.letter), (winsByGroup.get(letterGroup(t.letter)) ?? 0) + 1);
+          wins.push(t.k);
+        }
+      },
+    });
+    const me = res.seats[0];
+    const others = res.seats.slice(1);
+    const auctions = BAG_TILES - RACK * res.seats.length;
+    acc.place += 1 + others.filter((o) => o.score > me.score).length;
+    acc.first += others.every((o) => o.score <= me.score) ? 1 : 0;
+    acc.score += me.score;
+    acc.won += me.won;
+    acc.paid += me.paid;
+    acc.balance += me.balance;
+    acc.words += me.wordLens.length;
+    nw += me.wordLens.length;
+    acc.w7 += me.wordLens.filter((l) => l >= 7).length;
+    acc.w3 += me.wordLens.filter((l) => l <= 3).length;
+    acc.endRack += me.endRack;
+    acc.rivalScore += others.reduce((a, o) => a + o.score, 0) / others.length;
+    acc.bestRival += Math.max(...others.map((o) => o.score));
+    acc.rivalWon += others.reduce((a, o) => a + o.won, 0) / others.length;
+    // lastWord counts auctions closed: a word played while auction k is open has k - 1 closed (round k - 1).
+    const lw = me.lastWord ?? 0;
+    acc.lastWord += lw;
+    acc.lastIn67 += lw >= auctions - 1 ? 1 : 0;
+    acc.afterLast += wins.filter((k) => k - 1 >= lw).length;
+  }
+  const qs = Array.from({ length: 19 }, (_, j) => 0.05 * (j + 1));
+  const out: Record<string, unknown> = { field: fieldText, variant: variantName, n, seed };
+  for (const [k, v] of Object.entries(acc)) out[k] = +(v / n).toFixed(3);
+  out.share7 = +(acc.w7 / Math.max(1, nw)).toFixed(3);
+  out.share3 = +(acc.w3 / Math.max(1, nw)).toFixed(3);
+  out.coinsByPhase = coins.map((c) => +(c / n).toFixed(1));
+  out.winsByPhase = winsByPhase.map((c) => +(c / n).toFixed(2));
+  out.winsByGroup = Object.fromEntries([...winsByGroup].sort().map(([g, c]) => [g, +(c / n).toFixed(2)]));
+  out.cells = Object.fromEntries(
+    [...cells].sort().map(([key, xs]) => {
+      xs.sort((a, b) => a - b);
+      return [key, { n: xs.length, zero: +(xs.filter((x) => x <= 1).length / xs.length).toFixed(4), q: qs.map((q) => xs[Math.min(xs.length - 1, Math.floor(q * xs.length))]), mean: +(xs.reduce((a, b) => a + b, 0) / xs.length).toFixed(2) }];
+    }),
+  );
+  return out;
+}
+
 async function main() {
   const [mode = "sims", ...args] = process.argv.slice(2);
   const opts = args.filter((a) => a.startsWith("--"));
@@ -2246,6 +2413,9 @@ async function main() {
     for (const s of await calibrate5(Number(pos[0] ?? 6), Number(pos[1] ?? 576), Number(pos[2] ?? 1), base, pos[4] ?? "", gamma, update)) {
       console.log(JSON.stringify(s));
     }
+  } else if (mode === "calib") {
+    if (pos.length < 3) throw new Error("usage: calib <field> <matches> <seed> [variant]");
+    console.log(JSON.stringify(await calib(pos[0], Number(pos[1]), Number(pos[2]), pos[3] ?? "head")));
   } else if (mode === "list") {
     list();
   } else {
