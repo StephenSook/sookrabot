@@ -177,6 +177,8 @@ const BAG: Record<string, number> = {
 const BAG_TILES = Object.values(BAG).reduce((a, b) => a + b, 0);
 const RACK = 5;
 const START_BALANCE = 100;
+/** The focal seat sees rivals frozen at their match-start rows (see Table.connFor). */
+const STALE_RIVALS = process.env.SELFPLAY_STALE_RIVALS === "1";
 const SIMS: [string, SimStrategy][] = [
   ["Cheapo", "Cheapskate"], ["Valor", "ValueBidder"], ["Brutus", "Aggressive"],
   ["Hagrid", "ValueBidder"], ["Maverick", "Aggressive"], ["Snippet", "Cheapskate"],
@@ -596,8 +598,19 @@ class Table {
         matchState: { id: { find: (id: bigint) => (id === MATCH ? this.matchState : undefined) } },
         auction: { id: { find: (id: bigint) => (this.auction && this.auction.id === id ? this.auction : undefined) } },
         matchParticipant: {
+          // SELFPLAY_STALE_RIVALS=1: the focal seat sees every rival at its match-start row (balance
+          // START_BALANCE, score 0), as the live bot did under the self-join window subscription of 43f280a,
+          // which delivered rival rows once and never their updates.
           iter: (): Iterable<ParticipantRow> =>
-            this.seats.map((s) => ({ matchId: MATCH, botId: s.id, balance: BigInt(s.balance), score: BigInt(s.score) })),
+            this.seats.map((s) => {
+              const stale = STALE_RIVALS && seat === this.seats[0] && s !== seat;
+              return {
+                matchId: MATCH,
+                botId: s.id,
+                balance: BigInt(stale ? START_BALANCE : s.balance),
+                score: BigInt(stale ? 0 : s.score),
+              };
+            }),
         },
         myRack: {
           iter: (): Iterable<HoldingRow> =>
