@@ -1823,6 +1823,11 @@ function codeHash(): string {
     h.update(fs.readFileSync(new URL(`./${f}`, import.meta.url)));
   }
   h.update(fs.readFileSync(WORDLIST));
+  // A ,cal map from SELFPLAY_BIDCAL replaces the fixture for ,cal fields, so it is part of what produced the rows.
+  if (process.env.SELFPLAY_BIDCAL) {
+    h.update("SELFPLAY_BIDCAL");
+    h.update(fs.readFileSync(path.resolve(process.env.SELFPLAY_BIDCAL)));
+  }
   return h.digest("hex").slice(0, 12);
 }
 
@@ -2300,6 +2305,8 @@ function list() {
  */
 export async function calib(fieldText: string, n: number, seed: number, variantName = "head"): Promise<Record<string, unknown>> {
   const field = parseField(fieldText);
+  // calib plays every match cold: a ,warm field would be labelled warm and measured cold.
+  if (field.warm) throw new Error(`calib does not play the ,warm burn-in; drop ,warm from ${fieldText}`);
   const variant = parseVariant(variantName);
   const index = loadIndex();
   const cells = new Map<string, number[]>();
