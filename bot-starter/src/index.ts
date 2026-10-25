@@ -53,6 +53,12 @@ const BOT_NAME = process.env.BOT_NAME ?? "bot";
 const BOT_TOKEN = process.env.BOT_TOKEN; // from the website, first run only
 const BOT_NONCE = process.env.BOT_NONCE; // from the CLI, first run only
 const TOURNAMENT_ID = process.env.TOURNAMENT_ID;
+/**
+ * With no TOURNAMENT_ID, the bot registers itself for any tournament that is
+ * taking registrations (the module allows one active tournament at a time),
+ * so entering one needs no restart or redeploy. AUTO_REGISTER=0 turns it off.
+ */
+const AUTO_REGISTER = process.env.AUTO_REGISTER !== "0";
 const SUBSCRIBE_ALL = process.env.SUBSCRIBE_ALL === "1";
 const OBSERVE_BOT_ID = process.env.OBSERVE_BOT_ID ? BigInt(process.env.OBSERVE_BOT_ID) : null;
 if (OBSERVE_BOT_ID !== null && (BOT_TOKEN || BOT_NONCE || TOURNAMENT_ID)) {
@@ -356,6 +362,9 @@ function onConnect(conn: DbConnection, identity: Identity, token: string, id: nu
     supervisor.noteAuctionEvent();
     bot.onAuctionResult(c, r);
   });
+  // A tournament opening for registration while we run (bootstrapActivity covers one already open).
+  conn.db.tournament.onInsert((_ctx, t) => live() && autoRegister(conn, t));
+  conn.db.tournament.onUpdate((_ctx, _old, t) => live() && autoRegister(conn, t));
 
   // When a match this bot was in ends, report it and hop back into the lobby.
   conn.db.matchState.onUpdate((_ctx, old, neu) => {
@@ -392,6 +401,29 @@ function joinLobby(conn: DbConnection) {
   }
 }
 
+/** Tournament ids each connection already asked to register for (the reducer is idempotent; this keeps the log quiet). */
+const autoRegistered = new WeakMap<DbConnection, Set<string>>();
+
+/** Register for `t` if it is taking registrations (AUTO_REGISTER, no TOURNAMENT_ID). */
+function autoRegister(conn: DbConnection, t: { id: bigint; status: { tag: string } }) {
+  try {
+    if (TOURNAMENT_ID || !AUTO_REGISTER || OBSERVE_BOT_ID !== null || bot.myBotId === null) return;
+    if (t.status.tag !== "Registration") return;
+    let asked = autoRegistered.get(conn);
+    if (!asked) autoRegistered.set(conn, (asked = new Set()));
+    const key = String(t.id);
+    if (asked.has(key)) return;
+    asked.add(key);
+    console.log(`[${BOT_NAME}] tournament ${key} is taking registrations; registering`);
+    conn.reducers
+      .registerForTournament({ tournamentId: t.id })
+      .then(() => console.log(`[${BOT_NAME}] registered for tournament ${key}`))
+      .catch(logFailure(`registering for tournament ${key}`));
+  } catch (err) {
+    bot.warn("auto-register", err);
+  }
+}
+
 function bootstrapActivity(conn: DbConnection) {
   if (TOURNAMENT_ID) {
     conn.reducers
@@ -401,6 +433,7 @@ function bootstrapActivity(conn: DbConnection) {
       )
       .catch(logFailure(`registering for tournament ${TOURNAMENT_ID}`));
   }
+  for (const t of conn.db.tournament.iter()) autoRegister(conn, t);
   joinLobby(conn);
   activeConn = asConn(conn);
   bot.tick(activeConn);

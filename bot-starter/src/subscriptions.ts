@@ -12,7 +12,7 @@
 //
 // - base (kept for the connection's life, scoped by its identity, or by
 //   OBSERVE_BOT_ID in observer mode): our credential, the bot table, our rack
-//   (view) and our lobby memberships.
+//   (view), our lobby memberships and the tournament table.
 // - seed (temporary): every seat we ever had, to find our recent matches. It
 //   is dropped once the window is applied, which holds the seats that matter.
 // - window (re-floored as matches pass): every row of our most recent
@@ -61,6 +61,7 @@ export const READ_TABLES = [
   "match_state",
   "auction",
   "auction_result",
+  "tournament",
 ] as const;
 
 export interface Floors {
@@ -99,6 +100,8 @@ export function baseQueries(scope: BaseScope): string[] {
     `SELECT * FROM bot`,
     `SELECT * FROM my_rack`,
     ourRows(scope, "lobby_member", "lm"),
+    // One row per tournament ever created (one active at a time): index.ts autoRegister.
+    `SELECT * FROM tournament`,
   ];
 }
 

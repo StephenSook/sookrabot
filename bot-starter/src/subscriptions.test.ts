@@ -58,7 +58,7 @@ test("queries read only the tables the bot uses, a strict subset of the schema",
       assert.ok(schema.includes(t), `${t} is not in the bindings`);
     }
     assert.ok(read.size < schema.length, "subscribes to every table");
-    for (const big of ["auction_top_bid_archive", "word_play", "bot_stats", "tournament", "visible_auction_top_bids"]) {
+    for (const big of ["auction_top_bid_archive", "word_play", "bot_stats", "tournament_entry", "visible_auction_top_bids"]) {
       assert.ok(!read.has(big), `${big} subscribed`);
     }
   }
@@ -71,9 +71,9 @@ test("every query on a growing table is filtered", () => {
       if (tablesOf(q).some((t) => growing.has(t))) assert.match(q, / WHERE /, q);
     }
   }
-  // The only unfiltered queries are the small bot table and our own rack view.
+  // The only unfiltered queries are the small bot and tournament tables and our own rack view.
   const unfiltered = everyQuery(SCOPE).filter((q) => !q.includes(" WHERE "));
-  assert.deepEqual(unfiltered.sort(), ["SELECT * FROM bot", "SELECT * FROM my_rack"]);
+  assert.deepEqual(unfiltered.sort(), ["SELECT * FROM bot", "SELECT * FROM my_rack", "SELECT * FROM tournament"]);
 });
 
 test("queries scope to our identity, or to the observed bot id", () => {
