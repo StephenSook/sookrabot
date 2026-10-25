@@ -11,6 +11,8 @@ import {
   READ_TABLES,
   REFLOOR_MIN_STEP_MS,
   REFLOOR_RETRY_MS,
+  SEAT_FLOOR_MIN_STEP,
+  floorsMoved,
   PlanChain,
   TargetedSubscription,
   WINDOW_MATCHES,
@@ -255,6 +257,41 @@ test("re-floor: a new window replaces the old only once applied; small moves are
   const t2 = t1 + REFLOOR_RETRY_MS + REFLOOR_MIN_STEP_MS;
   assert.equal(plan.refloor([30n], t2), true);
   assert.equal(handles[4].queries[0].includes("mp.match_id >= 20"), true);
+});
+
+test("re-floor: between matches the seat range rises to the newest known match and never falls", async () => {
+  const { plan, handles } = harness();
+  plan.start();
+  handles[0].apply();
+  handles[1].apply();
+  plan.openWindow(9n, [10n, 20n, 30n], NOW);
+  handles[2].apply();
+  await settle();
+  assert.ok(handles[2].queries.includes("SELECT * FROM match_participant WHERE match_id >= 10"));
+  // Idle: same seats, small game move, but the seat floor rose by SEAT_FLOOR_MIN_STEP or more.
+  const t1 = NOW + 1000;
+  assert.equal(plan.refloor([10n, 20n, 30n], t1, 10n + SEAT_FLOOR_MIN_STEP - 1n), false, "a small seat move is skipped");
+  assert.equal(plan.refloor([10n, 20n, 30n], t1, 500n), true);
+  assert.ok(handles[3].queries.includes("SELECT * FROM match_participant WHERE match_id >= 500"));
+  assert.ok(handles[3].queries.some((q) => q.includes("mp.match_id >= 10")), "our own floor is unchanged");
+  handles[3].apply();
+  await settle();
+  // In a match (no seat floor passed) and after a lower one: the seat floor stays at 500.
+  const t2 = t1 + REFLOOR_RETRY_MS + REFLOOR_MIN_STEP_MS;
+  assert.equal(plan.refloor([10n, 20n, 30n, 600n], t2), true);
+  assert.ok(handles[4].queries.includes("SELECT * FROM match_participant WHERE match_id >= 500"));
+  handles[4].apply();
+  await settle();
+  const t3 = t2 + REFLOOR_RETRY_MS + REFLOOR_MIN_STEP_MS;
+  assert.equal(plan.refloor([10n, 20n, 30n, 600n], t3, 400n), true);
+  assert.ok(handles[5].queries.includes("SELECT * FROM match_participant WHERE match_id >= 500"));
+});
+
+test("seat range: a seat floor at or below our own floor changes nothing", () => {
+  const w = windowQueries(9n, { mine: 3800n, gameSinceMs: NOW, seats: 100n });
+  assert.ok(w.includes("SELECT * FROM match_participant WHERE match_id >= 3800"));
+  assert.ok(floorsMoved({ mine: 3800n, gameSinceMs: NOW }, { mine: 3800n, gameSinceMs: NOW, seats: 3800n + SEAT_FLOOR_MIN_STEP }));
+  assert.ok(!floorsMoved({ mine: 3800n, gameSinceMs: NOW }, { mine: 3800n, gameSinceMs: NOW, seats: 100n }));
 });
 
 test("a reconnect replay with a re-floor pending reports ready once, on the promoted window", async () => {

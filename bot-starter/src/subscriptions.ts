@@ -69,7 +69,17 @@ export interface Floors {
   mine: bigint;
   /** Game-wide results from this time on (ms since the epoch). */
   gameSinceMs: number;
+  /**
+   * Lowest match id of the seat range (seatsQuery); undefined means `mine`.
+   * Raised between matches to the newest match id the cache knows (index.ts
+   * refloor), so the range, which holds every table's seats from its floor on,
+   * stops growing while we wait (finals matches start only when the admin starts them).
+   */
+  seats?: bigint;
 }
+
+/** A raised seat floor is worth a new window once it moved by at least this many matches. */
+export const SEAT_FLOOR_MIN_STEP = 25n;
 
 export interface BaseScope {
   /** Hex identity of this connection (no 0x). */
@@ -117,15 +127,19 @@ export function seedQueries(scope: BaseScope): string[] {
  * score 0) for the whole match, logged "rank 1/6" for every match it played,
  * and its rival caps and broke-rival bids never fired. Read-only probe of
  * 2026-10-24 (analysis scripts/ts/probe_rival_rows.ts, 45 s, bot 9's tables):
- * the self-join delivered 0 rival updates, a plain match_id range query 44.
- * The range also holds other tables' seats from our floor on, a few hundred
- * rows. Floor 0 (fewer than WINDOW_MATCHES matches of ours) would be the whole
- * table, so that case keeps the self-join.
+ * the self-join delivered 0 rival updates, a plain match_id range query 44,
+ * and the self-join written the other way round (o JOIN mp) also 0.
+ * The range also holds other tables' seats from its floor on, a few hundred
+ * rows (Floors.seats keeps it from growing between matches). Floor 0 (fewer
+ * than WINDOW_MATCHES matches of ours) would be the whole table, so that case
+ * keeps the self-join.
  */
-export function seatsQuery(botId: bigint, floor: bigint): string {
-  return floor > 0n
-    ? `SELECT * FROM match_participant WHERE match_id >= ${floor}`
-    : `SELECT o.* FROM match_participant mp JOIN match_participant o ON mp.match_id = o.match_id WHERE mp.bot_id = ${botId} AND mp.match_id >= ${floor}`;
+export function seatsQuery(botId: bigint, floors: Floors): string {
+  if (floors.mine <= 0n) {
+    return `SELECT o.* FROM match_participant mp JOIN match_participant o ON mp.match_id = o.match_id WHERE mp.bot_id = ${botId} AND mp.match_id >= ${floors.mine}`;
+  }
+  const floor = floors.seats !== undefined && floors.seats > floors.mine ? floors.seats : floors.mine;
+  return `SELECT * FROM match_participant WHERE match_id >= ${floor}`;
 }
 
 export function windowQueries(botId: bigint, floors: Floors): string[] {
@@ -134,7 +148,7 @@ export function windowQueries(botId: bigint, floors: Floors): string[] {
     `SELECT ms.* FROM match_participant mp JOIN match_state ms ON mp.match_id = ms.id WHERE ${mine}`,
     `SELECT a.* FROM match_participant mp JOIN auction a ON mp.match_id = a.match_id WHERE ${mine}`,
     `SELECT r.* FROM match_participant mp JOIN auction_result r ON mp.match_id = r.match_id WHERE ${mine}`,
-    seatsQuery(botId, floors.mine),
+    seatsQuery(botId, floors),
     `SELECT l.* FROM lobby_member lm JOIN lobby l ON lm.lobby_id = l.id WHERE lm.bot_id = ${botId}`,
     // Game-wide, for the first-price price history.
     `SELECT * FROM match_state WHERE created_at >= ${timeLiteral(floors.gameSinceMs - MATCH_LOOKBACK_MS)}`,
@@ -153,9 +167,17 @@ export function windowFloors(seatMatchIds: Iterable<bigint>, nowMs: number): Flo
   return { mine, gameSinceMs: nowMs - GAME_WINDOW_MS };
 }
 
-/** Worth a new window: our floor moved up, or the game floor moved by at least REFLOOR_MIN_STEP_MS. */
+/**
+ * Worth a new window: our floor moved up, the game floor moved by at least
+ * REFLOOR_MIN_STEP_MS, or the seat floor rose by at least SEAT_FLOOR_MIN_STEP.
+ */
 export function floorsMoved(cur: Floors, next: Floors): boolean {
-  return next.mine > cur.mine || next.gameSinceMs - cur.gameSinceMs >= REFLOOR_MIN_STEP_MS;
+  const seats = (f: Floors) => (f.seats !== undefined && f.seats > f.mine ? f.seats : f.mine);
+  return (
+    next.mine > cur.mine ||
+    next.gameSinceMs - cur.gameSinceMs >= REFLOOR_MIN_STEP_MS ||
+    seats(next) >= seats(cur) + SEAT_FLOOR_MIN_STEP
+  );
 }
 
 // ---- the subscription state machine ----
@@ -238,14 +260,18 @@ export class TargetedSubscription {
    * window is dropped only once the new one is applied. Skipped while one is
    * pending, before the first window is applied, within REFLOOR_RETRY_MS of
    * the last attempt, or when the floors barely moved. True if one started.
+   * `seatFloor` (only while no match of ours is running) raises the seat
+   * range's floor (Floors.seats); it never moves down.
    */
-  refloor(seatMatchIds: Iterable<bigint>, nowMs: number): boolean {
+  refloor(seatMatchIds: Iterable<bigint>, nowMs: number, seatFloor?: bigint): boolean {
     if (this.stopped || this.quiesced || this.botId === null || this.pending !== null) return false;
     if (!this.window?.handle?.isActive()) return false;
     if (nowMs - this.lastAttemptMs < REFLOOR_RETRY_MS) return false;
     const cur = this.window.floors!;
     const next = windowFloors(seatMatchIds, nowMs);
     if (next.mine < cur.mine) next.mine = cur.mine; // never move our floor down
+    const seats = seatFloor !== undefined && (cur.seats === undefined || seatFloor > cur.seats) ? seatFloor : cur.seats;
+    if (seats !== undefined) next.seats = seats;
     if (!floorsMoved(cur, next)) return false;
     this.lastAttemptMs = nowMs;
     this.addWindow(this.botId, next, "pending");
@@ -312,7 +338,8 @@ export class TargetedSubscription {
           this.pending = null;
           if (old) drop(old.handle);
           this.hooks.log(
-            `window re-floored: our matches from m${floors.mine}, game since ${new Date(floors.gameSinceMs).toISOString()}`,
+            `window re-floored: our matches from m${floors.mine}, seats from m${floors.seats ?? floors.mine}, ` +
+              `game since ${new Date(floors.gameSinceMs).toISOString()}`,
           );
           return;
         }

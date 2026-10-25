@@ -176,7 +176,13 @@ function refloor(why: string) {
   const plan = currentPlan(conn);
   if (!conn || !plan || bot.myBotId === null) return;
   try {
-    if (plan.refloor(seatMatchIds(conn.db, bot.myBotId), Date.now())) {
+    // Between matches, raise the seat range to the newest match we know of: any match of
+    // ours that starts later has a larger id, and the range stops growing while we wait.
+    let seatFloor: bigint | undefined;
+    if (bot.runningMatches(asConn(conn)).length === 0) {
+      for (const m of conn.db.matchState.iter()) if (seatFloor === undefined || m.id > seatFloor) seatFloor = m.id;
+    }
+    if (plan.refloor(seatMatchIds(conn.db, bot.myBotId), Date.now(), seatFloor)) {
       console.log(`[${BOT_NAME}] re-flooring the subscription window (${why})`);
     }
   } catch (err) {
