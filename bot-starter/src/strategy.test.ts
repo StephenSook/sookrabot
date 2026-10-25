@@ -560,9 +560,10 @@ test("final letter: deny it to sims (they can still score it), 0 against real bo
 // ---- word play ----
 
 test("liquidity: a broke bot cashes a short word rather than bid 0 forever (Codex QUIZ example)", () => {
+  // The fallback floor of 2 letters, passed explicitly: the live default is now 5 (self-play run 40170095539).
   const play = (rack: string, myBalance: number) => {
     const counts = countsOf(rack);
-    return chooseWords(INDEX, { counts, cands: INDEX.scan(counts, true), myBalance, flush: false });
+    return chooseWords(INDEX, { counts, cands: INDEX.scan(counts, true), myBalance, flush: false, policy: { ...DEFAULT_POLICY, LIQUIDITY_FALLBACK_MIN_LEN: 2 } });
   };
   // QUIZ is the only word in these tiles and has 4 letters.
   assert.deepEqual(play("QUIZ", 0), ["QUIZ"]);
@@ -573,7 +574,10 @@ test("liquidity: a broke bot cashes a short word rather than bid 0 forever (Code
   // 5+ letter words are preferred when they exist.
   const five = play("QUAKES", 3);
   assert.deepEqual(five, ["QUAKES"]);
-  assert.equal(LIQUIDITY_FALLBACK_MIN_LEN, 2);
+  assert.equal(LIQUIDITY_FALLBACK_MIN_LEN, 5);
+  // With the live default of 5, a broke bot holding only a 4-letter word keeps it.
+  const counts = countsOf("QUIZ");
+  assert.deepEqual(chooseWords(INDEX, { counts, cands: INDEX.scan(counts, true), myBalance: 0, flush: false }), []);
 });
 
 test("shouldFlush: always at the final auction, earlier for short auctions", () => {

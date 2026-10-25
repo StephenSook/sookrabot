@@ -149,7 +149,9 @@ export const HOLD_FROM_BAG = 999;
  */
 export const LIQUIDITY_FLOOR = 15;
 export const LIQUIDITY_MIN_LEN = 5;
-export const LIQUIDITY_FALLBACK_MIN_LEN = 2;
+// 5 (from 2): calibrated self-play run 40170095539 against 87860f0, mean place 6-seat field -0.052 (t -2.83),
+// top five -0.044, first price -0.037, 4 seats -0.121 (t -4.24), 8 seats no change, duel +0.015 (t 2.66).
+export const LIQUIDITY_FALLBACK_MIN_LEN = 5;
 export const LIQUIDITY_TOP_K = 24;
 /**
  * Kappa used when every opponent is a sim. Sims cannot outbid
