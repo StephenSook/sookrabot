@@ -86,6 +86,11 @@ test("queries scope to our identity, or to the observed bot id", () => {
   assert.throws(() => baseQueries({ identityHex: "zz" }), /32-byte identity/);
   const w = windowQueries(9n, { mine: 3800n, gameSinceMs: NOW - GAME_WINDOW_MS });
   assert.ok(w.every((q) => !q.includes("mp.") || q.includes("mp.bot_id = 9 AND mp.match_id >= 3800")));
+  // Rival seats come from a plain range query; the self-join form never delivered rival updates (seatsQuery).
+  assert.ok(w.includes("SELECT * FROM match_participant WHERE match_id >= 3800"));
+  assert.ok(!w.some((q) => q.includes("JOIN match_participant o")));
+  // With no floor yet the range would be the whole table, so that case keeps the self-join.
+  assert.ok(windowQueries(9n, { mine: 0n, gameSinceMs: NOW }).some((q) => q.includes("JOIN match_participant o")));
   assert.ok(w.includes(`SELECT * FROM auction_result WHERE closed_at >= '${new Date(NOW - GAME_WINDOW_MS).toISOString()}'`));
   assert.ok(
     w.includes(

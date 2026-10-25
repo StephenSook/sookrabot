@@ -106,13 +106,32 @@ export function seedQueries(scope: BaseScope): string[] {
   return [ourRows(scope, "match_participant", "mp")];
 }
 
+/**
+ * Every seat at our tables (rivals' balances and scores). Not the self-join
+ * `match_participant mp JOIN match_participant o ON mp.match_id = o.match_id`:
+ * maincloud sends that join's rows once and then only updates of OUR row, so
+ * live build 43f280a saw every rival at its match-start row (balance 100,
+ * score 0) for the whole match, logged "rank 1/6" for every match it played,
+ * and its rival caps and broke-rival bids never fired. Read-only probe of
+ * 2026-10-24 (analysis scripts/ts/probe_rival_rows.ts, 45 s, bot 9's tables):
+ * the self-join delivered 0 rival updates, a plain match_id range query 44.
+ * The range also holds other tables' seats from our floor on, a few hundred
+ * rows. Floor 0 (fewer than WINDOW_MATCHES matches of ours) would be the whole
+ * table, so that case keeps the self-join.
+ */
+export function seatsQuery(botId: bigint, floor: bigint): string {
+  return floor > 0n
+    ? `SELECT * FROM match_participant WHERE match_id >= ${floor}`
+    : `SELECT o.* FROM match_participant mp JOIN match_participant o ON mp.match_id = o.match_id WHERE mp.bot_id = ${botId} AND mp.match_id >= ${floor}`;
+}
+
 export function windowQueries(botId: bigint, floors: Floors): string[] {
   const mine = `mp.bot_id = ${botId} AND mp.match_id >= ${floors.mine}`;
   return [
     `SELECT ms.* FROM match_participant mp JOIN match_state ms ON mp.match_id = ms.id WHERE ${mine}`,
     `SELECT a.* FROM match_participant mp JOIN auction a ON mp.match_id = a.match_id WHERE ${mine}`,
     `SELECT r.* FROM match_participant mp JOIN auction_result r ON mp.match_id = r.match_id WHERE ${mine}`,
-    `SELECT o.* FROM match_participant mp JOIN match_participant o ON mp.match_id = o.match_id WHERE ${mine}`,
+    seatsQuery(botId, floors.mine),
     `SELECT l.* FROM lobby_member lm JOIN lobby l ON lm.lobby_id = l.id WHERE lm.bot_id = ${botId}`,
     // Game-wide, for the first-price price history.
     `SELECT * FROM match_state WHERE created_at >= ${timeLiteral(floors.gameSinceMs - MATCH_LOOKBACK_MS)}`,
