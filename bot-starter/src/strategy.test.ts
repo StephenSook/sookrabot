@@ -962,3 +962,76 @@ test("valuation of a 20-tile rack stays well inside a 250 ms auction", (t) => {
   t.diagnostic(`index build: ${buildMs.toFixed(0)} ms of CPU`);
   assert.ok(buildMs < 5000, `index build ${buildMs.toFixed(0)} ms of CPU`);
 });
+
+test("ALLIN_LAST: at bagTotal 1 a letter with value is bid min(balance, richest rival + 1), no duel reserve, no sims", () => {
+  const bid = (o: Partial<Policy>, x: Partial<Parameters<typeof decideBid>[0]> = {}) =>
+    decideBid({
+      letter: "S", delta: 3, bagTotal: 1, auctionType: "Vickrey", myBalance: 100, opponents: REAL,
+      auctionsPerMatch: 68, ...x, policy: withPolicy(o),
+    });
+  const on = { ALLIN_LAST: 1 };
+  assert.equal(bid(on).amount, 100);
+  assert.match(bid(on).reason, /all-in last/);
+  assert.equal(bid(on, { myBalance: 40 }).amount, 40);
+  const poorer = Array.from({ length: 5 }, (_, i) => ({ isSim: false, balance: 10 + i * 5 }));
+  assert.equal(bid(on, { opponents: poorer }).amount, 31);
+  assert.equal(bid(on, { auctionType: "FirstPrice", opponents: poorer }).amount, 31);
+  // Off, at other auctions, without value, or with a sim seated: exactly the head bid.
+  for (const x of [{ bagTotal: 2 }, { bagTotal: 0 }, { delta: 0 }, { bagTotal: 30 }]) {
+    assert.deepEqual(bid(on, x), bid({}, x), JSON.stringify(x));
+  }
+  assert.ok(bid({}).amount < 100, "head at bagTotal 1 is a value bid");
+  const withSim = [...REAL.slice(0, 4), { isSim: true, strategy: "Aggressive" as const, balance: 100 }];
+  assert.deepEqual(bid(on, { opponents: withSim }), bid({}, { opponents: withSim }));
+  // Duel: head holds back a 1-coin reserve at bagTotal 1; all-in spends it.
+  const duel = { opponents: [{ isSim: false, balance: 100 }], myBalance: 20, auctionsPerMatch: 88 };
+  assert.ok(bid({}, duel).amount <= 19);
+  assert.equal(bid(on, duel).amount, 20);
+});
+
+test("FP_SURPLUS: the first-price bid maximizes (value - b) x G(b), floored at the quantile target", () => {
+  const prices = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+  // G(19) = 9.5 / 10: (30 - 19) x 0.95 = 10.45 beats 10 at 20 and 10.2 at 18.
+  assert.equal(strategy.surplusBid(30, prices, 11, 30), 19);
+  assert.equal(strategy.surplusBid(30, prices, 11, 18), 18, "capped at hi");
+  assert.equal(strategy.surplusBid(12, prices, 11, 12), 11);
+  assert.equal(strategy.surplusBid(30, prices, 25, 30), 25, "never below the floor");
+  assert.equal(strategy.surplusBid(30, [], 5, 30), 5);
+  const bid = (o: Partial<Policy>, delta: number) =>
+    decideBid({
+      letter: "S", delta, bagTotal: 40, auctionType: "FirstPrice", myBalance: 100, opponents: REAL,
+      auctionsPerMatch: 68, fpHistory: prices.map((paid) => ({ face: 1, paid })), policy: withPolicy(o),
+    });
+  // Head caps every letter at the 0.2 quantile + 1 (11 + 1 = 12), a completer worth 40 coins as a filler.
+  assert.equal(bid({}, 12).amount, 12);
+  const hi = bid({ FP_SURPLUS: 1 }, 12);
+  assert.ok(hi.amount > 12, `surplus bid ${hi.amount}`);
+  assert.match(hi.reason, /surplus/);
+  // A letter worth little keeps the head bid (the floor).
+  assert.equal(bid({ FP_SURPLUS: 1 }, 2).amount, bid({}, 2).amount);
+  // Vickrey is untouched.
+  const v = (o: Partial<Policy>) =>
+    decideBid({ letter: "S", delta: 12, bagTotal: 40, auctionType: "Vickrey", myBalance: 100, opponents: REAL, auctionsPerMatch: 68, policy: withPolicy(o) });
+  assert.deepEqual(v({ FP_SURPLUS: 1 }), v({}));
+});
+
+test("EARLY_LEN_SEATS: at 7+ seats the early-cut window is round(28 x auctions / 68)", () => {
+  const seats = (n: number) => Array.from({ length: n - 1 }, () => ({ isSim: false, balance: 100 }));
+  const bid = (o: Partial<Policy>, n: number, idx: number) => {
+    const apm = 98 - 5 * n;
+    return decideBid({
+      letter: "S", delta: 5, bagTotal: apm - 1 - idx, auctionType: "Vickrey", myBalance: 100, opponents: seats(n),
+      auctionsPerMatch: apm, policy: withPolicy(o),
+    }).amount;
+  };
+  const on = { EARLY_LEN_SEATS: 7 };
+  // 8 seats, 58 auctions: window 24. Index 25 is cut in head (window 28), not with the knob.
+  assert.ok(bid(on, 8, 25) > bid({}, 8, 25));
+  assert.equal(bid(on, 8, 23), bid({}, 8, 23));
+  assert.equal(bid(on, 8, 30), bid({}, 8, 30));
+  // 6 seats (window 28 either way) and 4 seats: unchanged.
+  for (const idx of [0, 20, 27, 28, 40]) {
+    assert.equal(bid(on, 6, idx), bid({}, 6, idx));
+    assert.equal(bid(on, 4, idx), bid({}, 4, idx));
+  }
+});
