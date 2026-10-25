@@ -1025,7 +1025,7 @@ export class SookraBot {
       const li = letterIndex(auction.letter);
       const mask = this.policy.COMPLETE7_PREMIUM !== 1 ? this.sevenMasks.get(val) : undefined;
       if (mask !== undefined && li >= 0) extras.completes7 = ((mask >>> li) & 1) === 1;
-      if (this.policy.DEAD_KAPPA_SCALE !== 1) extras.leaveAlpha = val.alpha;
+      if (this.policy.DEAD_KAPPA_SCALE !== 1 || this.policy.DEAD_LATE_BAG > 0) extras.leaveAlpha = val.alpha;
     }
     let decision: BidDecision;
     try {

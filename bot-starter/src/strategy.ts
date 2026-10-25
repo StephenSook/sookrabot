@@ -461,6 +461,13 @@ export const EARLY_REF_AUCTIONS = 68;
  * 73 / 58 / 54, and every bot earns about twice as many points a coin early as late). 0: off.
  */
 export const TIME_TILT = 0;
+/**
+ * DEAD_LATE_BAG: with fewer than this many auctions to come, no bid on a dead letter (isDeadLetter:
+ * worth no more to the rack than its own leave value), whose value is a word that can no longer form.
+ * Live SookraBot wins 0.55 letters a match after its last word (7.2 coins), the flushers 0.07 to 0.16.
+ * 0: off.
+ */
+export const DEAD_LATE_BAG = 0;
 
 /**
  * The tuning constants above, by name: what a SookraBot plays with. Game rules
@@ -529,6 +536,7 @@ export interface Policy {
   readonly FP_SURPLUS: number;
   readonly EARLY_LEN_SEATS: number;
   readonly TIME_TILT: number;
+  readonly DEAD_LATE_BAG: number;
 }
 
 /** The live policy: every field is the constant of the same name. Frozen, so nothing can change it at run time. */
@@ -594,6 +602,7 @@ export const DEFAULT_POLICY: Policy = Object.freeze({
   FP_SURPLUS,
   EARLY_LEN_SEATS,
   TIME_TILT,
+  DEAD_LATE_BAG,
 });
 
 // ---- Types ----
@@ -967,6 +976,16 @@ function valueBid(input: BidInput, rivalCap: number, balance: number, p: Policy)
       ? Math.max(0.1, 1 + p.TIME_TILT * (1 - (2 * Math.max(0, apm - 1 - input.bagTotal)) / (apm - 1)))
       : 1;
   const kappaTilted = kappaRule * tilt;
+  // Word-play knob (DEAD_LATE_BAG, off by default): no late bid on a letter only its leave value prices.
+  if (
+    p.DEAD_LATE_BAG > 0 &&
+    input.bagTotal < p.DEAD_LATE_BAG &&
+    !simsOnlyVickrey &&
+    input.leaveAlpha !== undefined &&
+    isDeadLetter(input.letter, input.delta, input.leaveAlpha)
+  ) {
+    return { amount: 0, reason: `dead-late (bag ${input.bagTotal})` };
+  }
   const kappaExact = dead ? kappaTilted * p.DEAD_KAPPA_SCALE : kappaTilted;
   const kappa = +kappaExact.toFixed(4); // for the reason strings
   let full = Math.floor(kappaExact * input.delta);
