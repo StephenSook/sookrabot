@@ -506,7 +506,13 @@ test("duel rule: one rival means a cash reserve sized to the remaining auctions"
   assert.equal(duel(20, 20), 10); // 20 - 10 reserve
   assert.equal(duel(12, 5), 7); // kappa doubled (51), capped at 12 - 5
   assert.equal(duel(5, 20), 0); // inside the reserve: an even share, floor(5 / 21)
-  assert.equal(duel(3, 1), 2); // max(3 - 1, floor(3 / 2))
+  assert.equal(duel(3, 2), 1); // max(3 - 2, floor(3 / 3))
+  // bagTotal 1, the last usable auction: ALLIN_LAST spends everything (9f1faba: max(3 - 1, floor(3 / 2)) = 2).
+  assert.equal(duel(3, 1), 3);
+  assert.equal(
+    decideBid({ letter: "S", delta: 6, bagTotal: 1, auctionType: "Vickrey", myBalance: 3, opponents: rich, policy: { ...DEFAULT_POLICY, ALLIN_LAST: 0 } }).amount,
+    2,
+  );
   // Six-bot tables keep the measured kappa rule.
   const five: Opponent[] = Array.from({ length: 5 }, () => ({ isSim: false, balance: 100 }));
   assert.equal(
@@ -970,22 +976,23 @@ test("ALLIN_LAST: at bagTotal 1 a letter with value is bid min(balance, richest 
       auctionsPerMatch: 68, ...x, policy: withPolicy(o),
     });
   const on = { ALLIN_LAST: 1 };
+  const off = { ALLIN_LAST: 0 };
   assert.equal(bid(on).amount, 100);
   assert.match(bid(on).reason, /all-in last/);
   assert.equal(bid(on, { myBalance: 40 }).amount, 40);
   const poorer = Array.from({ length: 5 }, (_, i) => ({ isSim: false, balance: 10 + i * 5 }));
   assert.equal(bid(on, { opponents: poorer }).amount, 31);
   assert.equal(bid(on, { auctionType: "FirstPrice", opponents: poorer }).amount, 31);
-  // Off, at other auctions, without value, or with a sim seated: exactly the head bid.
+  // At other auctions, without value, or with a sim seated: exactly the 9f1faba bid (ALLIN_LAST 0).
   for (const x of [{ bagTotal: 2 }, { bagTotal: 0 }, { delta: 0 }, { bagTotal: 30 }]) {
-    assert.deepEqual(bid(on, x), bid({}, x), JSON.stringify(x));
+    assert.deepEqual(bid(on, x), bid(off, x), JSON.stringify(x));
   }
-  assert.ok(bid({}).amount < 100, "head at bagTotal 1 is a value bid");
+  assert.ok(bid(off).amount < 100, "9f1faba at bagTotal 1 is a value bid");
   const withSim = [...REAL.slice(0, 4), { isSim: true, strategy: "Aggressive" as const, balance: 100 }];
-  assert.deepEqual(bid(on, { opponents: withSim }), bid({}, { opponents: withSim }));
-  // Duel: head holds back a 1-coin reserve at bagTotal 1; all-in spends it.
+  assert.deepEqual(bid(on, { opponents: withSim }), bid(off, { opponents: withSim }));
+  // Duel: 9f1faba holds back a 1-coin reserve at bagTotal 1; all-in spends it.
   const duel = { opponents: [{ isSim: false, balance: 100 }], myBalance: 20, auctionsPerMatch: 88 };
-  assert.ok(bid({}, duel).amount <= 19);
+  assert.ok(bid(off, duel).amount <= 19);
   assert.equal(bid(on, duel).amount, 20);
 });
 

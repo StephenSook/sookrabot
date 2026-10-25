@@ -312,6 +312,7 @@ export const LOOKAHEAD_POOL = 1;
  * LOOKAHEAD_MIN_REAL_RIVALS real (non-sim) rivals (3 or more seats); 0:
  * everywhere. Gated off, duels, first-price and sim-padded tables play exactly
  * as head (cloud run seed 7301: 600 of 600 identical in each such field).
+ * FP_LOOKAHEAD (finals-patch) reopens the gate at first-price tables.
  */
 export const LOOKAHEAD_MIN_REAL_RIVALS = 2;
 /**
@@ -385,7 +386,9 @@ export const SPITE_MIN_OBS = 2;
 export const SPEND_FLOOR = 0;
 export const SPEND_FLOOR_MIN_REAL_RIVALS = 2;
 
-// Finals knobs (2026-10-24 evening), each off by default, so DEFAULT_POLICY plays exactly as 9f1faba.
+// Finals knobs (2026-10-24 evening, branch finals-patch). Paired cloud self-play against 9f1faba (head),
+// rivals shading by 0.8 at first-price tables (,fp,shade=0.8,warm), seeds 10241 to 10245; d = variant
+// minus head per match, 95% CI = mean +/- 1.96 se; swiss = Swiss points (match size minus place).
 
 /**
  * ALLIN_LAST: at the last auction a real bot can still use (bagTotal 1: the match ends inside the
@@ -393,26 +396,56 @@ export const SPEND_FLOOR_MIN_REAL_RIVALS = 2;
  * afterwards, so any letter with positive value is bid min(balance, richest rival's balance + 1) in
  * either auction type, with no duel reserve. Only at tables with no sim seated (a sim can still use
  * the final letter, and the final-letter deny bid needs coins). 0: off.
+ *
+ * On (sign fixed by the rules; checked for harm): first price +0.28 points at 6 seats (n 500, CI
+ * +0.15 to +0.40), +0.31 top five (CI +0.10 to +0.52), +0.32 at 4 (n 400, CI +0.22 to +0.43), +0.38
+ * at 8 (CI +0.25 to +0.52, swiss +0.022, CI +0.004 to +0.041); Vickrey 4, 6, 7 and 8 seats: d score
+ * exactly 0 in every match (n 500 each); Vickrey duels +0.01 to +0.10 (n 1500 each, never below 0),
+ * first-price duels +0.04 to +0.58; 3-game final (summed score, 500 finals a field) win share moved
+ * by at most 0.003 either way, summed margin +0.03 to +2.1.
  */
-export const ALLIN_LAST = 0;
+export const ALLIN_LAST = 1;
 /**
  * FP_LOOKAHEAD: the one-step and multi-letter lookaheads (bot.ts lookaheadOn) also run in
  * first-price auctions at tables with at least LOOKAHEAD_MIN_REAL_RIVALS real rivals. 0: off
- * (Vickrey only).
+ * (Vickrey only). Vickrey tables and duels are untouched by construction.
+ *
+ * On: first price, 6-seat field +8.7 points (n 500, CI +6.2 to +11.3; swiss +0.088, CI +0.044 to
+ * +0.132), top five +3.6 (CI +1.3 to +5.9; swiss +0.056, CI -0.003 to +0.115), 8 seats +5.7 (n 400,
+ * CI +4.1 to +7.2; swiss +0.163, CI +0.070 to +0.255), 4 seats +3.8 (n 400, CI -0.7 to +8.4; swiss
+ * +0.022, CI -0.014 to +0.059). Shipped together with ALLIN_LAST, confirmed on a fresh seed (10251,
+ * code a94a4a1, n 400 a field): first price 6 seats +7.2 (CI +4.4 to +10.1; swiss +0.077, CI +0.025
+ * to +0.130), 8 seats +6.9 (CI +5.3 to +8.5; swiss +0.300, CI +0.199 to +0.401), 4 seats +4.2 (CI
+ * -0.3 to +8.7; swiss +0.003); the two 4-seat runs pooled (n 800): +4.0 (CI about +0.8 to +7.2),
+ * swiss +0.013 (CI about -0.013 to +0.038). Vickrey 6 and 8 seats: d score exactly 0 (n 400 each);
+ * first-price duel (Nijello) +0.08 (CI -0.48 to +0.64), 3-game final win share 0.797 to 0.801.
  */
-export const FP_LOOKAHEAD = 0;
+export const FP_LOOKAHEAD = 1;
 /**
  * FP_SURPLUS: with at least FP_MIN_OBS same-face first-price prices, the bid is the b in
- * [current shaded bid, min(full bid, rival cap)] that maximizes (full - b) x G(b), G the empirical
- * chance that b beats the rivals' top bid (share of same-face rival winning prices below b, half
- * of those equal to it). The current FP_QUANTILE target stays the floor, so a letter worth many
- * coins to the rack is no longer capped like a filler. 0: off.
+ * [current shaded bid, min(full bid, rival cap, spendable)] that maximizes (full - b) x G(b), G the
+ * empirical chance that b beats the rivals' top bid (share of same-face rival winning prices below
+ * b, half of those equal to it). The current FP_QUANTILE target stays the floor, so a letter worth
+ * many coins to the rack is no longer capped like a filler. 0: off.
+ *
+ * Off: it lost everywhere it was measured (code ce48201, before the spendable cap; the cap only
+ * lowers the bids it raises). First price -15.6 points at 6 seats (CI -17.7 to -13.5),
+ * -13.3 top five, -29.4 at 4, -3.4 at 8; first-price duels -45.6 (Nijello) and -45.8 (postturing),
+ * the 3-game final win share 0.77 to 0.34 and 0.92 to 0.70. With FP_LOOKAHEAD it gave back the
+ * lookahead's gain at 6 seats (+0.3 field and -2.7 top five, against +8.7 and +3.6) and lost 17.5
+ * at 4 seats; only at 8 seats did it add (+6.1 against +5.7).
  */
 export const FP_SURPLUS = 0;
 /**
  * EARLY_LEN_SEATS: at tables of at least this many seats, the early-cut window is
  * round(EARLY_AUCTIONS x auctions per match / EARLY_REF_AUCTIONS) instead of EARLY_AUCTIONS, so the
- * cut covers the same share of a shorter match (28 auctions of 68 at 6 seats). 0: off.
+ * cut covers the same share of a shorter match (28 auctions of 68 at 6 seats). A seat threshold,
+ * not a switch: 7 means 7+ seats. 0: off.
+ *
+ * Off: at 7, Vickrey 7 seats +0.33 points (n 500, CI -0.39 to +1.04) but swiss -0.050 (CI -0.090 to
+ * -0.010), a worse place; Vickrey 8 seats +0.22 in two runs (n 500 and 400, each CI about -0.7 to
+ * +1.1; swiss +0.022 and +0.028, CIs include 0); first price 8 seats +0.96 (CI +0.01 to +1.91; swiss
+ * +0.045, CI -0.023 to +0.113) and +0.5 on top of the shipped knobs.
  */
 export const EARLY_LEN_SEATS = 0;
 /** Auctions in the 6-seat match EARLY_AUCTIONS was tuned on (98 - 5 x 6). */
